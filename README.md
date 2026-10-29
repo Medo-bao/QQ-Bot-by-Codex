@@ -4,7 +4,7 @@
 上游基线：`ee980be`（2026-10-28，0.5.4）；本插件版本：0.0.1。
 
 QQ 私聊或群聊 → 腾讯 QQ Bot SDK → 本地 Codex App Server → QQ 回复。
-使用本机 Codex 的登录、模型提供商和工具配置，无需安装 DeepSeek Harness。
+使用本机 Codex 的登录、模型提供商和工具配置。
 
 ## 功能
 
