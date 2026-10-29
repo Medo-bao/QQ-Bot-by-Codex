@@ -1,7 +1,5 @@
 # QQ Bot
 
-项目版本固定为 **0.0.1**，后续本地修改沿用这一版本号。
-
 从 [tencent-connect/dsh-qqbot](https://github.com/tencent-connect/dsh-qqbot) 的 `main` 分支改造的本地 Codex 插件。
 上游基线：`ee980be`（2026-10-28，0.5.4）；本插件版本：0.0.1。
 
