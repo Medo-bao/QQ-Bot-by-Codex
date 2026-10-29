@@ -1,0 +1,6 @@
+interface:
+  display_name: "QQ Bot"
+  short_description: "通过 QQ 使用本机 Codex"
+  default_prompt: "设置 QQ Bot 并连接到 Codex"
+policy:
+  allow_implicit_invocation: false

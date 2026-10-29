@@ -1,0 +1,41 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "codex-qqbot",
+  "version": "0.0.1",
+  "description": "Connect QQ private and group chats to local Codex sessions, with QR binding, streaming replies, file delivery and approvals.",
+  "author": {
+    "name": "Local adaptation of tencent-connect/dsh-qqbot"
+  },
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "qq",
+    "qqbot",
+    "chat",
+    "local"
+  ],
+  "extensions": {
+    "com.openai": {
+      "requires_local_executor": true,
+      "onboardingSkill": "./skills/qqbot/SKILL.md",
+      "interface": {
+        "displayName": "QQ Bot",
+        "shortDescription": "在 QQ 中与本机 Codex 对话和交付文件",
+        "longDescription": "将 QQ 私聊与群聊接到本机 Codex App Server，支持扫码绑定、独立会话、流式回复、图片输入、文件发送和操作确认。",
+        "developerName": "Local adaptation",
+        "category": "Productivity",
+        "capabilities": [
+          "Interactive",
+          "Read",
+          "Write"
+        ],
+        "composerIcon": "./assets/icons/qq_logo.svg",
+        "logo": "./assets/icons/qqbot_logo.svg",
+        "defaultPrompt": [
+          "设置 QQ Bot 并连接到 Codex",
+          "查看 QQ Bot 的连接与会话状态"
+        ]
+      }
+    }
+  }
+}

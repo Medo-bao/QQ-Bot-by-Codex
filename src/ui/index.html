@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>QQ Bot</title><style>__APP_STYLES__</style></head>
+<body data-view="sessions" data-detail-open="false">
+<div class="application">
+<header class="topbar">
+<nav class="primary-tabs" aria-label="QQ Bot" role="tablist">
+<button data-view-button="sessions" role="tab" aria-selected="true">会话</button>
+<button data-view-button="settings" role="tab" aria-selected="false">设置</button>
+</nav>
+<button id="headerAction" class="primary"><span aria-hidden="true">＋</span> 绑定机器人</button>
+</header>
+<div class="workspace">
+<aside class="collection-pane" aria-label="机器人与会话">
+<label class="search-field"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="8.5" cy="8.5" r="6" stroke="currentColor" stroke-width="1.4"/><path d="m13 13 4 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg><input id="listSearch" type="search" placeholder="搜索机器人或会话" aria-label="搜索机器人或会话" title="Enter 打开首个结果 · ↑/↓ 选择 · Esc 清空"></label>
+<div class="collection-scroll"><div id="botList" class="robot-groups">
+<section id="botGroup" class="robot-group" aria-label="QQ Bot">
+<div class="robot-group-header">
+<button id="toggleBotGroup" class="robot-group-toggle" aria-expanded="true" aria-controls="sessionList"><svg class="group-chevron" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m4.5 6.25 3.5 3.5 3.5-3.5" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" stroke-linejoin="round"/></svg><svg class="group-folder" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M2.5 6.5V5a1.5 1.5 0 0 1 1.5-1.5h4l2 2H16A1.5 1.5 0 0 1 17.5 7v.5M3 7.5h14.25a.75.75 0 0 1 .72.96l-1.65 5.68A2 2 0 0 1 14.4 15.5H4.5A2 2 0 0 1 2.5 14V8a.5.5 0 0 1 .5-.5Z" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/></svg><span class="group-name">QQ Bot</span><span id="botGroupStatus" class="group-status" aria-hidden="true"></span><span id="botSessionCount" class="group-count">0</span></button>
+<button id="manageBot" class="group-settings-button" aria-label="QQ Bot 机器人设置" title="机器人设置"><svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><circle cx="10" cy="10" r="1" fill="currentColor"/><circle cx="4" cy="10" r="1" fill="currentColor"/><circle cx="16" cy="10" r="1" fill="currentColor"/></svg></button>
+</div><div id="sessionList" class="collection-list robot-sessions"></div>
+</section><p id="noMatchingSessions" class="list-empty" hidden>没有匹配的机器人或会话</p></div>
+<nav id="settingsNavigation" class="settings-navigation" aria-label="设置分类" hidden>
+<button data-tab="connection" aria-selected="false"><span>连接与绑定</span><small>QQ Bot 绑定与 Codex 登录</small></button>
+<button data-tab="access" aria-selected="false"><span>访问范围</span><small>用户、群聊与白名单</small></button>
+<button data-tab="models" aria-selected="false"><span>模型与预设</span><small>模型提供商、技能与会话预设</small></button>
+<button data-tab="prompts" aria-selected="false"><span>回复与提示词</span><small>流式输出与个性化提示词</small></button>
+<button data-tab="media" aria-selected="false"><span>图片与文件</span><small>图片理解、附件与交付文件</small></button>
+<button data-tab="runtime" aria-selected="false"><span>运行设置</span><small>队列、超时与本机数据</small></button>
+</nav></div>
+<div id="collectionSummary" class="collection-summary">QQ Bot</div>
+</aside>
+<main class="detail-pane">
+<section id="emptyDetail" class="empty-detail"><p id="emptyDetailText">选择一项会话以查看</p></section>
+<div id="detailContent" class="detail-content" hidden>
+<div class="detail-topline"><button id="backToList" class="back-button">‹ 返回列表</button><span id="connectionStatus" class="connection-status">读取状态</span><div id="sessionTopbar" class="session-topbar" hidden></div><div class="row connection-actions"><button id="start">启动</button><button id="stop">停止</button></div></div>
+<p id="error" role="alert"></p><p id="feedback" role="status"></p>
+<section class="tab" id="tab-connection" hidden><h2>连接 QQ 与 Codex</h2><p>绑定机器人，选择本机工作目录，然后从 QQ 发起任务。</p><div class="section"><div class="connection-grid"><div><h3>QQ Bot</h3><p id="bindingStatus">读取绑定状态</p><div class="row"><button class="primary" id="bind">手机 QQ 扫码</button><button id="cancelBind">取消扫码</button><button class="danger" id="unbind">解绑</button></div><p><a id="qrLink" target="_blank" rel="noreferrer"></a></p><details><summary>使用 AppID / AppSecret 手动绑定</summary><form id="credentials"><label class="field"><span>AppID</span><input name="appId" required autocomplete="off"></label><label class="field"><span>AppSecret</span><input name="appSecret" required type="password" autocomplete="new-password"></label><button type="submit">保存凭据并连接</button></form></details></div><img id="qr" alt="使用手机 QQ 扫码绑定 QQ Bot"></div><div class="notice">凭据保存在本机，页面不会回显 AppSecret。首次连接后，消息来源会显示在「访问范围」中。</div></div><div class="section"><h3>本机 Codex</h3><p id="accountStatus">正在读取登录状态</p><div class="row"><button id="login">登录 Codex</button><button id="refreshAccount">刷新状态</button><a id="loginLink" target="_blank" rel="noreferrer">继续 Codex 登录</a></div></div><div class="section"><h3>工作位置</h3><div id="connectionFields" class="fields"></div></div></section>
+<section class="tab" id="tab-access" hidden><h2>访问范围</h2><p>允许哪些用户和群使用本机 Codex。</p><div id="accessFields" class="fields"></div><div class="notice">群聊任务的发起者也需要被允许。群聊默认只响应 @机器人的消息。</div><div class="section"><h3>最近消息来源</h3><p>向机器人发送消息后，可以在这里添加用户或群。</p><div id="peers"></div></div></section>
+<section class="tab" id="tab-models" hidden><h2>模型与预设</h2><p>留空使用 Codex 的默认设置。预设用于组合模型、提示词、技能和会话配置。</p><div id="modelFields" class="fields"></div><button id="refreshModels">刷新可用模型与技能</button><p id="catalogInfo"></p><datalist id="models"></datalist><datalist id="providers"></datalist><div class="section"><div class="card-head"><h3>会话预设</h3><button id="addPreset">添加预设</button></div><div class="row"><input id="newPresetId" aria-label="新预设 ID" placeholder="新预设 ID，例如 coding" style="max-width:260px"></div><div id="presets"></div><p class="notice">切换预设后，新会话生效。在 QQ 中使用 /preset 查看并切换，再发送 /new。</p></div></section>
+<section class="tab" id="tab-prompts" hidden><h2>回复与提示词</h2><p>设置 QQ Bot 的默认回复方式与提示词。可在「会话」中为每个私聊或群聊单独设置角色与额外提示词。</p><div class="notice">QQ Bot 不自动注入 Codex 的全局个性化指令、AGENTS 指令或记忆。</div><div id="promptFields" class="fields"></div></section>
+<section class="tab" id="tab-media" hidden><h2>图片与文件</h2><p>处理收到的图片和附件，并把交付文件发送回 QQ。</p><div id="mediaFields" class="fields"></div></section>
+<section class="tab" id="tab-runtime" hidden><h2>运行设置</h2><p>控制任务时间、队列、审批方式和资源使用。</p><div id="globalPermissions"></div><details><summary>自定义权限</summary><div id="permissionFields" class="fields"></div></details><div id="runtimeFields" class="fields"></div><details><summary>高级 Codex 启动配置</summary><div id="advancedFields" class="fields"></div></details><div class="section"><h3>本机数据</h3><p>运行配置</p><p id="dataLocation" class="mono"></p><p>会话与资源</p><p id="archiveLocation" class="mono"></p><p class="notice">停止连接会中止当前任务。共享后台持续接收 QQ 消息；退出后台后可通过插件重新启动。</p><button class="danger" id="shutdown">退出后台服务</button></div></section>
+<section class="tab" id="tab-sessions" aria-label="会话窗口" hidden><div id="sessions"></div></section>
+
+</div>
+<footer id="detailFooter" class="detail-footer" hidden><span id="saveStatus">设置保存在本机</span><div class="row"><button id="reload">重新读取</button><button id="save" class="primary">保存设置</button></div></footer>
+</main>
+</div></div>
+<dialog id="sessionSettingsDialog" aria-labelledby="sessionSettingsTitle"><header class="dialog-header"><div><h2 id="sessionSettingsTitle">会话设置</h2><p id="sessionSettingsPeer"></p></div><button id="closeSessionSettings" class="icon-button" aria-label="关闭会话设置">×</button></header><div class="dialog-body"><section class="session-settings-summary" aria-label="当前会话详细信息"><h3>当前会话</h3><p id="chatState"></p><p id="contextUsageDetails"></p><p id="chatPermissions"></p><p id="chatStorage" class="mono"></p></section><div id="sessionSettingsBody"></div></div></dialog>
+<dialog id="renameSessionDialog" aria-labelledby="renameSessionTitle" class="rename-dialog"><header class="dialog-header"><div><h2 id="renameSessionTitle">重命名会话</h2><p id="renameSessionPeer"></p></div><button id="closeRenameSession" class="icon-button" aria-label="关闭重命名">×</button></header><form id="renameSessionForm" class="dialog-body"><label class="field"><span>会话名称</span><input id="sessionNameInput" maxlength="80" autocomplete="off" placeholder="输入会话名称"></label><p class="notice">留空使用默认名称。</p><p id="renameSessionError" role="alert"></p><div class="row rename-actions"><button id="cancelRenameSession" type="button">取消</button><button id="saveSessionName" class="primary" type="submit">保存名称</button></div></form></dialog>
+<dialog id="directMessageDialog" aria-labelledby="directMessageTitle" class="compose-dialog"><header class="dialog-header"><div><h2 id="directMessageTitle">通过机器人发送</h2><p>直接以 QQ Bot 身份发送文字、图片或文件，不调用 AI。</p></div><button id="closeDirectMessage" class="icon-button" aria-label="关闭直接发送">×</button></header><form id="directMessageForm" class="dialog-body"><label class="field"><span>接收会话</span><select id="directMessageTarget" required></select></label><label class="field"><span>消息内容（可选）</span><textarea id="directMessageText" rows="5" placeholder="输入文字，或添加下方文件直接发送"></textarea></label><div class="direct-attachments"><button id="addDirectFiles" type="button">＋ 添加文件</button><input id="directFileInput" type="file" multiple hidden aria-label="选择要发送的图片或文件"><small id="directFileLimit"></small></div><div id="directFileList" class="direct-file-list" aria-label="待发送文件"></div><p id="directMessageProgress" class="notice" role="status"></p><p id="directMessageError" role="alert"></p><div class="dialog-actions"><span class="notice">Ctrl+Enter 发送</span><div class="row"><button id="cancelDirectMessage" type="button">取消</button><button id="sendDirectMessage" class="primary" type="submit">发送到 QQ</button></div></div></form></dialog>
+<script>window.__QQBOT_MODE__="__MODE__";</script><script>__APP_SCRIPT__</script></body></html>

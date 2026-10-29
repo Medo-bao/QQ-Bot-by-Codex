@@ -1,0 +1,39 @@
+{
+  "name": "codex-qqbot",
+  "version": "0.0.1",
+  "private": true,
+  "description": "QQ private and group chat bridge for Codex, adapted from tencent-connect/dsh-qqbot.",
+  "type": "module",
+  "bin": {
+    "codex-qqbot": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc --noEmit && node scripts/build.mjs",
+    "start": "node dist/cli.js",
+    "test": "node --test tests/integration.test.mjs",
+    "check:codex": "node scripts/check-codex.mjs",
+    "package:plugin": "node scripts/package-plugin.mjs"
+  },
+  "engines": {
+    "node": ">=20.3.0"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "^2.0.4",
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@tencent-connect/qqbot-connector": "1.2.0",
+    "@tencent-connect/qqbot-nodejs": "^1.0.5",
+    "dompurify": "3.4.17",
+    "marked": "18.1.2",
+    "qrcode": "^1.5.4",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "@types/qrcode": "^1.5.5",
+    "esbuild": "^0.25.12",
+    "typescript": "^5.9.3",
+    "ws": "^8.21.0"
+  }
+}
