@@ -87,6 +87,7 @@ const fields: Record<string, Field[]> = {
     { path: 'networkAccess', label: '允许命令联网', kind: 'boolean', wide: true },
   ],
   runtimeFields: [
+    { path: 'responsesTransport', label: 'OpenAI 模型连接方式', kind: 'select', options: ['http', 'auto'], help: '默认使用 HTTP 流式，避免 WebSocket 连接反复超时后才开始回复；自定义模型提供商保持原连接方式。' },
     { path: 'autoStart', label: '随 Codex 启动 QQ Bot', kind: 'boolean', wide: true, help: '默认开启：插件加载后自动连接已绑定的机器人。手动停止后，状态刷新不会重新启动连接。' },
     { path: 'webSearch', label: '网页搜索', kind: 'select', options: ['live', 'cached', 'indexed', 'disabled'] },
     { path: 'autoCompact', label: '默认自动压缩上下文', kind: 'boolean', wide: true },
@@ -99,7 +100,7 @@ const fields: Record<string, Field[]> = {
   ],
   advancedFields: [{ path: 'codexCommand', label: 'Codex 可执行文件', wide: true }, { path: 'codexArgs', label: 'App Server 附加启动参数', kind: 'lines', wide: true, help: '每行一个参数。' }],
 };
-const labels: Record<string, string> = { '': '跟随默认', enabled: '允许', live: '实时搜索', cached: '缓存搜索', indexed: '索引搜索', allowlist: '仅白名单', open: '开放', disabled: '关闭', 'on-request': '由 Codex 请求确认', untrusted: '不可信操作需要确认', never: '不请求确认', user: '由我批准', auto_review: 'Codex 自动审核', 'workspace-write': '可写工作目录', 'read-only': '只读', 'danger-full-access': '完全访问' };
+const labels: Record<string, string> = { '': '跟随默认', http: 'HTTP 流式（稳定优先）', auto: '由 Codex 自动选择', enabled: '允许', live: '实时搜索', cached: '缓存搜索', indexed: '索引搜索', allowlist: '仅白名单', open: '开放', disabled: '关闭', 'on-request': '由 Codex 请求确认', untrusted: '不可信操作需要确认', never: '不请求确认', user: '由我批准', auto_review: 'Codex 自动审核', 'workspace-write': '可写工作目录', 'read-only': '只读', 'danger-full-access': '完全访问' };
 const get = (object: any, path: string): any => path.split('.').reduce((value, key) => value?.[key], object);
 const set = (object: any, path: string, value: any) => { const keys = path.split('.'); const final = keys.pop()!; const owner = keys.reduce((value, key) => value[key] ||= {}, object); owner[final] = value; };
 
@@ -1053,7 +1054,7 @@ function bindEvents(): void {
 async function main(): Promise<void> {
   document.body.dataset.transport = mode;
   if (mode === 'mcp') {
-    app = new App({ name: 'codex-qqbot-settings', title: 'QQ Bot', version: '0.0.1' }, {});
+    app = new App({ name: 'codex-qqbot-settings', title: 'QQ Bot', version: '0.0.2' }, {});
     app.onhostcontextchanged = (context) => { if (context.theme) document.body.dataset.theme = context.theme; };
     await app.connect();
     const theme = app.getHostContext()?.theme; if (theme) document.body.dataset.theme = theme;

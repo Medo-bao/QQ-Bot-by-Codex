@@ -5,7 +5,7 @@ description: 设置、绑定和管理 QQ Bot，让 QQ 私聊或群聊通过本�
 
 # QQ Bot
 
-The plugin version is fixed at 0.0.1 for local updates.
+The current plugin version is 0.0.2. Change it only when explicitly requested.
 
 Use this plugin's `qqbot_*` MCP tools. If they are absent, ask the user to install
 and enable `codex-qqbot` from the local marketplace, then open a new chat.
@@ -60,7 +60,7 @@ Recent group context is persistent and includes complete received messages with
 stable speaker IDs and bot replies. Existing current-thread history is backfilled;
 only messages actually delivered to the bot can be recovered. Authorized non-mention
 messages remain context without triggering replies. Explicit resets clear recent
-context and preserve archived records. The plugin version remains 0.0.1.
+context and preserve archived records. The plugin version remains 0.0.2.
 Group messages require an @mention by default. `/new`, `/compact`, `/model`, `/effort`,
 `/preset`, `/stop`, `/bot-status`, `/bot-help` and `/answer` work inside QQ. Codex approvals
 and questions are delivered to QQ; QQ replies must come from the task's initiating

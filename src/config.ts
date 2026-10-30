@@ -23,6 +23,7 @@ export const configSchema = z.object({
   storageDir: z.string().trim().refine((value) => !value || isAbsolute(value), '会话与资源目录必须是绝对路径。').default(''),
   codexCommand: z.string().default('codex'),
   codexArgs: z.array(z.string()).default([]),
+  responsesTransport: z.enum(['http', 'auto']).default('http'),
   model: z.string().default(''),
   modelProvider: z.string().default(''),
   preset: z.string().default(''),

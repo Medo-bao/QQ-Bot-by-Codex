@@ -1,6 +1,6 @@
 # QQ Bot
 
-The plugin version is fixed at **0.0.1**, including future local updates.
+Current plugin version: **0.0.2**.
 
 The conversation view follows Codex typography, blue user bubbles, Markdown and
 collapsible activity, with code/reply copying, image previews and a latest-message button.
@@ -29,6 +29,10 @@ Use the pencil beside the conversation title to rename it. Names persist across
 restarts and appear in the list, header and search; an empty name restores the default.
 
 Requires Node.js >=20.3.0 and an installed, signed-in Codex CLI with App Server.
+The bot-owned process defaults to HTTP streaming for the built-in OpenAI provider,
+avoiding repeated WebSocket connection timeouts without changing the selected model
+or reasoning effort. Runtime settings can restore automatic transport selection;
+custom providers retain their configured transport.
 
 ```powershell
 git clone https://github.com/Medo-bao/QQ-Bot-by-Codex.git
@@ -45,6 +49,8 @@ read the observed OpenID on the setup page, and add the intended user. Group exe
 also requires group permission and an allowed initiating user.
 Group members share one AI context with sender names and stable IDs. The conversation
 view labels each author and reply recipient; QQ text replies mention the current requester.
+Each turn reads the received group history before the current question. The SDK's
+truncated history is no longer duplicated, and clarification answers join the same history.
 Fallback group reply IDs must belong to that requester.
 Received group messages and successful bot replies persist per group in
 `group-messages.jsonl`, with recent context in `context.json`. Each turn includes

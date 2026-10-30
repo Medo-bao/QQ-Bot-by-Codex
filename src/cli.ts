@@ -8,13 +8,6 @@ import { callService, ensureService, startService } from './service.ts';
 import type { Logger } from './types.ts';
 import { downloadFile } from './media.ts';
 
-const logger: Logger = {
-  info: (message) => console.error(`[qqbot] ${message}`),
-  warn: (message) => console.error(`[qqbot] ${message}`),
-  error: (message) => console.error(`[qqbot] ${message}`),
-  debug: (message) => { if (process.env.QQBOT_DEBUG === '1') console.error(`[qqbot] ${message}`); },
-};
-
 async function main(): Promise<void> {
   const [command = 'help', argument] = process.argv.slice(2);
   if (command === 'download') {
@@ -30,7 +23,16 @@ async function main(): Promise<void> {
   if (command === 'daemon') {
     const directory = dataDirectory(); new ConfigStore(directory);
     const log = createWriteStream(join(directory, 'runtime.log'), { flags: 'a', mode: 0o600 });
-    for (const method of ['log', 'info', 'warn', 'error', 'debug'] as const) console[method] = (...args: unknown[]) => { log.write(`${format(...args)}\n`); };
+    for (const method of ['log', 'info', 'warn', 'error', 'debug'] as const) console[method] = (...args: unknown[]) => {
+      const prefix = `${new Date().toISOString()} [${method === 'log' ? 'INFO' : method.toUpperCase()}] `;
+      log.write(`${prefix}${format(...args).replace(/\r?\n/g, `\n${prefix}`)}\n`);
+    };
+    const logger: Logger = {
+      info: message => console.info(`[qqbot] ${message}`),
+      warn: message => console.warn(`[qqbot] ${message}`),
+      error: message => console.error(`[qqbot] ${message}`),
+      debug: message => { if (process.env.QQBOT_DEBUG === '1') console.debug(`[qqbot] ${message}`); },
+    };
     await startService(logger, directory); return;
   }
   if (command === 'config') {
@@ -57,7 +59,7 @@ async function main(): Promise<void> {
     if (command !== 'shutdown' && command !== 'stop') await ensureService();
     process.stdout.write(`${JSON.stringify(await callService(command), null, 2)}\n`); return;
   }
-  process.stdout.write('QQ Bot 0.0.1\n\nnode dist/cli.js setup     本地扫码绑定与设置页\nnode dist/cli.js start     启动 QQ → Codex\nnode dist/cli.js status    查看状态\nnode dist/cli.js models    查看 Codex 模型\nnode dist/cli.js stop      停止 QQ 连接\nnode dist/cli.js shutdown  退出共享后台进程\nnode dist/cli.js mcp       Codex 插件 MCP 入口\n');
+  process.stdout.write('QQ Bot 0.0.2\n\nnode dist/cli.js setup     本地扫码绑定与设置页\nnode dist/cli.js start     启动 QQ → Codex\nnode dist/cli.js status    查看状态\nnode dist/cli.js models    查看 Codex 模型\nnode dist/cli.js stop      停止 QQ 连接\nnode dist/cli.js shutdown  退出共享后台进程\nnode dist/cli.js mcp       Codex 插件 MCP 入口\n');
 }
 
 main().catch((error: Error) => { console.error(error.message); process.exitCode = 1; });

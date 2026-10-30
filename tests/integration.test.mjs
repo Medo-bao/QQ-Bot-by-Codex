@@ -5,6 +5,8 @@ import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createServer } from 'node:http';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { WebSocketServer } from 'ws';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -22,6 +24,7 @@ const waitFor = async (predicate) => {
   while (!predicate()) { if (Date.now() > deadline) throw new Error('Timed out waiting for fixture state'); await new Promise((resolve) => setTimeout(resolve, 10)); }
 };
 const message = (text, scope = 'c2c', id = 'alice', senderId = 'alice') => ({ target: { scope, targetId: id, msgId: 'msg-' + Math.random(), ...(scope === 'group' ? { replyUserId: senderId } : {}) }, text, senderId, shouldAnswer: true, attachments: [] });
+const currentText = turn => turn.params.input.find(input => input.type === 'text' && !['[QQ Bot 本轮文件目录]\n', '[QQ Bot 群聊上下文：', '[QQ Bot 引用上下文：'].some(prefix => input.text.startsWith(prefix)))?.text || '';
 const groupContext = (turn) => JSON.parse(turn.params.input.find(input => input.type === 'text' && input.text.startsWith('[QQ Bot 群聊上下文：')).text.split('\n').slice(1).join('\n'));
 const referenceContext = turn => JSON.parse(turn.params.input.find(input => input.type === 'text' && input.text.startsWith('[QQ Bot 引用上下文：')).text.split('\n').slice(1).join('\n')).reference;
 class FakeQQ {
@@ -74,6 +77,11 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     assert.equal(qq.streams[0].updates.at(-1), 'Codex fixture reply: hello');
     assert.equal(qq.streams[0].completeCount, 1);
     assert.equal(qq.messages.length, 0, 'streamed reply must not be duplicated as static');
+    assert.equal(requireTrace(directory).find(item => item.method === 'thread/start').params.modelProvider, 'qqbot-openai-http', 'the default OpenAI connection skips repeated WebSocket handshakes');
+    assert.ok(requireTrace(directory).find(item => item.launch).launch.some(arg => arg.includes('supports_websockets=false')));
+    assert.ok(requireTrace(directory).find(item => item.launch).launch.includes('notify=[]'), 'QQ replies do not invoke desktop notification commands');
+    await client.call('thread/start', { modelProvider: 'fixture', ephemeral: true });
+    assert.equal(requireTrace(directory).filter(item => item.method === 'thread/start').at(-1).params.modelProvider, 'fixture', 'custom provider selection is preserved');
     bridge.submitLocal('c2c', 'alice', 'continue from desktop');
     await waitFor(() => !bridge.status().sessions.find((item) => item.peerId === 'alice').queued);
     assert.equal(bridge.status().sessions.find((item) => item.peerId === 'alice').threadId, first, 'the desktop continues the same QQ AI thread');
@@ -94,9 +102,11 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     await bridge.handleMessage({ ...message(`/answer ${pending.token} 2`, 'group', 'team'), shouldAnswer: false });
     await task;
     await queuedTask;
-    const queuedTurn = requireTrace(directory).find(item => item.method === 'turn/start' && item.params.input[0].text.includes('queued group question'));
+    const queuedTurn = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('queued group question'));
     assert.ok(!groupContext(queuedTurn).messages.some(item => item.text.includes('future passive group message')), 'queued requests do not receive user messages that arrived later');
     assert.ok(groupContext(queuedTurn).messages.some(item => item.role === 'assistant'), 'the previous task reply is available when the queued task begins');
+    assert.ok(queuedTurn.params.input[0].text.startsWith('[QQ Bot 群聊上下文：'), 'received group history is read before the current question');
+    assert.equal(groupContext(queuedTurn).currentMessageId, queuedInput.contextId);
     assert.equal(qq.files.length, 1);
     assert.equal(qq.files[0].target.targetId, 'team');
     assert.notEqual(bridge.status().sessions.find((item) => item.scope === 'group').threadId, first);
@@ -130,7 +140,7 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     assert.ok(recentGroup.some(item => item.text.endsWith('-末尾线索')), 'messages longer than 200 characters keep their complete text');
     await bridge.handleMessage({ ...message(fullQuote, 'group', 'team', 'alice'), senderName: '原发言人', messageIndex: 'original-ref==', attachments: [quoteImage], shouldAnswer: false });
     await bridge.handleMessage({ ...message('read quoted context', 'group', 'team', 'bob'), reference: { key: 'original-ref==', text: fullQuote.slice(0, 80) } });
-    const quoteTurn = requireTrace(directory).find(item => item.method === 'turn/start' && item.params.input[0].text.includes('read quoted context'));
+    const quoteTurn = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('read quoted context'));
     const quoted = referenceContext(quoteTurn);
     assert.equal(quoted.text, fullQuote); assert.equal(quoted.senderId, 'alice'); assert.equal(quoted.senderName, '原发言人');
     assert.equal(quoted.source, 'archive'); assert.equal(quoteDownloads, 1);
@@ -139,36 +149,36 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     assert.equal(qq.messages.at(-1).target.replyUserId, 'bob', 'a quoted sender never replaces the current reply recipient');
     const botReply = qq.messages.at(-1);
     await bridge.handleMessage({ ...message('quote bot reply', 'group', 'team', 'alice'), reference: { key: botReply.receipt.ext_info.ref_idx } });
-    const replyContext = referenceContext(requireTrace(directory).find(item => item.method === 'turn/start' && item.params.input[0].text.includes('quote bot reply')));
+    const replyContext = referenceContext(requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('quote bot reply')));
     assert.equal(replyContext.text, botReply.text); assert.equal(replyContext.isBot, true);
     await bridge.handleMessage({ ...message('quote private stream'), reference: { key: qq.streams[0].receipt.ext_info.ref_idx } });
-    assert.equal(referenceContext(requireTrace(directory).find(item => item.method === 'turn/start' && item.params.input[0].text === 'quote private stream')).text, 'Codex fixture reply: hello');
+    assert.equal(referenceContext(requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item) === 'quote private stream')).text, 'Codex fixture reply: hello');
     await bridge.handleMessage({ ...message('isolated quoted lookup'), reference: { key: 'original-ref==' } });
-    const isolated = referenceContext(requireTrace(directory).find(item => item.method === 'turn/start' && item.params.input[0].text === 'isolated quoted lookup'));
+    const isolated = referenceContext(requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item) === 'isolated quoted lookup'));
     assert.equal(isolated.source, 'missing'); assert.equal(isolated.text, undefined, 'a reference key cannot read another conversation');
     await bridge.handleMessage({ ...message('same current and quoted image', 'group', 'team'), attachments: [quoteImage], reference: { key: 'original-ref==' } });
-    const sameImage = requireTrace(directory).find(item => item.method === 'turn/start' && item.params.input[0].text.includes('same current and quoted image'));
+    const sameImage = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('same current and quoted image'));
     assert.equal(quoteDownloads, 2, 'the current attachment is downloaded once and reused for its quote');
     assert.equal(sameImage.params.input.filter(item => item.type === 'localImage').length, 1);
     await bridge.handleMessage({ ...message('nested quoted context', 'group', 'team', 'bob'), reference: {
       key: 'forwarded-context', text: '转发的对话资料', references: [{ key: 'original-ref==', text: '较短预览' }, { key: '', text: '第二条转发消息', senderId: 'bob' }],
     } });
-    const nested = referenceContext(requireTrace(directory).find(item => item.method === 'turn/start' && item.params.input[0].text.includes('nested quoted context')));
+    const nested = referenceContext(requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('nested quoted context')));
     assert.equal(nested.references[0].text, fullQuote); assert.equal(nested.references[1].senderId, 'bob');
     config.media.enabled = false;
     await bridge.handleMessage({ ...message('quoted media disabled', 'group', 'team'), reference: { key: 'original-ref==' } });
-    const mediaDisabledTurn = requireTrace(directory).find(item => item.method === 'turn/start' && item.params.input[0].text.includes('quoted media disabled'));
+    const mediaDisabledTurn = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('quoted media disabled'));
     assert.ok(!mediaDisabledTurn.params.input.some(item => item.type === 'localImage'));
     assert.match(referenceContext(mediaDisabledTurn).note, /附件接收已关闭/);
     config.media.enabled = true;
     await bridge.handleMessage({ ...message('reference with expired attachment', 'group', 'team'), reference: {
       key: 'expired-ref', text: '引用正文仍然可读', attachments: [{ ...quoteImage, url: quoteBase + '/expired.png' }],
     } });
-    const expired = referenceContext(requireTrace(directory).find(item => item.method === 'turn/start' && item.params.input[0].text.includes('reference with expired attachment')));
+    const expired = referenceContext(requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('reference with expired attachment')));
     assert.equal(expired.text, '引用正文仍然可读'); assert.match(expired.unavailable[0].reason, /410/);
     assert.equal(bridge.status().sessions.find(item => item.peerId === 'team').lastError, undefined, 'expired quoted media does not fail the current question');
     await bridge.handleMessage({ ...message('', 'group', 'team', 'bob'), envelope: '<from>\nuser: Bob\nscope: group(team)\n</from>', reference: { key: 'original-ref==' } });
-    assert.ok(requireTrace(directory).some(item => item.method === 'turn/start' && item.params.input[0].text.includes('请查看引用消息。') && referenceContext(item).text === fullQuote), 'quote-only requests are not discarded');
+    assert.ok(requireTrace(directory).some(item => item.method === 'turn/start' && currentText(item).includes('请查看引用消息。') && referenceContext(item).text === fullQuote), 'quote-only requests are not discarded');
     quoteMediaExpired = true;
     const beforeGeneratedFiles = qq.files.length;
     await bridge.handleMessage(message('send-generated-image'));
@@ -180,7 +190,7 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     assert.equal(qq.files.length, beforeGeneratedFiles + 1, 'the dynamic tool, sandbox alias and final Markdown link deliver the same image once');
     const deliveredImage = qq.files.at(-1);
     await bridge.handleMessage({ ...message('quote delivered bot image'), reference: { key: deliveredImage.receipt.ext_info.ref_idx } });
-    const imageReplyTurn = requireTrace(directory).find(item => item.method === 'turn/start' && item.params.input[0].text === 'quote delivered bot image');
+    const imageReplyTurn = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item) === 'quote delivered bot image');
     assert.equal(referenceContext(imageReplyTurn).isBot, true);
     assert.ok(imageReplyTurn.params.input.some(item => item.type === 'localImage' && item.path === deliveredImage.path), 'outgoing file receipts restore the original bot image');
     assert.equal(qq.messages.some(item => item.text.includes('工具执行失败：qqbot_send_file')), false, 'tool diagnostics obey the disabled QQ synchronization setting');
@@ -279,7 +289,7 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
   await writeFile(join(directory, 'sessions.json'), JSON.stringify(oldSessions));
   const oldHistory = JSON.parse(await readFile(join(directory, 'thread-history.json'), 'utf8'));
   const seedText = '旧群聊完整资料-' + '历史正文'.repeat(80) + '-旧资料末尾';
-  const originalGroupInput = requireTrace(directory).find(item => item.method === 'turn/start' && item.params.input[0].text.includes('member A question')).params.input[0].text;
+  const originalGroupInput = currentText(requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('member A question')));
   oldHistory['existing-group-thread'] = [{ id: 'existing-group-turn', status: 'completed', items: [
     { id: 'existing-group-user', type: 'userMessage', content: [{ type: 'text', text: originalGroupInput.replace('member A question', seedText) }] },
     { id: 'existing-group-answer', type: 'agentMessage', phase: 'final_answer', text: '旧群聊中的机器人答复' },
@@ -290,23 +300,23 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
   await second.start();
   try {
     await second.handleMessage(message('continue existing group', 'group', 'history-team'));
-    const backfilled = groupContext(requireTrace(directory).filter(item => item.method === 'turn/start' && item.params.input[0].text.includes('continue existing group')).at(-1));
+    const backfilled = groupContext(requireTrace(directory).filter(item => item.method === 'turn/start' && currentText(item).includes('continue existing group')).at(-1));
     assert.ok(backfilled.messages.some(item => item.text === seedText && item.senderId === 'alice'), 'existing native group history is backfilled with complete text and sender identity');
     assert.ok(backfilled.messages.some(item => item.role === 'assistant' && item.text === '旧群聊中的机器人答复'));
     assert.equal(second.status().sessions.find(item => item.peerId === 'history-team').threadId, 'existing-group-thread', 'backfill preserves the existing AI thread');
     await second.handleMessage(message('restart group recall', 'group', 'team', 'bob'));
-    const resumedGroup = groupContext(requireTrace(directory).filter(item => item.method === 'turn/start' && item.params.input[0].text.includes('restart group recall')).at(-1));
+    const resumedGroup = groupContext(requireTrace(directory).filter(item => item.method === 'turn/start' && currentText(item).includes('restart group recall')).at(-1));
     assert.ok(resumedGroup.messages.some(item => item.text.includes('reference with expired attachment')), 'group context survives a background restart');
     const beforeRestartQuote = quoteDownloads;
     await second.handleMessage({ ...message('quote after restart', 'group', 'team', 'bob'), reference: { key: 'original-ref==' } });
-    const restoredQuote = referenceContext(requireTrace(directory).find(item => item.method === 'turn/start' && item.params.input[0].text.includes('quote after restart')));
+    const restoredQuote = referenceContext(requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('quote after restart')));
     assert.equal(restoredQuote.text, fullQuote); assert.equal(restoredQuote.source, 'archive');
     assert.equal(restoredQuote.files.length, 1); assert.equal(quoteDownloads, beforeRestartQuote, 'persisted files survive expired remote URLs');
     await appendFile(join(second.storage.paths(message('', 'group', 'team').target).directory, 'group-messages.jsonl'), JSON.stringify({
       type: 'message', id: 'qq:legacy-quote-id', role: 'user', senderId: 'alice', senderName: 'Alice', text: '旧群存档里的引用原文',
     }) + '\n');
     await second.handleMessage({ ...message('quote legacy archive', 'group', 'team'), reference: { key: 'legacy-quote-id' } });
-    const legacyQuote = referenceContext(requireTrace(directory).find(item => item.method === 'turn/start' && item.params.input[0].text.includes('quote legacy archive')));
+    const legacyQuote = referenceContext(requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('quote legacy archive')));
     assert.equal(legacyQuote.text, '旧群存档里的引用原文'); assert.equal(legacyQuote.senderId, 'alice');
     await second.handleMessage(message('resume'));
     assert.equal(second.status().sessions.find((item) => item.peerId === 'alice').name, '我的工作助手', 'the name survives service restart and new contexts');
@@ -316,11 +326,11 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     const protocol = (await readFile(join(directory, 'protocol.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
     assert.ok(protocol.some((item) => item.method === 'thread/resume'));
     assert.ok(protocol.some((item) => item.method === 'turn/start' && item.params.effort === 'high'));
-    const privateResume = protocol.filter(item => item.method === 'turn/start' && item.params.input[0].text === 'resume').at(-1);
+    const privateResume = protocol.filter(item => item.method === 'turn/start' && currentText(item) === 'resume').at(-1);
     assert.ok(!privateResume.params.input.some(input => input.text?.startsWith('[QQ Bot 群聊上下文：')), 'private chats never receive group context');
     await second.handleMessage(message('/new', 'group', 'team'));
     await second.handleMessage(message('fresh group context', 'group', 'team'));
-    const resetGroup = groupContext(requireTrace(directory).filter(item => item.method === 'turn/start' && item.params.input[0].text.includes('fresh group context')).at(-1));
+    const resetGroup = groupContext(requireTrace(directory).filter(item => item.method === 'turn/start' && currentText(item).includes('fresh group context')).at(-1));
     assert.deepEqual(resetGroup.messages, [], 'an explicit group reset does not silently restore old context');
   } finally { await second.close(); }
   const cancel = new AbortController();
@@ -477,9 +487,9 @@ test('Context reset and compaction report progress, retain settings and recover 
     assert.deepEqual(current().settings, before.settings);
     assert.equal(current().name, '群聊名称');
     const turn = requireTrace(directory).filter(item => item.method === 'turn/start').at(-1);
-    assert.ok(turn.params.input[0].text.includes('new message after reset request'));
+    assert.ok(currentText(turn).includes('new message after reset request'));
     assert.deepEqual(groupContext(turn).messages.map(item => item.text), ['passive message after reset request']);
-    assert.ok(!requireTrace(directory).some(item => item.method === 'turn/start' && item.params.input[0].text.includes('discard queued old context')));
+    assert.ok(!requireTrace(directory).some(item => item.method === 'turn/start' && currentText(item).includes('discard queued old context')));
     const archived = JSON.parse(await readFile(join(before.storage.history, before.threadId + '.json'), 'utf8'));
     assert.ok(archived.messages.some(item => item.text === 'history with saved settings'));
     const empty = await controller.session('c2c', 'empty-peer', 'compact');
@@ -665,7 +675,8 @@ test('Tencent SDK uses actual HTTP/WebSocket QQ frames; media inputs and outgoin
     event('GROUP_AT_MESSAGE_CREATE', { author: { member_openid: 'bob', username: 'Bob' }, group_openid: 'team', content: 'second group member', attachments: [] });
     await waitFor(() => messages.length === 4);
     assert.equal(messages[0].senderId, 'alice');
-    assert.match(messages[0].envelope, /hi from QQ/);
+    assert.equal(messages[0].text, 'hi from QQ');
+    assert.equal(messages[0].envelope, undefined, 'the SDK does not add a second, truncated copy of group history');
     assert.equal(messages[1].target.targetId, 'team');
     assert.equal(messages[1].shouldAnswer, false);
     assert.equal(messages[2].shouldAnswer, true, 'the official group AT event is accepted even without a literal mention tag');
@@ -749,6 +760,9 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
   await mkdir(join(directory, 'codex-home'), { recursive: true });
   await writeFile(desktopAuthPath, JSON.stringify(desktopLogin));
   await writeFile(botAuthPath, JSON.stringify(oldLogin));
+  const desktopConfigPath = join(process.env.CODEX_HOME, 'config.toml');
+  const desktopConfig = `model = "fixture-model"\ndisable_response_storage = true\nnotify = ["fixture-desktop-notify"]\ndeveloper_instructions = '''\n[features]\nrmcp_client = true\n'''\n[features]\nrmcp_client = true\nmemories = true\n[model_providers.fixture]\nname = "Fixture provider"\n`;
+  await writeFile(desktopConfigPath, desktopConfig);
   await writeFile(join(directory, 'sessions.json'), JSON.stringify({ 'saved-app:c2c:alice': { threadId: 'history-thread', prompt: 'old-private-role' }, 'saved-app:group:team': { prompt: 'group-role' } }));
   await writeFile(join(directory, 'thread-history.json'), JSON.stringify({ 'history-thread': Array.from({ length: 31 }, (_, index) => ({
     id: 'history-turn-' + index, status: 'completed', items: [
@@ -763,7 +777,7 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
   try {
     assert.equal(client.getServerVersion().name, 'codex-qqbot');
     assert.equal(client.getServerVersion().title, 'QQ Bot');
-    assert.equal(client.getServerVersion().version, '0.0.1');
+    assert.equal(client.getServerVersion().version, '0.0.2');
     const tools = (await client.listTools()).tools.map((tool) => tool.name);
     assert.deepEqual(tools.sort(), ['qqbot_configure', 'qqbot_models', 'qqbot_send_file', 'qqbot_send_message', 'qqbot_setup', 'qqbot_start', 'qqbot_status', 'qqbot_stop', 'qqbot_ui'].sort());
     const details = (await client.listTools()).tools;
@@ -819,6 +833,9 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
     assert.equal((await callService('status', {}, directory)).config.access.c2cAllow[0], 'alice');
     const models = await client.callTool({ name: 'qqbot_models', arguments: {} });
     assert.equal(JSON.parse(models.content[0].text).data[0].model, 'fixture-model');
+    const runtimeConfig = await readFile(join(directory, 'codex-home', 'config.toml'), 'utf8');
+    assert.equal(runtimeConfig, desktopConfig.replace('disable_response_storage = true\n', '').replace('[features]\nrmcp_client = true\nmemories', '[features]\nmemories'), 'only removed settings are excluded; instruction text, providers and tools retain their configuration');
+    assert.equal(await readFile(desktopConfigPath, 'utf8'), desktopConfig, 'the desktop configuration stays unchanged');
     assert.deepEqual(JSON.parse(await readFile(botAuthPath, 'utf8')), desktopLogin, 'a refreshed desktop login replaces the stale same-account copy');
     const newerBotLogin = login('fixture-account', '2026-10-29T00:00:00Z', 'newer-bot-token');
     await writeFile(botAuthPath, JSON.stringify(newerBotLogin));
@@ -882,14 +899,21 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
     try {
       await waitForState(state => state === undefined);
       store.update({ autoStart: true });
-      const primary = await connect();
+      const startupLogOffset = (await readFile(join(directory, 'runtime.log'), 'utf8')).length;
+      const [primary, secondary] = await Promise.all([connect(), connect()]);
       const online = await waitForState(state => state?.connected);
       assert.equal(online.config.autoStart, true);
       assert.equal(connections, 1);
-      const secondary = await connect();
       const shared = await secondary.callTool({ name: 'qqbot_status', arguments: {} });
       assert.equal(shared.structuredContent.connected, true);
       assert.equal(connections, 1, 'multiple MCP instances reuse the live QQ connection');
+      await promisify(execFile)(process.execPath, [resolve('dist/cli.js'), 'daemon'], {
+        env: { ...process.env, QQBOT_DATA_DIR: directory }, windowsHide: true, timeout: 5000,
+      });
+      const startupLog = (await readFile(join(directory, 'runtime.log'), 'utf8')).slice(startupLogOffset);
+      assert.doesNotMatch(startupLog, /EADDRINUSE|自动启动失败/, 'concurrent daemon launch is a successful reuse, not an error');
+      assert.equal(startupLog.match(/QQ 后台服务已启动/g)?.length, 1);
+      assert.match(startupLog, /^\d{4}-\d{2}-\d{2}T\S+ \[INFO\] \[qqbot\] QQ 后台服务已启动/m, 'runtime diagnostics include a timestamp and severity');
       await new Promise(resolve => setTimeout(resolve, 100));
       await primary.callTool({ name: 'qqbot_stop', arguments: {} });
       const stopped = await secondary.callTool({ name: 'qqbot_status', arguments: {} });

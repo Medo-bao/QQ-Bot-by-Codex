@@ -1,9 +1,19 @@
 # Changelog
 
+## 0.0.2 - 2026-10-30
+
+- 统一插件清单、MCP 服务、界面、QQ 版本命令及 SDK 标识为 0.0.2。
+- 修复多个插件实例同时启动后台时的地址占用报错，共用现有连接。
+- 隔离桌面通知命令，避免长回复触发 Windows 命令行长度错误；移除机器人配置副本中的失效配置项。
+- 运行日志增加每行时间和级别，便于定位新问题。
+- 默认使用 HTTP 流式连接，并在当前问题之前提供已接收的群聊前文。
+
 ## 0.0.1 - 2026-10-29
 
-The plugin version remains fixed at 0.0.1 for local updates.
+Initial source release.
 
+- Prefer HTTP streaming for the built-in OpenAI provider in the bot-owned process to avoid repeated WebSocket connection timeouts, preserving the model, reasoning level and custom providers.
+- Read complete local group context before the current question on every turn, record clarification answers and remove the duplicate truncated SDK history.
 - Preserve conversation reading positions and expanded tool details, keep unfinished session settings when dialogs close, and separate their validation from global saves.
 - Add keyboard search navigation and full-name tooltips, restore typing focus after sends, accept valid attachments up to the limit, and keep the direct-send button unavailable until the previous send finishes.
 - Fill the available page height so the sidebar and conversation composer align with the bottom without an extra host-input spacer.

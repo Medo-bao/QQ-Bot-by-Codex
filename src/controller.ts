@@ -1,6 +1,6 @@
 import { startQrConnect } from '@tencent-connect/qqbot-connector';
 import { ConfigStore } from './config.ts';
-import { CodexClient } from './codex-client.ts';
+import { CodexClient, openAIHttpProvider } from './codex-client.ts';
 import { QQBridge } from './bridge.ts';
 import { QQTransport } from './qq-transport.ts';
 import type { Logger, ReplyTarget } from './types.ts';
@@ -154,7 +154,7 @@ export class BotController {
     try {
       await client.start();
       const config = (await client.call('config/read', { includeLayers: false })).config;
-      const providers = Object.entries(config.model_providers || {}).map(([id, item]: [string, any]) => ({ id, name: item.name || id }));
+      const providers = Object.entries(config.model_providers || {}).filter(([id]) => id !== openAIHttpProvider).map(([id, item]: [string, any]) => ({ id, name: item.name || id }));
       if (!providers.some((provider) => provider.id === 'openai')) providers.unshift({ id: 'openai', name: 'OpenAI' });
       const skills = await client.call('skills/list', { cwds: [this.store.read().cwd] });
       return { providers, skills: (skills.data || []).flatMap((entry: any) => entry.skills || []).map((skill: any) => ({ name: skill.name, description: skill.description, path: skill.path, enabled: skill.enabled })) };

@@ -6,7 +6,7 @@ import { callService, ensureService } from './service.ts';
 import { uiDocument } from './ui-document.ts';
 
 export async function startMcp(): Promise<void> {
-  const server = new McpServer({ name: 'codex-qqbot', title: 'QQ Bot', version: '0.0.1' });
+  const server = new McpServer({ name: 'codex-qqbot', title: 'QQ Bot', version: '0.0.2' });
   const textResult = (value: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
     ...(value && typeof value === 'object' && !Array.isArray(value) ? { structuredContent: value as Record<string, unknown> } : {}) });
   const execute = async (method: string, params: Record<string, unknown> = {}) => {

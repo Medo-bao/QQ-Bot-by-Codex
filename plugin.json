@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "codex-qqbot",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Connect QQ private and group chats to local Codex sessions, with QR binding, streaming replies, file delivery and approvals.",
   "author": {
     "name": "Local adaptation of tencent-connect/dsh-qqbot"

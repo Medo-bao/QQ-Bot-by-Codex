@@ -113,7 +113,15 @@ export async function startService(logger: Logger, directory = dataDirectory()):
     for (const socket of sockets) socket.end();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
-  await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(address, () => resolve()); });
+  try {
+    await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(address, () => resolve()); });
+  } catch (error) {
+    // Several MCP clients can launch a daemon before the first one starts listening.
+    // The listener owns the service; the losing process can simply reuse it and exit.
+    if ((error as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw error;
+    await callService('status', {}, directory);
+    return;
+  }
   if (process.platform !== 'win32') chmodSync(address, 0o600);
   process.once('SIGINT', () => { void shutdown(); });
   process.once('SIGTERM', () => { void shutdown(); });

@@ -17,6 +17,8 @@ export interface RpcMessage {
   error?: { code: number; message: string };
 }
 
+export const openAIHttpProvider = 'qqbot-openai-http';
+
 /** Prefer a native executable on Windows, without invoking a shell or quoting user text. */
 export function codexExecutable(command: string): { command: string; prefix: string[] } {
   if (extname(command) === '.js' || extname(command) === '.mjs') return { command: process.execPath, prefix: [command] };
@@ -47,8 +49,9 @@ export class CodexClient {
   requestHandler?: (message: RpcMessage) => Promise<unknown>;
   private closing = false;
   private runtimeHome?: string;
+  private defaultModelProvider = 'openai';
 
-  constructor(private readonly config: Pick<BotConfig, 'codexCommand' | 'codexArgs' | 'cwd'>, private readonly logger: Logger) {}
+  constructor(private readonly config: Pick<BotConfig, 'codexCommand' | 'codexArgs' | 'cwd' | 'responsesTransport'>, private readonly logger: Logger) {}
 
   generatedImageDirectory(threadId: string): string | undefined {
     return this.runtimeHome ? join(this.runtimeHome, 'generated_images', threadId) : undefined;
@@ -98,7 +101,9 @@ export class CodexClient {
     this.runtimeHome = botCodexHome();
     // Plugin MCP discovery happens at server startup, before per-thread config applies.
     const child = spawn(executable.command, [...executable.prefix, 'app-server', ...this.config.codexArgs,
+      ...(this.config.responsesTransport !== 'auto' ? ['-c', `model_providers.${openAIHttpProvider}={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=false}`] : []),
       '-c', 'plugins.codex-qqbot@qqbot-local.enabled=false',
+      '-c', 'notify=[]',
       '-c', 'developer_instructions=""', '-c', 'project_doc_max_bytes=0', '-c', 'personality="none"',
       '-c', 'memories.use_memories=false', '-c', 'memories.generate_memories=false'], {
       cwd: this.config.cwd,
@@ -127,15 +132,20 @@ export class CodexClient {
       }
     });
     await this.call('initialize', {
-      clientInfo: { name: 'codex_qqbot', title: 'QQ Bot', version: '0.0.1' },
+      clientInfo: { name: 'codex_qqbot', title: 'QQ Bot', version: '0.0.2' },
       capabilities: { experimentalApi: true },
     });
     this.notify('initialized', {});
+    const settings = await this.call('config/read', { includeLayers: false });
+    this.defaultModelProvider = settings.config?.model_provider || 'openai';
   }
 
   call(method: string, params: Record<string, unknown> = {}, timeoutMs = 60000): Promise<any> {
     if (this.closing || !this.child || this.child.killed || !this.child.stdin.writable) return Promise.reject(new Error('Codex App Server 未启动或已关闭。'));
-    if (method === 'thread/start' || method === 'thread/resume') params = isolateThreadInstructions(params);
+    if (method === 'thread/start' || method === 'thread/resume') {
+      const provider = params.modelProvider || this.defaultModelProvider;
+      params = isolateThreadInstructions({ ...params, modelProvider: provider === 'openai' && this.config.responsesTransport !== 'auto' ? openAIHttpProvider : provider });
+    }
     const id = ++this.sequence;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {

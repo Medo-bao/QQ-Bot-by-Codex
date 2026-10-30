@@ -1,4 +1,4 @@
-import { QQBot, contentSanitizer, envelopeFormatter, errorHandler, mentionGate, messageFilter, rateLimiter, typingIndicator } from '@tencent-connect/qqbot-nodejs';
+import { QQBot, contentSanitizer, errorHandler, mentionGate, messageFilter, rateLimiter, typingIndicator } from '@tencent-connect/qqbot-nodejs';
 import type { InlineKeyboard, InteractionEvent } from '@tencent-connect/qqbot-nodejs';
 import { cacheEventId, cacheMsgId } from './transport/msgid-cache.ts';
 import { resolveReplyTarget, sendResolvedMarkdown } from './transport/reply-target.ts';
@@ -50,7 +50,7 @@ export class QQTransport implements ChatTransport {
       appId: config.appId,
       appSecret: config.appSecret,
       transport: 'websocket',
-      userAgent: 'codex-qqbot/0.0.1',
+      userAgent: 'codex-qqbot/0.0.2',
       logger,
       baseUrl: process.env.QQBOT_BASE_URL || 'https://api.bot.qq.com',
       tokenBaseUrl: process.env.QQBOT_TOKEN_BASE_URL || 'https://api.bot.qq.com',
@@ -61,7 +61,6 @@ export class QQTransport implements ChatTransport {
     this.bot.use(mentionGate({ requireMentionInGroup: config.requireMention, passthrough: true }));
     this.bot.use(contentSanitizer({ parseFaceTags: true }));
     this.bot.use(typingIndicator());
-    this.bot.use(envelopeFormatter({ historyLimit: config.historyLimit, includeQuote: false, includeSender: true }));
     this.bot.on('error', (error) => logger.error(`QQ: ${error instanceof Error ? error.message : error}`));
     this.bot.on('resumed', () => { if (!this.stopping) this.onConnected?.(); });
     this.bot.on('disconnected', (event) => {
@@ -88,7 +87,6 @@ export class QQTransport implements ChatTransport {
       const mention = context.state.mention as { shouldAnswer?: boolean } | undefined;
       try {
         await onMessage({ target, senderId: message.senderId, senderName: message.senderName, text: message.content,
-          envelope: context.state.envelope as string | undefined,
           shouldAnswer: mention?.shouldAnswer !== false,
           attachments: (message.attachments || []) as RawAttachment[],
           receivedAt: context.receivedAt,
