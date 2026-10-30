@@ -5,9 +5,9 @@ import { resolveReplyTarget, sendResolvedMarkdown } from './transport/reply-targ
 import { ReplyLimiter } from './transport/reply-limiter.ts';
 import { replyPolicy } from './transport/reply-policy.ts';
 import type { BotConfig } from './config.ts';
-import type { Logger, RawAttachment, ReplyTarget } from './types.ts';
+import type { FileSendMode, Logger, RawAttachment, ReplyTarget } from './types.ts';
 import type { QQBotSender } from './transport/outbound-buffer.ts';
-import { extname } from 'node:path';
+import { fileSendKind } from './media.ts';
 import { referenceFromMessage, type MessageReference } from './message-reference.ts';
 
 export interface IncomingMessage {
@@ -34,7 +34,7 @@ export interface IncomingInteraction {
 export interface ChatTransport extends QQBotSender {
   connect(onMessage: (message: IncomingMessage) => Promise<void>, onInteraction: (event: IncomingInteraction) => boolean): Promise<void>;
   close(): void;
-  sendFile(target: ReplyTarget, path: string, fileName: string): Promise<unknown>;
+  sendFile(target: ReplyTarget, path: string, fileName: string, sendAs?: FileSendMode): Promise<unknown>;
 }
 
 export class QQTransport implements ChatTransport {
@@ -50,7 +50,7 @@ export class QQTransport implements ChatTransport {
       appId: config.appId,
       appSecret: config.appSecret,
       transport: 'websocket',
-      userAgent: 'codex-qqbot/0.0.2',
+      userAgent: 'codex-qqbot/0.0.3',
       logger,
       baseUrl: process.env.QQBOT_BASE_URL || 'https://api.bot.qq.com',
       tokenBaseUrl: process.env.QQBOT_TOKEN_BASE_URL || 'https://api.bot.qq.com',
@@ -135,12 +135,12 @@ export class QQTransport implements ChatTransport {
     return this.bot.openStream({ target: { scope: resolved.scope, targetId: resolved.targetId, msgId: resolved.msgId } });
   }
 
-  sendFile(target: ReplyTarget, path: string, fileName: string): Promise<unknown> {
+  sendFile(target: ReplyTarget, path: string, fileName: string, sendAs: FileSendMode = 'auto'): Promise<unknown> {
+    const kind = fileSendKind(path, sendAs);
     const resolved = resolveReplyTarget(target, this.limiters[target.scope], false);
-    const extension = extname(path).toLowerCase();
-    if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'].includes(extension)) return this.bot.sendImage(resolved, { localPath: path });
-    if (['.mp4', '.mov', '.avi', '.mkv', '.webm'].includes(extension)) return this.bot.sendVideo(resolved, { localPath: path });
-    if (['.silk', '.amr', '.mp3', '.wav', '.ogg', '.aac'].includes(extension)) return this.bot.sendVoice(resolved, { localPath: path });
+    if (kind === 'image') return this.bot.sendImage(resolved, { localPath: path });
+    if (kind === 'video') return this.bot.sendVideo(resolved, { localPath: path });
+    if (kind === 'voice') return this.bot.sendVoice(resolved, { localPath: path });
     return this.bot.sendFile(resolved, { localPath: path }, { fileName });
   }
 

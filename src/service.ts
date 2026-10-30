@@ -91,7 +91,7 @@ export async function startService(logger: Logger, directory = dataDirectory()):
           switch (request.method) {
             case 'setup': result = { url: await page.open(), ...controller.status() }; break;
             case 'send': result = await controller.send(target(params), String(params.text)); break;
-            case 'sendFile': result = await controller.sendFile(target(params), String(params.file_path)); break;
+            case 'sendFile': result = await controller.sendFile(target(params), String(params.file_path), params.send_as); break;
             case 'shutdown': result = { stopped: true }; break;
             default: result = await controller.invoke(request.method, params);
           }

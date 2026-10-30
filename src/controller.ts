@@ -8,7 +8,7 @@ import QRCode from 'qrcode';
 import { SessionStore, sessionNameSchema, sessionSettingsSchema, sessionPermissions } from './session-store.ts';
 import { readConversation } from './conversation.ts';
 import { ConversationStorage } from './storage.ts';
-import { MediaStore } from './media.ts';
+import { MediaStore, fileSendModeSchema } from './media.ts';
 import { readFile, stat } from 'node:fs/promises';
 import { basename, extname } from 'node:path';
 
@@ -119,9 +119,9 @@ export class BotController {
     await this.bridge.send(target, text); return { sent: true };
   }
 
-  async sendFile(target: ReplyTarget, path: string): Promise<unknown> {
+  async sendFile(target: ReplyTarget, path: string, sendAs?: unknown): Promise<unknown> {
     if (!this.bridge || !this.connected) throw new Error('QQ 连接尚未启动。');
-    await this.bridge.sendFile(target, path); return { sent: true };
+    await this.bridge.sendFile(target, path, fileSendModeSchema.parse(sendAs)); return { sent: true };
   }
 
   async models(): Promise<unknown> {
@@ -204,7 +204,7 @@ export class BotController {
         for (const message of current.messages) {
           const index = page.messages.findIndex((item) => item.id === message.id);
           const visible = { ...message, turnId: current.turnId };
-          if (index >= 0) page.messages[index] = visible; else page.messages.push(visible);
+          if (index >= 0) page.messages[index] = { ...page.messages[index]!, ...visible }; else page.messages.push(visible);
         }
         for (const activity of current.activities) {
           const index = page.activities.findIndex((item) => item.id === activity.id);
@@ -223,7 +223,7 @@ export class BotController {
     const storage = new ConversationStorage(this.store.directory, config);
     const actual = await new MediaStore(this.store.directory, config).allowedFile(path, [storage.paths(target).directory, saved.cwd || config.presets[saved.preset || config.preset]?.cwd || config.cwd]);
     if (config.sendFile.restrictPaths) storage.assertFile(target, actual);
-    const types: Record<string, string> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif' };
+    const types: Record<string, string> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif', '.bmp': 'image/bmp' };
     const mime = types[extname(actual).toLowerCase()]; if (!mime) throw new Error('该文件类型不支持图片预览。');
     if ((await stat(actual)).size > config.vision.maxBytes) throw new Error('图片超过预览大小上限，请从存储目录查看。');
     return { name: basename(actual), dataUrl: `data:${mime};base64,${(await readFile(actual)).toString('base64')}` };
@@ -270,7 +270,7 @@ export class BotController {
         }
         if (params.action === 'sendFile') {
           if (typeof params.file_path !== 'string' || !params.file_path) throw new Error('请选择要发送的文件。');
-          return this.sendFile({ scope: params.scope, targetId: params.target_id }, params.file_path);
+          return this.sendFile({ scope: params.scope, targetId: params.target_id }, params.file_path, params.send_as);
         }
         if (params.action === 'send') {
           if (typeof params.text !== 'string' || !params.text.trim()) throw new Error('请输入要发送的消息。');

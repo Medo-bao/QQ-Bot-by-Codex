@@ -5,7 +5,7 @@ description: 设置、绑定和管理 QQ Bot，让 QQ 私聊或群聊通过本�
 
 # QQ Bot
 
-The current plugin version is 0.0.2. Change it only when explicitly requested.
+The current plugin version is 0.0.3. Change it only when explicitly requested.
 
 Use this plugin's `qqbot_*` MCP tools. If they are absent, ask the user to install
 and enable `codex-qqbot` from the local marketplace, then open a new chat.
@@ -54,13 +54,15 @@ Sessions can also override sandbox, approval policy, command network access and
 web search. Empty values inherit global settings; restore-global clears all overrides.
 Activity details are local by default, including recovered tool failures. Only sync
 those diagnostics to QQ when the configured showToolResults option is enabled.
+Public reasoning summaries and plans appear alongside progress and streamed command
+output in chronological, collapsible activity; summaries are local to the conversation UI.
 Session names appear in the toolbar and storage paths in Session settings. Native image directories point
 to the peer's archive; generated files and history persist across context resets.
 Recent group context is persistent and includes complete received messages with
 stable speaker IDs and bot replies. Existing current-thread history is backfilled;
 only messages actually delivered to the bot can be recovered. Authorized non-mention
 messages remain context without triggering replies. Explicit resets clear recent
-context and preserve archived records. The plugin version remains 0.0.2.
+context and preserve archived records. The plugin version remains 0.0.3.
 Group messages require an @mention by default. `/new`, `/compact`, `/model`, `/effort`,
 `/preset`, `/stop`, `/bot-status`, `/bot-help` and `/answer` work inside QQ. Codex approvals
 and questions are delivered to QQ; QQ replies must come from the task's initiating
@@ -78,6 +80,10 @@ or files to other people on your own initiative. A request received through a
 configured QQ session authorizes the bridge's reply to that same conversation;
 it does not authorize unrelated recipients. Preserve the chosen destination and
 text. File sends obey the configured workspace and extra-root allowlist.
+For an original downloadable file, set `send_as: "file"`; do not wrap an MP3 in
+ZIP merely to prevent a voice message. Ordinary audio (MP3, WAV, OGG, AAC, etc.)
+defaults to a file. Use `send_as: "voice"` only when a voice message is requested.
+`auto` keeps image/video previews and native SILK/AMR voice messages.
 
 QQ conversation threads automatically receive scoped `qqbot_send_file` and
 `qqbot_ask_question` tools. They do not start another bridge MCP instance.

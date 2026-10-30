@@ -8,6 +8,7 @@ import type { Logger } from './types.ts';
 import { isolateThreadInstructions } from './prompt-policy.ts';
 import { botCodexHome } from './codex-home.ts';
 import { contextUsage, type ContextUsage } from './context-usage.ts';
+import { refreshThreadTool, type ThreadToolSpec } from './thread-tool-cache.ts';
 
 export interface RpcMessage {
   id?: number | string;
@@ -55,6 +56,11 @@ export class CodexClient {
 
   generatedImageDirectory(threadId: string): string | undefined {
     return this.runtimeHome ? join(this.runtimeHome, 'generated_images', threadId) : undefined;
+  }
+
+  async refreshThreadTool(threadId: string, tool: ThreadToolSpec): Promise<boolean> {
+    if (!this.runtimeHome) throw new Error('Codex App Server 尚未启动。');
+    return refreshThreadTool(this, this.runtimeHome, threadId, tool);
   }
 
   async readContextUsage(threadId: string): Promise<ContextUsage | undefined> {
@@ -132,7 +138,7 @@ export class CodexClient {
       }
     });
     await this.call('initialize', {
-      clientInfo: { name: 'codex_qqbot', title: 'QQ Bot', version: '0.0.2' },
+      clientInfo: { name: 'codex_qqbot', title: 'QQ Bot', version: '0.0.3' },
       capabilities: { experimentalApi: true },
     });
     this.notify('initialized', {});

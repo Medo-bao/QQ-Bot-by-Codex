@@ -27,7 +27,7 @@ let activeSearchQuery = '';
 let searchGroupCollapsed = false;
 let globalPermissionPicker: ReturnType<typeof permissionPicker> | undefined;
 const directMessageDrafts = new Map<string, string>();
-type DirectFile = { file: File; preview?: string; path?: string; status?: string };
+type DirectFile = { file: File; sendAs: 'auto' | 'file' | 'voice'; preview?: string; path?: string; status?: string };
 const directFileDrafts = new Map<string, DirectFile[]>();
 let directSending = false;
 const dirtySessions = new Set<string>();
@@ -76,7 +76,7 @@ const fields: Record<string, Field[]> = {
     { path: 'vision.maxOutputChars', label: '图片分析回复字符上限', kind: 'number' },
     { path: 'vision.timeoutMs', label: '图片分析超时（毫秒）', kind: 'number' },
     { path: 'sendFile.sendPresentedFiles', label: '自动发送回复中声明的交付文件', kind: 'boolean', wide: true },
-    { path: 'sendFile.restrictPaths', label: '限制文件发送目录', kind: 'boolean', wide: true },
+    { path: 'sendFile.restrictPaths', label: '限制文件发送目录', kind: 'boolean', wide: true, help: '开启时隔离其他会话的归档。完全访问会话可将外部文件自动归档到当前会话后发送，受限会话仍遵守目录白名单。' },
     { path: 'sendFile.maxFiles', label: '单轮最多发送文件数', kind: 'number' },
     { path: 'sendFile.extraRoots', label: '额外允许发送的目录', kind: 'lines', wide: true, help: '工作目录和媒体目录已自动允许；每行一个绝对目录。' },
   ],
@@ -451,7 +451,8 @@ async function loadConversation(session: any, cursor?: string, force = false): P
 
 function fileCard(file: { path: string; name: string; image?: boolean }, key: string): HTMLElement {
   const record = chatRecord(key); const card = document.createElement('figure'); card.className = 'message-file';
-  const image = file.image ?? /\.(png|jpe?g|gif|webp)(?:\?.*)?$/i.test(file.path);
+  card.dataset.filePath = file.path;
+  const image = file.image ?? /\.(png|jpe?g|gif|webp|bmp)(?:\?.*)?$/i.test(file.path);
   const show = (url: string) => { const img = document.createElement('img'); img.src = url; img.alt = file.name; img.loading = 'lazy'; card.replaceChildren(img); const caption = document.createElement('figcaption'); caption.textContent = file.name; card.append(caption); };
   const cached = record.previews.get(file.path); if (cached && image) { show(cached); return card; }
   const button = document.createElement('button'); button.type = 'button'; button.className = 'file-button'; button.textContent = `${image ? '查看图片' : '复制文件路径'} · ${file.name}`; button.title = file.path;
@@ -465,10 +466,23 @@ function fileCard(file: { path: string; name: string; image?: boolean }, key: st
   card.append(button); return card;
 }
 
-function richText(text: string, key: string): HTMLElement {
+function localFileKey(path: string): string {
+  let local = path.replace(/^sandbox:/i, '');
+  if (/^file:/i.test(local)) { try { local = decodeURIComponent(new URL(local).pathname).replace(/^\/([a-z]:)/i, '$1'); } catch { /* A malformed link stays a literal file reference. */ } }
+  local = local.replace(/\\/g, '/');
+  return /^[a-z]:/i.test(local) ? local.toLowerCase() : local;
+}
+
+function richText(text: string, key: string, files: Array<{ path: string; name: string; image?: boolean; aliases?: string[] }> = []): HTMLElement {
   const rendered = renderMarkdown(text);
+  const shown = new Set<string>();
   for (const file of rendered.querySelectorAll<HTMLElement>('[data-qq-file]')) {
-    const path = file.dataset.qqFile!; file.replaceWith(fileCard({ path, name: file.textContent || path.replace(/\\/g, '/').split('/').pop()! }, key));
+    const path = file.dataset.qqFile!;
+    const sent = files.find(entry => [entry.path, ...(entry.aliases || [])].some(alias => localFileKey(alias) === localFileKey(path)));
+    const fileKey = localFileKey(sent?.path || path);
+    if (shown.has(fileKey)) { file.replaceWith(document.createTextNode(file.textContent || '')); continue; }
+    shown.add(fileKey);
+    file.replaceWith(fileCard(sent || { path, name: file.textContent || path.replace(/\\/g, '/').split('/').pop()! }, key));
   }
   for (const link of rendered.querySelectorAll<HTMLAnchorElement>('a[href]')) link.onclick = (event) => { if (app) { event.preventDefault(); void app.openLink({ url: link.href }); } };
   return rendered;
@@ -477,6 +491,12 @@ function richText(text: string, key: string): HTMLElement {
 function renderChatMessages(key: string, older = false): void {
   if ($('sessions').firstElementChild?.getAttribute('data-session') !== key) return;
   const container = $('chatHistory'); const record = chatRecord(key);
+  const focus = document.activeElement as HTMLElement | null;
+  const focusedActivity = focus?.tagName === 'SUMMARY' && container.contains(focus) ? focus.parentElement?.dataset.activityKey : undefined;
+  const logPositions = new Map<string, number>();
+  for (const log of container.querySelectorAll<HTMLElement>('.activity-tool > pre')) {
+    const activityKey = log.parentElement?.dataset.activityKey; if (activityKey) logPositions.set(activityKey, log.scrollTop);
+  }
   const oldHeight = container.scrollHeight; const oldTop = container.scrollTop;
   const { scrollTop, followLatest } = record;
   const messages = document.createElement('div'); messages.className = 'chat-messages';
@@ -492,23 +512,35 @@ function renderChatMessages(key: string, older = false): void {
     const tools = record.activities.filter((item) => item.turnId === turnId);
     if (!comments.length && !tools.length && turnId !== record.activeTurnId) return;
     const details = document.createElement('details'); details.className = 'turn-activity'; details.dataset.turn = turnId;
+    details.dataset.activityKey = `turn:${turnId}`;
     details.open = record.activityOpen.get(turnId) ?? turnId === record.activeTurnId;
     let renderedOpen = details.open;
     details.ontoggle = () => { if (details.isConnected && details.open !== renderedOpen) { record.activityOpen.set(turnId, details.open); renderedOpen = details.open; } };
     const summary = document.createElement('summary');
-    const label = document.createElement('span'); label.className = 'activity-label'; label.textContent = turnId === record.activeTurnId ? '正在处理' : '活动';
-    const count = document.createElement('span'); count.className = 'activity-count'; count.textContent = tools.length ? tools.map((tool) => tool.label).filter((label, index, values) => values.indexOf(label) === index).join(' · ') : `${comments.length} 条进展`;
+    const thinking = tools.some(tool => tool.kind === 'reasoning' && tool.status === 'running');
+    const label = document.createElement('span'); label.className = 'activity-label'; label.textContent = turnId === record.activeTurnId ? thinking ? '正在思考' : '正在处理' : tools.some(tool => tool.kind === 'reasoning') ? '思考与活动' : '活动';
+    const count = document.createElement('span'); count.className = 'activity-count'; count.textContent = tools.length ? tools.map((tool) => tool.label).filter((label, index, values) => values.indexOf(label) === index).join(' · ') : comments.length ? `${comments.length} 条进展` : '等待模型响应…';
     summary.append(label, count); details.append(summary);
     const body = document.createElement('div'); body.className = 'activity-body';
-    for (const comment of comments) { const entry = richText(comment.text, key); entry.classList.add('activity-comment'); body.append(entry); }
-    for (const tool of tools) {
-      const entry = document.createElement('details'); entry.className = 'activity-tool'; entry.dataset.status = tool.status;
+    const entries = [...comments.map((comment, index) => ({ comment, tool: null as any, order: comment.order ?? index })),
+      ...tools.map((tool, index) => ({ tool, comment: null as any, order: tool.order ?? comments.length + index }))].sort((a, b) => a.order - b.order);
+    for (const { comment, tool } of entries) {
+      if (comment) { const entry = richText(comment.text, key); entry.classList.add('activity-comment'); body.append(entry); continue; }
+      const prose = tool.kind === 'reasoning' || tool.kind === 'plan';
+      const entry = document.createElement('details'); entry.className = `activity-tool${prose ? ' activity-prose' : ''}`; entry.dataset.status = tool.status; entry.dataset.kind = tool.kind;
       const openKey = `tool:${tool.id}`;
-      entry.open = record.activityOpen.get(openKey) || false;
+      entry.dataset.activityKey = openKey;
+      entry.open = record.activityOpen.get(openKey) ?? (prose && tool.status === 'running');
       let renderedOpen = entry.open;
       entry.ontoggle = () => { if (entry.isConnected && entry.open !== renderedOpen) { record.activityOpen.set(openKey, entry.open); renderedOpen = entry.open; } };
-      const title = document.createElement('summary'); title.textContent = `${tool.status === 'failed' ? '未完成 · ' : ''}${tool.label}`; entry.append(title);
-      if (tool.detail) { const detail = document.createElement('pre'); detail.textContent = tool.detail; entry.append(detail); }
+      const title = document.createElement('summary'); title.textContent = `${tool.status === 'failed' ? '未完成 · ' : ''}${tool.kind === 'reasoning' && tool.status === 'running' ? '正在思考' : tool.label}`; entry.append(title);
+      if (tool.detail) {
+        const detail = prose ? richText(tool.detail, key) : document.createElement('pre');
+        if (!prose) detail.textContent = tool.detail;
+        entry.append(detail);
+      } else if (prose && tool.status === 'running') {
+        const pending = document.createElement('p'); pending.className = 'activity-placeholder'; pending.textContent = tool.kind === 'reasoning' ? '正在等待思考摘要…' : '正在整理计划…'; entry.append(pending);
+      }
       body.append(entry);
     }
     details.append(body); messages.append(details);
@@ -526,10 +558,10 @@ function renderChatMessages(key: string, older = false): void {
     author.textContent = message.role === 'assistant' ? message.replyToId || message.replyToName ? `QQ Bot → ${member(message.replyToName, message.replyToId)}` : ''
       : message.scope === 'group' ? member(message.authorName, message.authorId) : '';
     author.title = message.role === 'assistant' ? message.replyToId || '' : message.authorId || '';
-    const text = message.role === 'assistant' ? richText(message.text, key) : document.createElement('div');
+    const text = message.role === 'assistant' ? richText(message.text, key, message.files) : document.createElement('div');
     if (message.role !== 'assistant') { text.className = 'message-text'; text.textContent = message.text; }
     article.append(author, text);
-    for (const file of message.files || []) article.append(fileCard(file, key));
+    for (const file of message.files || []) if (![...text.querySelectorAll<HTMLElement>('.message-file')].some(card => card.dataset.filePath === file.path)) article.append(fileCard(file, key));
     if (message.role === 'assistant' && message.text) {
       const copy = document.createElement('button'); copy.className = 'copy-message'; copy.type = 'button'; copy.textContent = '复制'; copy.setAttribute('aria-label', '复制回复');
       copy.onclick = async () => { try { await navigator.clipboard.writeText(message.text); copy.textContent = '已复制'; } catch { copy.textContent = '复制失败'; } };
@@ -562,6 +594,11 @@ function renderChatMessages(key: string, older = false): void {
   }
   if (record.error || record.taskError) { const error = document.createElement('p'); error.textContent = record.error || record.taskError || ''; error.className = 'chat-error'; error.setAttribute('role', 'alert'); messages.append(error); }
   container.replaceChildren(messages);
+  for (const log of container.querySelectorAll<HTMLElement>('.activity-tool > pre')) log.scrollTop = logPositions.get(log.parentElement?.dataset.activityKey || '') || 0;
+  if (focusedActivity) {
+    const restored = [...container.querySelectorAll<HTMLElement>('details[data-activity-key]')].find(item => item.dataset.activityKey === focusedActivity);
+    restored?.querySelector<HTMLElement>(':scope > summary')?.focus({ preventScroll: true });
+  }
   if (container.clientHeight) {
     container.scrollTop = older ? oldTop + container.scrollHeight - oldHeight : followLatest ? container.scrollHeight : scrollTop;
     record.scrollTop = container.scrollTop;
@@ -622,15 +659,21 @@ function renderDirectFiles(): void {
     const name = document.createElement('strong'); name.textContent = entry.file.name;
     const status = document.createElement('small'); status.textContent = `${fileSize(entry.file.size)} · ${entry.status || '等待发送'}`;
     body.append(name, status);
+    const mode = document.createElement('select'); mode.setAttribute('aria-label', `${entry.file.name} 的发送方式`); mode.disabled = directSending;
+    const audio = entry.file.type.startsWith('audio/') || /\.(mp3|wav|ogg|aac|flac|m4a|silk|amr)$/i.test(entry.file.name);
+    for (const [value, label] of [['auto', '自动识别'], ['file', '按文件发送'], ...(audio ? [['voice', '按语音发送']] : [])]) {
+      const option = document.createElement('option'); option.value = value!; option.textContent = label!; mode.append(option);
+    }
+    mode.value = entry.sendAs; mode.onchange = () => { entry.sendAs = mode.value as DirectFile['sendAs']; };
     const remove = document.createElement('button'); remove.type = 'button'; remove.textContent = '移除'; remove.disabled = directSending; remove.setAttribute('aria-label', `移除 ${entry.file.name}`);
     remove.onclick = () => {
       if (entry.preview) URL.revokeObjectURL(entry.preview);
       directFileDrafts.set(key, (directFileDrafts.get(key) || []).filter(item => item !== entry)); renderDirectFiles();
     };
-    row.append(body, remove); return row;
+    row.append(body, mode, remove); return row;
   }));
   $<HTMLButtonElement>('addDirectFiles').disabled = directSending;
-  $('directFileLimit').textContent = `可拖入文件或粘贴图片 · 最多 ${state.config.sendFile.maxFiles} 个，每个不超过 ${state.config.media.maxMB} MB`;
+  $('directFileLimit').textContent = `可拖入文件或粘贴图片 · 最多 ${state.config.sendFile.maxFiles} 个，每个不超过 ${state.config.media.maxMB} MB · MP3 等普通音频默认按文件发送`;
   updateDirectSend();
 }
 
@@ -902,7 +945,7 @@ function bindEvents(): void {
     for (const file of selected) {
       if (!file.size || file.size > state.config.media.maxMB * 1024 * 1024) { skipped.push(`${file.name}：文件须非空且不超过 ${state.config.media.maxMB} MB。`); continue; }
       if (files.length >= state.config.sendFile.maxFiles) { limitReached = true; continue; }
-      files.push({ file, ...(file.type.startsWith('image/') ? { preview: URL.createObjectURL(file) } : {}) });
+      files.push({ file, sendAs: 'auto', ...(file.type.startsWith('image/') ? { preview: URL.createObjectURL(file) } : {}) });
     }
     directFileDrafts.set(key, files); renderDirectFiles();
     if (limitReached) skipped.push(`已达 ${state.config.sendFile.maxFiles} 个文件的上限，其余文件未添加。`);
@@ -946,7 +989,7 @@ function bindEvents(): void {
           $('directMessageProgress').textContent = `正在发送文件 ${index + 1}/${files.length}：${entry.file.name}`;
           const path = entry.path || await uploadDirectFile(session, entry);
           entry.status = '正在发送到 QQ…'; renderDirectFiles();
-          const result = await api('session', { action: 'sendFile', scope: session.scope, target_id: session.peerId, file_path: path });
+          const result = await api('session', { action: 'sendFile', scope: session.scope, target_id: session.peerId, file_path: path, send_as: entry.sendAs });
           if (!result.sent) throw new Error('文件未能发送。');
           sent++; if (entry.preview) URL.revokeObjectURL(entry.preview);
           directFileDrafts.set(draftKey, (directFileDrafts.get(draftKey) || []).filter(item => item !== entry)); renderDirectFiles();
@@ -1054,7 +1097,7 @@ function bindEvents(): void {
 async function main(): Promise<void> {
   document.body.dataset.transport = mode;
   if (mode === 'mcp') {
-    app = new App({ name: 'codex-qqbot-settings', title: 'QQ Bot', version: '0.0.2' }, {});
+    app = new App({ name: 'codex-qqbot-settings', title: 'QQ Bot', version: '0.0.3' }, {});
     app.onhostcontextchanged = (context) => { if (context.theme) document.body.dataset.theme = context.theme; };
     await app.connect();
     const theme = app.getHostContext()?.theme; if (theme) document.body.dataset.theme = theme;

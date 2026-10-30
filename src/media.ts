@@ -6,7 +6,24 @@ import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 import type { BotConfig } from './config.ts';
-import type { RawAttachment } from './types.ts';
+import { fileSendModes, type FileSendMode, type RawAttachment } from './types.ts';
+import { z } from 'zod';
+
+export const fileSendModeSchema = z.enum(fileSendModes).default('auto');
+
+export function localFilePath(path: string): string {
+  return /^file:/i.test(path) ? fileURLToPath(path) : path.replace(/^sandbox:/i, '');
+}
+
+export function fileSendKind(path: string, sendAs: FileSendMode = 'auto'): 'file' | 'image' | 'video' | 'voice' {
+  const mode = fileSendModeSchema.parse(sendAs);
+  if (mode !== 'auto') return mode;
+  const extension = extname(path).toLowerCase();
+  if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp'].includes(extension)) return 'image';
+  if (['.mp4', '.mov', '.avi', '.mkv', '.webm'].includes(extension)) return 'video';
+  if (['.silk', '.amr'].includes(extension)) return 'voice';
+  return 'file';
+}
 
 export type CodexInput = { type: 'text'; text: string } | { type: 'localImage'; path: string } | { type: 'skill'; name: string; path: string };
 
@@ -93,8 +110,8 @@ export class MediaStore {
     return { received };
   }
 
-  async allowedFile(path: string, workspaceRoots: string[] = []): Promise<string> {
-    path = /^file:/i.test(path) ? fileURLToPath(path) : path.replace(/^sandbox:/, '');
+  async allowedFile(path: string, workspaceRoots: string[] = [], importExternal?: (actual: string) => Promise<string>): Promise<string> {
+    path = localFilePath(path);
     if (!isAbsolute(path)) throw new Error('file_path 必须是绝对路径。');
     const actual = await realpath(path);
     if (!(await stat(actual)).isFile()) throw new Error('发送目标必须是普通文件。');
@@ -107,7 +124,10 @@ export class MediaStore {
         const rel = relative(actualRoot, actual);
         if (rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))) { allowed = true; break; }
       }
-      if (!allowed) throw new Error('文件不在工作目录、媒体目录或本会话允许的发送目录内。');
+      if (!allowed) {
+        if (importExternal) return importExternal(actual);
+        throw new Error('文件不在工作目录、媒体目录或本会话允许的发送目录内。请先将已获准读取的文件复制到本会话文件目录，再调用发送工具。');
+      }
     }
     return actual;
   }

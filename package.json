@@ -1,6 +1,6 @@
 {
   "name": "codex-qqbot",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": true,
   "description": "QQ private and group chat bridge for Codex, adapted from tencent-connect/dsh-qqbot.",
   "type": "module",
@@ -16,7 +16,7 @@
     "package:plugin": "node scripts/package-plugin.mjs"
   },
   "engines": {
-    "node": ">=20.3.0"
+    "node": ">=22.13.0"
   },
   "license": "MIT",
   "dependencies": {

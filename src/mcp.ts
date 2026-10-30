@@ -4,9 +4,10 @@ import { z } from 'zod';
 import { ConfigStore } from './config.ts';
 import { callService, ensureService } from './service.ts';
 import { uiDocument } from './ui-document.ts';
+import { fileSendModeSchema } from './media.ts';
 
 export async function startMcp(): Promise<void> {
-  const server = new McpServer({ name: 'codex-qqbot', title: 'QQ Bot', version: '0.0.2' });
+  const server = new McpServer({ name: 'codex-qqbot', title: 'QQ Bot', version: '0.0.3' });
   const textResult = (value: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
     ...(value && typeof value === 'object' && !Array.isArray(value) ? { structuredContent: value as Record<string, unknown> } : {}) });
   const execute = async (method: string, params: Record<string, unknown> = {}) => {
@@ -58,7 +59,7 @@ export async function startMcp(): Promise<void> {
     server.registerTool('qqbot_models', { title: 'QQ Bot 可用模型', description: 'List models and reasoning efforts available through the installed Codex login and configuration.', annotations: { readOnlyHint: true }, inputSchema: {} }, () => execute('models'));
     const destination = { scope: z.enum(['c2c', 'group']), target_id: z.string().min(1) };
     server.registerTool('qqbot_send_message', { title: 'QQ Bot 发送消息', description: 'Send a Markdown message to a specified QQ user or group. Use only when the human explicitly asks to send to this QQ conversation.', inputSchema: { ...destination, text: z.string().min(1) } }, (params) => execute('send', params));
-    server.registerTool('qqbot_send_file', { title: 'QQ Bot 发送文件', description: 'Send an existing local file to a specified QQ conversation, within configured allowed paths. Requires an explicit human request to send to that recipient.', inputSchema: { ...destination, file_path: z.string().min(1) } }, (params) => execute('sendFile', params));
+    server.registerTool('qqbot_send_file', { title: 'QQ Bot 发送文件', description: 'Send an existing local file to a specified QQ conversation, within configured allowed paths. MP3 defaults to an original file. Set send_as=file to force a downloadable file or send_as=voice for a voice message. Requires an explicit human request to send to that recipient.', inputSchema: { ...destination, file_path: z.string().min(1), send_as: fileSendModeSchema.describe('auto previews images/videos and native QQ voice; ordinary audio such as MP3 is sent as a file. file always preserves the original file and filename. voice sends audio as a voice message.') } }, (params) => execute('sendFile', params));
   }
   await server.connect(new StdioServerTransport());
 }

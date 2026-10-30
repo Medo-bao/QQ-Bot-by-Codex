@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFile, mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -10,7 +10,7 @@ import { promisify } from 'node:util';
 import { WebSocketServer } from 'ws';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { ConfigStore, CodexClient, QQBridge, QQTransport, BotController, InteractionBroker, MediaStore, configSchema, callService, describeImage,
+import { ConfigStore, CodexClient, QQBridge, QQTransport, BotController, InteractionBroker, MediaStore, configSchema, callService, describeImage, dynamicTools,
   ReplyLimiter, replyPolicy, cacheMsgId, getCachedReplyIds, resolveReplyTarget } from '../dist/index.js';
 
 const quiet = { info() {}, warn() {}, error() {}, debug() {} };
@@ -28,18 +28,58 @@ const currentText = turn => turn.params.input.find(input => input.type === 'text
 const groupContext = (turn) => JSON.parse(turn.params.input.find(input => input.type === 'text' && input.text.startsWith('[QQ Bot 群聊上下文：')).text.split('\n').slice(1).join('\n'));
 const referenceContext = turn => JSON.parse(turn.params.input.find(input => input.type === 'text' && input.text.startsWith('[QQ Bot 引用上下文：')).text.split('\n').slice(1).join('\n')).reference;
 class FakeQQ {
-  messages = []; files = []; streams = []; failedSends = 0; failNextMarkdown = false;
+  messages = []; files = []; streams = []; failedSends = 0; failNextMarkdown = false; fileDelayMs = 0;
   async connect(onMessage, onInteraction) { this.onMessage = onMessage; this.onInteraction = onInteraction; }
   close() { this.closed = true; }
   async sendMarkdown(target, text, opts) { if (this.failNextMarkdown) { this.failNextMarkdown = false; this.failedSends++; throw new Error('fixture QQ delivery unavailable'); } const receipt = { id: 'sent-' + this.messages.length, ext_info: { ref_idx: 'sent-ref-' + this.messages.length } }; this.messages.push({ target, text, opts, receipt }); return receipt; }
-  async sendFile(target, path, fileName) { const receipt = { id: 'file-' + this.files.length, ext_info: { ref_idx: 'file-ref-' + this.files.length } }; this.files.push({ target, path, fileName, receipt }); return receipt; }
+  async sendFile(target, path, fileName, sendAs = 'auto') { if (this.fileDelayMs) await new Promise(resolve => setTimeout(resolve, this.fileDelayMs)); const receipt = { id: 'file-' + this.files.length, ext_info: { ref_idx: 'file-ref-' + this.files.length } }; this.files.push({ target, path, fileName, sendAs, receipt }); return { upload: { file_info: 'fixture-media' }, message: receipt }; }
   openStream(target) { const receipt = { id: 'stream-' + this.streams.length, ext_info: { ref_idx: 'stream-ref-' + this.streams.length } }; const stream = { target, receipt, updates: [], completeCount: 0, async update(text) { this.updates.push(text); }, async complete() { this.completeCount++; return receipt; } }; this.streams.push(stream); return stream; }
 }
 
+test('Persisted QQ file tools refresh modes without replacing history or unrelated tools', async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  const directory = await temp(); const sessions = join(directory, 'sessions'); await mkdir(sessions);
+  const threadId = '11111111-2222-4333-8444-555555555555', path = join(sessions, 'legacy.jsonl');
+  const previous = structuredClone(dynamicTools[0]); previous.description = 'Legacy file sender'; delete previous.inputSchema.properties.send_as;
+  const unrelated = { type: 'function', name: 'unrelated_tool', description: 'Preserved', inputSchema: { type: 'object' } };
+  const history = Buffer.from(JSON.stringify({ type: 'response_item', payload: { text: '保留群聊上下文和文件路径 %20.png' } }) + '\n');
+  await writeFile(path, Buffer.concat([Buffer.from(JSON.stringify({ type: 'session_meta', payload: { id: threadId, dynamic_tools: [previous, unrelated] } }) + '\n'), history]));
+  const state = new DatabaseSync(join(directory, 'state_5.sqlite'));
+  state.exec('CREATE TABLE thread_dynamic_tools (thread_id TEXT, position INTEGER, name TEXT, description TEXT, input_schema TEXT, PRIMARY KEY(thread_id,position))');
+  const insert = state.prepare('INSERT INTO thread_dynamic_tools VALUES (?, ?, ?, ?, ?)');
+  insert.run(threadId, 0, previous.name, previous.description, JSON.stringify(previous.inputSchema));
+  insert.run(threadId, 1, unrelated.name, unrelated.description, JSON.stringify(unrelated.inputSchema));
+  const client = new CodexClient(configSchema.parse({ cwd: directory }), quiet); client.runtimeHome = directory;
+  let loaded = false;
+  client.call = async method => method === 'thread/read' ? { thread: { id: threadId, path } } : { data: loaded ? [threadId] : [] };
+  try {
+    assert.equal(await client.refreshThreadTool(threadId, dynamicTools[0]), true);
+    const updated = await readFile(path);
+    assert.ok(updated.subarray(updated.indexOf(10) + 1).equals(history));
+    const metadata = JSON.parse(updated.subarray(0, updated.indexOf(10)).toString());
+    assert.equal(metadata.payload.id, threadId);
+    assert.deepEqual(metadata.payload.dynamic_tools, [dynamicTools[0], unrelated]);
+    assert.deepEqual(JSON.parse(state.prepare('SELECT input_schema FROM thread_dynamic_tools WHERE name=?').get(previous.name).input_schema).properties.send_as.enum, ['auto', 'file', 'voice']);
+    assert.deepEqual(state.prepare('SELECT description FROM thread_dynamic_tools WHERE name=?').get(unrelated.name).description, unrelated.description);
+    loaded = true;
+    assert.equal(await client.refreshThreadTool(threadId, dynamicTools[0]), false, 'current schemas do not reload an active cache');
+    await assert.rejects(client.refreshThreadTool(threadId, { ...dynamicTools[0], description: 'A later revision' }), /重启/);
+    assert.ok((await readFile(path)).equals(updated), 'loaded threads are never rewritten');
+  } finally { state.close(); }
+});
+
 test('QQ → real JSONL child process: isolation, streaming, approvals, questions, file delivery, cancel and resume', { timeout: 30000 }, async t => {
   const directory = await temp();
-  let quoteDownloads = 0, quoteMediaExpired = false;
+  let quoteDownloads = 0, quoteMediaExpired = false, contextDownloads = 0, contextMediaExpired = false;
+  let releaseContextDownload, contextDownloadStarted = false;
   const quoteHttp = createServer((request, response) => {
+    if (request.url.startsWith('/context-')) {
+      contextDownloads++;
+      if (contextMediaExpired || request.url === '/context-expired.png') { response.writeHead(410); response.end(); return; }
+      const send = () => { response.setHeader('content-type', request.url.endsWith('.txt') ? 'text/plain' : 'image/png'); response.end(Buffer.from('ordinary context file')); };
+      if (request.url === '/context-slow.png') { contextDownloadStarted = true; releaseContextDownload = send; } else send();
+      return;
+    }
     quoteDownloads++;
     if (quoteMediaExpired || request.url === '/expired.png') { response.writeHead(410); response.end(); }
     else { response.setHeader('content-type', 'image/png'); response.end(Buffer.from('quoted-image-fixture')); }
@@ -49,6 +89,8 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
   const quoteBase = `http://127.0.0.1:${quoteHttp.address().port}`;
   const fullQuote = '引用完整正文-' + '完整资料'.repeat(180) + '-引用末尾';
   const quoteImage = { content_type: 'image/png', filename: 'quoted.png', size: 20, url: quoteBase + '/quoted.png' };
+  const contextImage = { content_type: 'image/png', filename: 'context-picture.png', size: 21, url: quoteBase + '/context-picture.png' };
+  const passiveContextImage = { ...message('普通图片', 'group', 'team', 'alice'), attachments: [contextImage], shouldAnswer: false };
   await writeFile(join(directory, 'report.txt'), 'requested report');
   await writeFile(join(directory, 'report.png'), 'image-fixture');
   await writeFile(join(directory, 'sessions.json'), JSON.stringify({ 'fixture-app:c2c:alice': { threadId: 'legacy-personal-thread' } }));
@@ -58,7 +100,8 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     presets: { coding: { name: 'Coding', model: 'fixture-model', prompt: 'preset-fixture-prompt', skills: ['fixture-skill'] } } });
   const qq = new FakeQQ();
   const client = new CodexClient(config, quiet);
-  const bridge = new QQBridge(config, directory, qq, client, quiet);
+  const warnings = [];
+  const bridge = new QQBridge(config, directory, qq, client, { ...quiet, warn: text => warnings.push(text) });
   await client.start();
   const legacyImages = client.generatedImageDirectory('legacy-personal-thread');
   await mkdir(legacyImages, { recursive: true });
@@ -138,6 +181,51 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     assert.equal(recentGroup.find(item => item.text === longHistory).senderId, 'alice');
     assert.ok(recentGroup.some(item => item.senderId === 'bob' && item.text === '第二位成员补充资料'));
     assert.ok(recentGroup.some(item => item.text.endsWith('-末尾线索')), 'messages longer than 200 characters keep their complete text');
+    const passiveReplies = qq.messages.length;
+    await bridge.handleMessage(passiveContextImage);
+    assert.equal(qq.messages.length, passiveReplies, 'receiving an ordinary group attachment never starts a reply');
+    await bridge.handleMessage(message('read ordinary previous image without quoting', 'group', 'team', 'bob'));
+    const ordinaryTurn = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('read ordinary previous image'));
+    const ordinaryFile = groupContext(ordinaryTurn).messages.find(item => item.id === passiveContextImage.contextId).files[0];
+    assert.equal(await readFile(ordinaryFile.path, 'utf8'), 'ordinary context file');
+    assert.ok(ordinaryTurn.params.input.some(item => item.type === 'localImage' && item.path === ordinaryFile.path), 'unquoted recent pictures reach model image input');
+    assert.equal(contextDownloads, 1);
+    await bridge.handleMessage(passiveContextImage);
+    assert.equal(contextDownloads, 1, 'gateway redelivery reuses the local ordinary attachment');
+    await rm(ordinaryFile.path);
+    await bridge.handleMessage(message('recover ordinary previous image', 'group', 'team', 'bob'));
+    const recoveredTurn = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('recover ordinary previous image'));
+    const recoveredFile = groupContext(recoveredTurn).messages.find(item => item.id === passiveContextImage.contextId).files[0];
+    assert.notEqual(recoveredFile.path, ordinaryFile.path);
+    assert.equal(await readFile(recoveredFile.path, 'utf8'), 'ordinary context file');
+    assert.equal(contextDownloads, 2, 'a missing cached file is restored from its recorded QQ attachment');
+    await bridge.handleMessage({ ...message('普通文档', 'group', 'team', 'alice'), attachments: [{ ...contextImage, content_type: 'text/plain', filename: 'context-note.txt', url: quoteBase + '/context-note.txt' }], shouldAnswer: false });
+    await bridge.handleMessage(message('read previous ordinary document', 'group', 'team', 'bob'));
+    const documentTurn = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('read previous ordinary document'));
+    const documentFile = groupContext(documentTurn).messages.find(item => item.files?.some(file => file.name === 'context-note.txt')).files[0];
+    assert.equal(await readFile(documentFile.path, 'utf8'), 'ordinary context file');
+    assert.ok(!documentTurn.params.input.some(item => item.type === 'localImage'), 'a document does not silently select an older picture');
+    const delayed = bridge.handleMessage({ ...message('正在接收的普通图片', 'group', 'team', 'alice'), attachments: [{ ...contextImage, filename: 'context-slow.png', url: quoteBase + '/context-slow.png' }], shouldAnswer: false });
+    await waitFor(() => contextDownloadStarted);
+    const followup = bridge.handleMessage(message('read image while its download is pending', 'group', 'team', 'bob'));
+    assert.ok(!requireTrace(directory).some(item => item.method === 'turn/start' && currentText(item).includes('while its download is pending')));
+    releaseContextDownload(); await Promise.all([delayed, followup]);
+    const delayedTurn = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('while its download is pending'));
+    assert.ok(delayedTurn.params.input.some(item => item.type === 'localImage' && item.path.includes('context-slow.png')));
+    await bridge.handleMessage({ ...message('过期的普通附件', 'group', 'team', 'alice'), attachments: [{ ...contextImage, filename: 'context-expired.png', url: quoteBase + '/context-expired.png' }], shouldAnswer: false });
+    await bridge.handleMessage(message('check unavailable ordinary attachment', 'group', 'team', 'bob'));
+    const unavailableTurn = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('unavailable ordinary attachment'));
+    const unavailableFile = groupContext(unavailableTurn).messages.find(item => item.files?.some(file => file.name === 'context-expired.png')).files[0];
+    assert.equal(unavailableFile.path, undefined); assert.match(unavailableFile.unavailable, /410/);
+    assert.ok(!unavailableTurn.params.input.some(item => item.type === 'localImage'), 'an expired latest picture is not replaced by an unrelated earlier image');
+    await bridge.handleMessage({ ...message('current ordinary image', 'group', 'team'), attachments: [contextImage] });
+    const currentImage = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('current ordinary image'));
+    assert.equal(currentImage.params.input.filter(item => item.type === 'localImage').length, 1, 'current non-quoted images are sent as image inputs');
+    config.media.enabled = false;
+    await bridge.handleMessage(message('ordinary media disabled', 'group', 'team'));
+    const disabledOrdinary = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('ordinary media disabled'));
+    assert.ok(!disabledOrdinary.params.input.some(item => item.type === 'localImage'), 'disabled media is not reintroduced through group context');
+    config.media.enabled = true;
     await bridge.handleMessage({ ...message(fullQuote, 'group', 'team', 'alice'), senderName: '原发言人', messageIndex: 'original-ref==', attachments: [quoteImage], shouldAnswer: false });
     await bridge.handleMessage({ ...message('read quoted context', 'group', 'team', 'bob'), reference: { key: 'original-ref==', text: fullQuote.slice(0, 80) } });
     const quoteTurn = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('read quoted context'));
@@ -181,12 +269,14 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     assert.ok(requireTrace(directory).some(item => item.method === 'turn/start' && currentText(item).includes('请查看引用消息。') && referenceContext(item).text === fullQuote), 'quote-only requests are not discarded');
     quoteMediaExpired = true;
     const beforeGeneratedFiles = qq.files.length;
+    qq.fileDelayMs = 15;
     await bridge.handleMessage(message('send-generated-image'));
     const generated = requireTrace(directory).find((item) => item.generatedImage)?.generatedImage;
     assert.equal(generated.delivery.success, true, 'the current thread generated-image folder is allowed by the actual dynamic tool');
     assert.equal(generated.repeated.success, true);
     assert.equal(generated.vision.success, true, 'image analysis resolves the same local file references as file delivery');
     assert.equal(generated.denied.success, false);
+    assert.ok(warnings.some(text => text.includes('QQ tool failed: qqbot_send_file') && text.includes('文件不在工作目录')), 'failure logs preserve the actual dynamic-tool error');
     assert.equal(qq.files.length, beforeGeneratedFiles + 1, 'the dynamic tool, sandbox alias and final Markdown link deliver the same image once');
     const deliveredImage = qq.files.at(-1);
     await bridge.handleMessage({ ...message('quote delivered bot image'), reference: { key: deliveredImage.receipt.ext_info.ref_idx } });
@@ -259,6 +349,48 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
       assert.equal(params.config.developer_instructions, params.developerInstructions);
       if (params.sandbox === 'workspace-write') assert.ok(params.config['sandbox_workspace_write.writable_roots'].some(root => root.includes('files')), 'the conversation output folder is writable without changing the task workspace');
     }
+    const beforeExternalFiles = qq.files.length;
+    await bridge.handleMessage(message('send-external-file restricted'));
+    assert.equal(requireTrace(directory).filter(item => item.externalFile).at(-1).externalFile.delivery.success, false, 'restricted sessions cannot import files outside their send roots');
+    assert.equal(qq.files.length, beforeExternalFiles);
+    await bridge.manageSession('c2c', 'alice', 'configure', { sandbox: 'danger-full-access' });
+    await bridge.handleMessage(message('send-external-file full'));
+    const external = requireTrace(directory).filter(item => item.externalFile).at(-1).externalFile;
+    assert.equal(external.delivery.success, true); assert.equal(external.repeated.success, true);
+    assert.equal(qq.files.length, beforeExternalFiles + 1, 'the staged file, URL alias and final link are delivered once');
+    const imported = qq.files.at(-1);
+    assert.equal(imported.fileName, 'external-song.mp3');
+    assert.equal(imported.sendAs, 'file', 'the dynamic file-mode option reaches the transport');
+    assert.ok(imported.path.startsWith(privatePaths.files));
+    assert.notEqual(imported.path, external.file);
+    assert.equal(await readFile(imported.path, 'utf8'), await readFile(external.file, 'utf8'));
+    const fileStore = new ConfigStore(directory); fileStore.update(config);
+    const fileViewer = new BotController(fileStore, quiet); fileViewer.bridge = bridge;
+    const importedHistory = await fileViewer.conversation('c2c', 'alice');
+    assert.ok(importedHistory.messages.flatMap(item => item.files || []).some(file => file.path === imported.path && !file.image), 'history records the staged file path rather than its external source');
+    assert.equal(config.sendFile.restrictPaths, true, 'full access does not disable the send-root setting');
+    await bridge.handleMessage(message('send-external-file voice'));
+    assert.equal(qq.files.length, beforeExternalFiles + 2, 'a final link does not resend an explicitly delivered voice message as a file');
+    assert.equal(qq.files.at(-1).sendAs, 'voice');
+    await assert.rejects(bridge.sendFile(message('').target, otherImage), /其他 QQ 会话/, 'full access still isolates other conversations');
+    await bridge.manageSession('c2c', 'alice', 'configure', { sandbox: '', approvalPolicy: '', approvalsReviewer: '', networkAccess: '' });
+    const beforeFileImage = qq.files.length;
+    const fileImageRun = bridge.handleMessage(message('send-generated-image file hold-file-card'));
+    await waitFor(() => bridge.broker.list().some(item => item.text.includes('确认文件卡片')));
+    assert.equal(qq.files.length, beforeFileImage + 1, 'parallel aliases and the final link deliver one original image file');
+    assert.equal(qq.files.at(-1).sendAs, 'file');
+    const imageHistory = await fileViewer.conversation('c2c', 'alice');
+    assert.ok(imageHistory.activeTurnId, 'the attachment is checked while its turn is still active');
+    assert.equal(imageHistory.messages.flatMap(item => item.files || []).filter(file => file.name === 'fixture100%.png').at(-1).image, false, 'an image sent as a file stays a file card during live updates');
+    bridge.submitLocal('c2c', 'alice', '继续'); await fileImageRun;
+    config.sendFile.maxFiles = 1;
+    const beforeParallel = qq.files.length;
+    await bridge.handleMessage(message('send-parallel-files'));
+    const parallel = requireTrace(directory).find(item => item.parallelFiles).parallelFiles;
+    assert.equal(parallel[0].success, true); assert.equal(parallel[1].success, true);
+    assert.equal(parallel[2].success, false); assert.match(parallel[2].contentItems[0].text, /数量上限/);
+    assert.equal(qq.files.length, beforeParallel + 1, 'parallel distinct files cannot exceed the per-turn quota');
+    config.sendFile.maxFiles = 4; qq.fileDelayMs = 0;
     const hanging = bridge.handleMessage(message('hang'));
     await waitFor(() => bridge.status().sessions.find((item) => item.threadId === first)?.busy);
     await bridge.manageSession('c2c', 'alice', 'rename', { name: '我的工作助手' });
@@ -283,6 +415,29 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     assert.ok(requireTrace(directory).some((item) => item.method === 'thread/start' && item.params.developerInstructions.includes('preset-fixture-prompt') && item.params.developerInstructions.includes('default-private-role')));
     await bridge.manageSession('c2c', 'alice', 'configure', { prompt: 'alice-exclusive-role' });
     await bridge.handleMessage(message('restore private role'));
+    const viewerStore = new ConfigStore(directory); viewerStore.update(config);
+    const viewer = new BotController(viewerStore, quiet); viewer.bridge = bridge;
+    const preview = bridge.handleMessage(message('reasoning-ui-probe'));
+    await waitFor(() => bridge.broker.list().some(item => item.text.includes('公开摘要预览')));
+    const live = await viewer.conversation('c2c', 'alice');
+    const liveReasoning = live.activities.find(item => item.kind === 'reasoning');
+    assert.equal(liveReasoning.detail, '**整理需求**\n\n先检查会话输入。\n\n**核对进度**\n\n保留公开摘要与执行顺序。');
+    assert.equal(liveReasoning.status, 'running');
+    const comment = live.messages.find(item => item.phase === 'commentary' && item.text.includes('已确认需求'));
+    const command = live.activities.find(item => item.id.startsWith('stream-command-'));
+    assert.equal(command.detail, 'Get-Date\nfixture working\n', 'command output is available before the tool completes');
+    assert.equal(live.activities.find(item => item.kind === 'plan').detail, '1. 核对摘要\n2. 整理结果');
+    assert.ok(liveReasoning.order < comment.order && comment.order < command.order, 'live activity and progress retain native item order');
+    assert.doesNotMatch(JSON.stringify(live), /must-not-display/, 'raw reasoning and stale-turn deltas are excluded from the conversation API');
+    assert.equal(requireTrace(directory).filter(item => item.method === 'turn/start').at(-1).params.summary, 'auto');
+    bridge.submitLocal('c2c', 'alice', '继续'); await preview;
+    const completed = await viewer.conversation('c2c', 'alice');
+    const summary = completed.activities.find(item => item.id === liveReasoning.id);
+    assert.equal(summary.status, 'completed');
+    assert.equal(summary.detail, '**核对完成**\n\n已检查会话输入，确认执行结果。\n\n**整理结果**\n\n将公开摘要与最终答复分开显示。', 'completed summary replaces streamed partial text without duplication');
+    assert.equal(completed.activities.find(item => item.id === command.id).detail, 'Get-Date\nfixture working\nfixture done\n');
+    assert.doesNotMatch(JSON.stringify(completed), /must-not-display/);
+    assert.ok(qq.messages.every(item => !item.text.includes('核对完成')) && qq.streams.every(item => item.updates.every(text => !text.includes('核对完成'))), 'reasoning summaries remain in the local UI rather than becoming QQ replies');
   } finally { await bridge.close(); }
   const oldSessions = JSON.parse(await readFile(join(directory, 'sessions.json'), 'utf8'));
   oldSessions['fixture-app:group:history-team'] = { ...oldSessions['fixture-app:group:team'], threadId: 'existing-group-thread' };
@@ -318,6 +473,16 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     await second.handleMessage({ ...message('quote legacy archive', 'group', 'team'), reference: { key: 'legacy-quote-id' } });
     const legacyQuote = referenceContext(requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('quote legacy archive')));
     assert.equal(legacyQuote.text, '旧群存档里的引用原文'); assert.equal(legacyQuote.senderId, 'alice');
+    contextMediaExpired = true;
+    const beforeOrdinaryRedelivery = contextDownloads;
+    await second.handleMessage(passiveContextImage);
+    await second.handleMessage(message('ordinary media after restart', 'group', 'team', 'bob'));
+    const restartMedia = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('ordinary media after restart'));
+    assert.ok(restartMedia);
+    const restartState = JSON.parse(await readFile(join(second.storage.paths(passiveContextImage.target).directory, 'context.json'), 'utf8'));
+    const restartFile = restartState.entries.find(item => item.id === passiveContextImage.contextId).files[0];
+    assert.equal(await readFile(restartFile.path, 'utf8'), 'ordinary context file');
+    assert.equal(contextDownloads, beforeOrdinaryRedelivery, 'a restarted process retains cached files when the ordinary message is redelivered with an expired URL');
     await second.handleMessage(message('resume'));
     assert.equal(second.status().sessions.find((item) => item.peerId === 'alice').name, '我的工作助手', 'the name survives service restart and new contexts');
     assert.equal(second.status().sessions.find((item) => item.peerId === 'alice').storage.directory, join(directory, 'storage', 'bot-fixture-app', 'private', 'peer-alice'), 'renaming and resetting context keep the storage directory');
@@ -385,6 +550,13 @@ test('Active QQ tasks survive global settings saves, preserve queued messages an
     assert.equal(resumed.params.model, 'fixture-model');
     assert.equal(resumed.params.sandbox, 'danger-full-access');
     assert.equal(resumed.params.approvalPolicy, 'never');
+    assert.equal(resumed.params.excludeTurns, true, 'conversation history uses its existing paginated read path');
+    const effective = trace.filter(item => item.effectiveTurn).map(item => item.effectiveTurn);
+    assert.equal(effective[0].sandbox, 'workspace-write', 'a settings save leaves the active turn on its original execution scope');
+    assert.equal(effective[1].model, 'fixture-model');
+    assert.equal(effective[1].sandbox, 'danger-full-access', 'the queued turn uses the new configuration rather than a subscribed cached thread');
+    assert.equal(effective[1].approvalPolicy, 'never');
+    assert.ok(!trace.some(item => item.ignoredResumeOverrides), 'the next turn is not a rejoin with ignored configuration changes');
     await controller.configure({ sandbox: 'workspace-write', approvalPolicy: 'on-request' });
     const approvalTask = bridge.handleMessage(message('permission-policy-probe pending approval', 'group', 'team'));
     await waitFor(() => bridge.status().pending.some(item => item.kind === 'approval'));
@@ -735,6 +907,24 @@ test('Tencent SDK uses actual HTTP/WebSocket QQ frames; media inputs and outgoin
     event('C2C_MESSAGE_CREATE', { author: { user_openid: 'alice' }, content: 'message after reconnect', attachments: [] });
     await waitFor(() => messages.length === 7);
     assert.equal(messages.at(-1).text, 'message after reconnect');
+    const song = join(directory, '原始音频.MP3'); await writeFile(song, 'mp3-fixture');
+    const picture = join(directory, 'preview.png'); await writeFile(picture, 'picture-fixture');
+    const nativeVoice = join(directory, 'native.silk'); await writeFile(nativeVoice, 'voice-fixture');
+    const uploads = () => requests.filter(request => request.path.endsWith('/files'));
+    const beforeAudio = uploads().length;
+    for (const target of [messages[0].target, messages[2].target]) {
+      await qq.sendFile(target, song, '原始音频.MP3');
+      await qq.sendFile(target, song, '原始音频.MP3', 'file');
+      await qq.sendFile(target, song, '原始音频.MP3', 'voice');
+      await qq.sendFile(target, picture, 'preview.png', 'file');
+      await qq.sendFile(target, picture, 'preview.png');
+      await qq.sendFile(target, nativeVoice, 'native.silk');
+    }
+    const audioUploads = uploads().slice(beforeAudio);
+    assert.deepEqual(audioUploads.map(request => request.body.file_type), [4, 3, 4, 1, 3, 4, 3, 4, 1, 3], 'private and group delivery distinguish files from voice and image messages; auto/file reuse the same MP3 upload');
+    assert.ok(audioUploads.filter(request => request.body.file_type === 4 && request.body.file_data === Buffer.from('mp3-fixture').toString('base64')).every(request => request.body.file_name === '原始音频.MP3'), 'MP3 file delivery preserves the filename and original bytes');
+    assert.throws(() => qq.sendFile(messages[0].target, song, '原始音频.MP3', 'invalid'), /auto|file|voice/);
+    assert.equal(uploads().length, beforeAudio + 10, 'invalid modes never issue a QQ upload');
   } finally {
     qq.close();
     globalThis.fetch = originalFetch;
@@ -768,6 +958,7 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
     id: 'history-turn-' + index, status: 'completed', items: [
       { id: 'history-user-' + index, type: 'userMessage', content: [{ type: 'text', text: `<from>\nuser: Alice\n</from>\n\n<message>\nhistory question ${index}\n</message>` }] },
       { id: 'history-secret-' + index, type: 'reasoning', text: 'must-not-display' },
+      { id: 'history-summary-' + index, type: 'reasoning', summary: ['**历史公开摘要**\n\n核对问题 ' + index], content: ['must-not-display-raw'] },
       { id: 'history-agent-' + index, type: 'agentMessage', text: 'history answer ' + index, phase: 'final_answer' },
     ],
   })) }));
@@ -777,7 +968,7 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
   try {
     assert.equal(client.getServerVersion().name, 'codex-qqbot');
     assert.equal(client.getServerVersion().title, 'QQ Bot');
-    assert.equal(client.getServerVersion().version, '0.0.2');
+    assert.equal(client.getServerVersion().version, '0.0.3');
     const tools = (await client.listTools()).tools.map((tool) => tool.name);
     assert.deepEqual(tools.sort(), ['qqbot_configure', 'qqbot_models', 'qqbot_send_file', 'qqbot_send_message', 'qqbot_setup', 'qqbot_start', 'qqbot_status', 'qqbot_stop', 'qqbot_ui'].sort());
     const details = (await client.listTools()).tools;
@@ -820,6 +1011,9 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
     assert.equal(history.structuredContent.messages.length, 60);
     assert.equal(history.structuredContent.messages[0].text, 'history question 1');
     assert.ok(!JSON.stringify(history.structuredContent.messages).includes('must-not-display'));
+    assert.equal(history.structuredContent.activities.filter(item => item.kind === 'reasoning').length, 30);
+    assert.ok(history.structuredContent.activities.some(item => item.detail.includes('历史公开摘要')));
+    assert.doesNotMatch(JSON.stringify(history.structuredContent), /must-not-display/, 'historical reasoning only exposes public summary fields');
     const older = await client.callTool({ name: 'qqbot_ui', arguments: { action: 'session', payload: { scope: 'c2c', target_id: 'alice', action: 'history', cursor: history.structuredContent.nextCursor } } });
     assert.equal(older.structuredContent.messages[0].text, 'history question 0');
     const otherHistory = await client.callTool({ name: 'qqbot_ui', arguments: { action: 'session', payload: { scope: 'group', target_id: 'team', action: 'history' } } });

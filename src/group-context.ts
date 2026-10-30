@@ -7,7 +7,7 @@ import type { ReplyTarget } from './types.ts';
 
 export interface GroupContextEntry {
   id: string; role: 'user' | 'assistant'; senderId: string; senderName?: string; text: string;
-  timestamp?: number; files?: Array<{ path?: string; name: string }>;
+  timestamp?: number; files?: Array<{ path?: string; name: string; contentType?: string; unavailable?: string }>;
 }
 interface State { threadId?: string; entries: GroupContextEntry[]; }
 
@@ -51,6 +51,7 @@ export class GroupContextStore {
   }
   attach(target: ReplyTarget, id: string, files: GroupContextEntry['files']): void {
     const entry = this.state(target).entries.find((item) => item.id === id); if (!entry || !files?.length) return;
+    if (JSON.stringify(entry.files) === JSON.stringify(files)) return;
     entry.files = files; this.save(target);
     appendFileSync(this.paths(target).archive, JSON.stringify({ type: 'message', ...entry }) + '\n', { mode: 0o600 });
   }
@@ -59,6 +60,7 @@ export class GroupContextStore {
     const state = this.state(target); const index = state.entries.findIndex((entry) => entry.id === id);
     return index < 0 ? [] : state.entries.filter((entry, position) => position < index || entry.role === 'assistant').slice(-limit);
   }
+  get(target: ReplyTarget, id: string): GroupContextEntry | undefined { return this.state(target).entries.find(entry => entry.id === id); }
   bind(target: ReplyTarget, threadId: string): void {
     const state = this.state(target);
     if (state.threadId && state.threadId !== threadId) this.clear(target);

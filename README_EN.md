@@ -1,9 +1,14 @@
 # QQ Bot
 
-Current plugin version: **0.0.2**.
+Current plugin version: **0.0.3**.
 
 The conversation view follows Codex typography, blue user bubbles, Markdown and
 collapsible activity, with code/reply copying, image previews and a latest-message button.
+Public reasoning summaries, plans and command output update while a turn runs and
+remain available in chronological, collapsible activity when revisiting history.
+Received group attachments are cached even without a mention or quote. Follow-up
+questions can use their local paths and the latest attachment message's images;
+unavailable downloads are identified rather than replaced with unrelated files.
 Sessions can override execution scope, approvals, command networking and web search;
 empty settings inherit global values. These changes preserve the existing context.
 The Node HTTPS download command avoids PowerShell TLS failures in the Windows sandbox
@@ -28,7 +33,8 @@ settings by default, with optional overrides and a restore-global action.
 Use the pencil beside the conversation title to rename it. Names persist across
 restarts and appear in the list, header and search; an empty name restores the default.
 
-Requires Node.js >=20.3.0 and an installed, signed-in Codex CLI with App Server.
+Requires Node.js >=22.13.0 (built-in SQLite for refreshing persisted tool indexes)
+and an installed, signed-in Codex CLI with App Server.
 The bot-owned process defaults to HTTP streaming for the built-in OpenAI provider,
 avoiding repeated WebSocket connection timeouts without changing the selected model
 or reasoning effort. Runtime settings can restore automatic transport selection;
@@ -85,6 +91,20 @@ generated-image folders are not automatically allowed.
 File sending and image analysis resolve local `file:` URLs and `sandbox:` references
 as well as absolute paths. One file is delivered once per turn even when both a tool
 and a final Markdown link refer to it. Failure notifications include the actual reason.
+`qqbot_send_file` accepts `send_as: "auto" | "file" | "voice"` in both entry points.
+MP3 and other ordinary audio default to original files, without ZIP wrapping. Use
+`file` to force a downloadable file (including images/videos), or `voice` when a
+voice message is requested. Auto keeps image/video previews and native SILK/AMR
+voice messages. The direct-send dialog exposes these choices for each attachment.
+On the first cold resume after an upgrade, the bridge refreshes the persisted file
+tool definition and index, retaining the thread ID and context so existing chats
+also discover `send_as` and `voice`.
+Full-access sessions copy requested files outside the allowed roots into the current
+conversation archive before sending, preserving the filename. Other conversations'
+archives remain isolated; restricted sessions still obey the send-root allowlist.
+Parallel file calls share deduplication and per-turn quotas. Conversation cards
+retain the delivered archive path and media kind, including original image files;
+media-message receipts also restore quoted attachments.
 `storageDir` selects the conversation archive root separately from the task workspace;
 it defaults to `storage` under the local data directory. Files are grouped by bot ID,
 private/group scope and stable peer ID. Each peer has `session.json`, Markdown/JSON

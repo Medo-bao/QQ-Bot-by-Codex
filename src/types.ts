@@ -5,6 +5,9 @@
 /** 会话作用域 */
 export type ChatScope = 'c2c' | 'group';
 
+export const fileSendModes = ['auto', 'file', 'voice'] as const;
+export type FileSendMode = typeof fileSendModes[number];
+
 /** QQ 回复目标 */
 export interface ReplyTarget {
   scope: ChatScope;

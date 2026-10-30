@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { cp, lstat, mkdir, realpath, rename, rm, symlink, unlink } from 'node:fs/promises';
+import { copyFile, cp, lstat, mkdir, mkdtemp, realpath, rename, rm, symlink, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { writeJson, type BotConfig } from './config.ts';
@@ -33,6 +33,16 @@ export class ConversationStorage {
 
   assertFile(target: ReplyTarget, actual: string): void {
     if (contains(this.root, actual) && !contains(this.paths(target).directory, actual)) throw new Error('文件属于其他 QQ 会话的存储目录。');
+  }
+
+  async importFile(target: ReplyTarget, source: string, threadId = 'direct'): Promise<string> {
+    this.assertFile(target, source);
+    const root = this.files(target, threadId);
+    await mkdir(root, { recursive: true });
+    const path = join(await mkdtemp(join(root, 'import-')), basename(source));
+    try { await copyFile(source, path); }
+    catch (error) { await rm(path, { force: true }); throw error; }
+    return path;
   }
 
   async prepareImages(target: ReplyTarget, threadId: string, nativePath: string): Promise<void> {

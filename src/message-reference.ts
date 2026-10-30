@@ -46,10 +46,14 @@ export class MessageReferenceStore {
   remember(target: ReplyTarget, keys: (string | undefined)[], message: MessageReference): void {
     const aliases = [...new Set(keys.filter((key): key is string => Boolean(key)))];
     if (!aliases.length) return;
-    const entry = { ...message, key: aliases[0]!, keys: aliases };
+    const previous = aliases.map(key => this.cache.get(`${this.path(target)}\0${key}`)).find(Boolean);
+    const entry = { ...message, files: message.files?.length ? message.files : previous?.files, key: aliases[0]!, keys: aliases };
     mkdirSync(this.storage.paths(target).directory, { recursive: true });
     appendFileSync(this.path(target), JSON.stringify(entry) + '\n', { mode: 0o600 });
-    this.cacheEntry(target, entry);
+    if (entry.attachments?.length && !entry.files?.length) {
+      // A redelivery may follow a restart. Let disk lookup retain earlier downloads.
+      for (const key of aliases) this.cache.delete(`${this.path(target)}\0${key}`);
+    } else this.cacheEntry(target, entry);
   }
   private async find(target: ReplyTarget, key: string): Promise<ReferenceEntry | undefined> {
     const cached = this.cache.get(`${this.path(target)}\0${key}`);
@@ -62,7 +66,7 @@ export class MessageReferenceStore {
         for await (const line of lines) {
           if (!line.trim()) continue;
           const entry = JSON.parse(line);
-          if (!legacy && entry.keys?.includes(key)) found = entry;
+          if (!legacy && entry.keys?.includes(key)) found = { ...entry, files: entry.files?.length ? entry.files : found?.files };
           else if (legacy && entry.type === 'message' && entry.id === `qq:${key}`) found = {
             key, keys: [key], text: entry.text, senderId: entry.senderId, senderName: entry.senderName,
             isBot: entry.role === 'assistant', timestamp: entry.timestamp,
@@ -83,12 +87,13 @@ export class MessageReferenceStore {
     for (const item of reference.attachments || []) attachments.set(item.filename || item.url, item);
     return { ...stored, ...reference, text: stored?.text || reference.text,
       senderId: reference.senderId || stored?.senderId, senderName: reference.senderName || stored?.senderName,
-      isBot: reference.isBot ?? stored?.isBot, files: stored?.files, attachments: [...attachments.values()],
+      isBot: reference.isBot ?? stored?.isBot, files: stored?.files?.length ? stored.files : reference.files, attachments: [...attachments.values()],
       references: reference.references?.length ? reference.references : stored?.references,
-      source: stored ? 'archive' : reference.text || reference.attachments?.length || reference.references?.length ? 'push' : 'missing' };
+      source: stored ? 'archive' : reference.text || reference.attachments?.length || reference.files?.length || reference.references?.length ? 'push' : 'missing' };
   }
   sent(target: ReplyTarget, receipt: any, text: string, files?: ReferenceFile[]): void {
-    this.remember(target, [receipt?.ext_info?.ref_idx, receipt?.id], {
+    const message = receipt?.message && typeof receipt.message === 'object' ? receipt.message : receipt;
+    this.remember(target, [message?.ext_info?.ref_idx, message?.id], {
       key: '', text, senderId: 'qqbot', senderName: 'QQ Bot', isBot: true, timestamp: Date.now(), files,
     });
   }
