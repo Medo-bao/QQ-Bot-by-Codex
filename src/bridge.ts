@@ -49,8 +49,9 @@ interface ContextOperation {
   kind: 'reset' | 'compact'; status: 'running' | 'completed' | 'cancelled' | 'failed';
   message: string; startedAt: number; finishedAt?: number;
   automatic?: boolean;
+  turnId?: string;
 }
-interface Peer extends Pick<SessionSettings, 'sandbox' | 'approvalPolicy' | 'approvalsReviewer' | 'networkAccess' | 'webSearch' | 'autoCompact' | 'autoCompactThreshold'> {
+interface Peer extends Pick<SessionSettings, 'sandbox' | 'approvalPolicy' | 'approvalsReviewer' | 'networkAccess' | 'webSearch' | 'contextWindow'> {
   key: string;
   name: string;
   target: ReplyTarget;
@@ -75,7 +76,6 @@ interface Peer extends Pick<SessionSettings, 'sandbox' | 'approvalPolicy' | 'app
   lastError?: string;
   contextOperation?: ContextOperation;
   contextUsage?: ContextUsage;
-  autoCompactAttempt?: number;
 }
 
 const fileParameters = { type: 'object', properties: { file_path: { type: 'string', description: 'Absolute path of a local file to deliver to the current QQ conversation.' },
@@ -153,18 +153,18 @@ export class QQBridge {
       previousThreadId: peer.previousThreadId, settings: { model: peer.model, modelProvider: peer.modelProvider,
         effort: peer.effort || '', preset: peer.preset, cwd: peer.cwd || '', prompt: peer.prompt ?? null,
         sandbox: peer.sandbox || '', approvalPolicy: peer.approvalPolicy || '', approvalsReviewer: peer.approvalsReviewer || '', networkAccess: peer.networkAccess || '', webSearch: peer.webSearch || '',
-        autoCompact: peer.autoCompact ?? null, autoCompactThreshold: peer.autoCompactThreshold ?? null },
+        contextWindow: peer.contextWindow ?? null },
       permissions: sessionPermissions(this.config, peer), lastError: peer.lastError,
       contextOperation: peer.contextOperation ? { ...peer.contextOperation } : undefined,
       contextUsage: peer.contextUsage?.threadId === peer.threadId ? peer.contextUsage : undefined,
-      contextSettings: { autoCompact: peer.autoCompact ?? this.config.autoCompact, threshold: peer.autoCompactThreshold ?? this.config.autoCompactThreshold },
+      contextSettings: { contextWindow: peer.contextWindow ?? this.config.contextWindow },
       busy: Boolean(peer.active), queued: peer.queued, loaded: peer.loaded, lastActive: peer.lastActive, storage: this.storage.paths(peer.target) })),
       observedPeers: Object.fromEntries(this.observedPeers), pending: this.broker.list() };
   }
 
   requiresRestart(config: BotConfig): boolean {
     const threadSettings = new Set(['model', 'modelProvider', 'effort', 'preset', 'presets', 'directPrompt', 'groupPrompt',
-      'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'webSearch', 'autoCompact', 'autoCompactThreshold']);
+      'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'webSearch', 'contextWindow']);
     return (Object.keys(config) as Array<keyof BotConfig>).some(key =>
       !threadSettings.has(key) && JSON.stringify(config[key]) !== JSON.stringify(this.config[key]));
   }
@@ -172,11 +172,12 @@ export class QQBridge {
   applyThreadSettings(config: BotConfig): void {
     if (JSON.stringify(config) === JSON.stringify(this.config)) return;
     const modelChanged = config.model !== this.config.model || config.modelProvider !== this.config.modelProvider;
+    const contextChanged = config.contextWindow !== this.config.contextWindow;
     Object.assign(this.config, config);
     this.settingsRevision++;
     for (const peer of this.peers.values()) {
       peer.loaded = false;
-      if (modelChanged && peer.contextUsage) peer.contextUsage.stale = true;
+      if ((modelChanged || contextChanged && peer.contextWindow == null) && peer.contextUsage) peer.contextUsage.stale = true;
       const permissions = sessionPermissions(this.config, peer);
       if (permissions.approvalPolicy === 'never' && peer.threadId) this.broker.settleApprovals(peer.threadId, permissions.sandbox === 'danger-full-access');
     }
@@ -198,7 +199,7 @@ export class QQBridge {
         modelProvider: saved.modelProvider ?? '', preset: saved.preset ?? '', activePreset: saved.activePreset, activePrompt: saved.activePrompt,
         effort: saved.effort, cwd: saved.cwd, prompt: saved.prompt, promptPolicyVersion: saved.promptPolicyVersion,
         sandbox: saved.sandbox, approvalPolicy: saved.approvalPolicy, approvalsReviewer: saved.approvalsReviewer, networkAccess: saved.networkAccess, webSearch: saved.webSearch,
-        autoCompact: saved.autoCompact, autoCompactThreshold: saved.autoCompactThreshold, contextUsage: saved.contextUsage,
+        contextWindow: saved.contextWindow, contextUsage: saved.contextUsage,
         previousThreadId: saved.previousThreadId, lastActive: Date.now(), queue: Promise.resolve(), queued: 0, generation: 0 };
       this.peers.set(key, peer);
     }
@@ -439,7 +440,7 @@ export class QQBridge {
     this.sessions.set(peer.key, { name: peer.name, threadId: peer.threadId, model: peer.model, modelProvider: peer.modelProvider,
       effort: peer.effort, preset: peer.preset, activePreset: peer.activePreset, activePrompt: peer.activePrompt, cwd: peer.cwd, prompt: peer.prompt,
       sandbox: peer.sandbox, approvalPolicy: peer.approvalPolicy, approvalsReviewer: peer.approvalsReviewer, networkAccess: peer.networkAccess, webSearch: peer.webSearch,
-      autoCompact: peer.autoCompact, autoCompactThreshold: peer.autoCompactThreshold, contextUsage: peer.contextUsage,
+      contextWindow: peer.contextWindow, contextUsage: peer.contextUsage,
       promptPolicyVersion: peer.promptPolicyVersion, previousThreadId: peer.previousThreadId });
     this.storage.saveSession(peer.target, peer.name, peer.threadId, peer.previousThreadId);
   }
@@ -471,10 +472,11 @@ export class QQBridge {
     const selectedModel = peer.model || preset?.model || this.config.model;
     const selectedProvider = peer.modelProvider || preset?.modelProvider || this.config.modelProvider;
     const permissions = sessionPermissions(this.config, peer);
+    const contextWindow = peer.contextWindow ?? this.config.contextWindow;
     const params = { cwd: peer.cwd || preset?.cwd || this.config.cwd, ...(selectedModel ? { model: selectedModel } : {}),
       ...(selectedProvider ? { modelProvider: selectedProvider } : {}),
       approvalPolicy: permissions.approvalPolicy, sandbox: permissions.sandbox,
-      config: { ...preset?.config, approvals_reviewer: permissions.approvalsReviewer, web_search: permissions.webSearch, 'sandbox_workspace_write.network_access': permissions.networkAccess, 'sandbox_workspace_write.writable_roots': [
+      config: { ...preset?.config, ...(contextWindow > 0 ? { model_context_window: contextWindow } : {}), approvals_reviewer: permissions.approvalsReviewer, web_search: permissions.webSearch, 'sandbox_workspace_write.network_access': permissions.networkAccess, 'sandbox_workspace_write.writable_roots': [
         ...(Array.isArray(preset?.config?.['sandbox_workspace_write.writable_roots']) ? preset.config['sandbox_workspace_write.writable_roots'] as string[] : []),
         this.storage.paths(peer.target).files,
       ] }, developerInstructions: prompt };
@@ -482,7 +484,7 @@ export class QQBridge {
     // Release this idle peer's subscription so Codex can reload its configuration.
     if (peer.threadId) {
       await this.client.call('thread/unsubscribe', { threadId: peer.threadId });
-      if (await this.client.refreshThreadTool(peer.threadId, dynamicTools[0]!)) this.logger.info('QQ 会话文件工具定义已更新，原上下文已保留。');
+      if (await this.client.refreshThreadTools(peer.threadId, dynamicTools)) this.logger.info('QQ 会话工具定义与索引已更新，原上下文已保留。');
     }
     const result = peer.threadId
       ? await this.client.call('thread/resume', { threadId: peer.threadId, excludeTurns: true, ...params })
@@ -499,7 +501,7 @@ export class QQBridge {
         });
       }
     }
-    if (peer.contextUsage?.threadId !== result.thread.id) { peer.contextUsage = undefined; peer.autoCompactAttempt = undefined; }
+    if (peer.contextUsage?.threadId !== result.thread.id) peer.contextUsage = undefined;
     peer.threadId = result.thread.id;
     peer.promptPolicyVersion = promptPolicyVersion;
     peer.activePrompt = prompt;
@@ -512,8 +514,6 @@ export class QQBridge {
   private async run(peer: Peer, message: IncomingMessage): Promise<void> {
     const generation = peer.generation;
     await this.load(peer);
-    if (this.closing || generation !== peer.generation) return;
-    await this.autoCompact(peer);
     if (this.closing || generation !== peer.generation) return;
     if (message.target.scope === 'group') this.rememberGroupMessage(message);
     let inputText = message.envelope || message.text || (message.reference ? '请查看引用消息。' : '请查看附件。');
@@ -589,6 +589,11 @@ export class QQBridge {
       await active.chain;
     } finally {
       clearTimeout(active.timer);
+      const operation = peer.contextOperation;
+      if (operation?.automatic && operation.status === 'running' && operation.turnId === active.id) {
+        operation.status = active.cancelled ? 'cancelled' : 'failed'; operation.finishedAt = Date.now();
+        operation.message = active.cancelled ? 'Codex 自动压缩已中止。' : 'Codex 自动压缩未完成，可继续聊天或重试。';
+      }
       for (const item of active.messages.values()) if (!item.delivered) item.writer?.abort();
       this.broker.cancelThread(peer.threadId!);
       active.abort.abort();
@@ -605,6 +610,27 @@ export class QQBridge {
       const usage = contextUsage(params.threadId, params.tokenUsage?.last?.totalTokens, params.tokenUsage?.modelContextWindow);
       if (usage) { peer.contextUsage = usage; this.save(peer); }
       return;
+    }
+    // Native compaction notifications only report progress; Codex owns every automatic trigger.
+    if (peer && params.item?.type === 'contextCompaction' && ['item/started', 'item/completed'].includes(message.method || '')) {
+      const operation = peer.contextOperation;
+      if (operation?.status === 'running' && !operation.automatic) {
+        if (operation.kind === 'compact') operation.message = message.method === 'item/completed' ? '正在完成压缩…' : '正在压缩历史，整理早期上下文…';
+      } else if (message.method === 'item/started') {
+        peer.contextOperation = { kind: 'compact', automatic: true, turnId: params.turnId, status: 'running',
+          startedAt: Date.now(), message: 'Codex 正在自动压缩上下文…' };
+      } else if (operation?.automatic && operation.status === 'running' && operation.turnId === params.turnId) {
+        operation.status = 'completed'; operation.finishedAt = Date.now();
+        operation.message = 'Codex 自动压缩已完成，聊天记录已保留。';
+        if (peer.contextUsage) { peer.contextUsage.stale = true; this.save(peer); }
+      }
+    }
+    const operation = peer?.contextOperation;
+    if (operation?.automatic && operation.status === 'running' && message.method === 'turn/completed' && operation.turnId === params.turn?.id) {
+      operation.status = params.turn.status === 'failed' ? 'failed' : params.turn.status === 'interrupted' ? 'cancelled' : 'completed';
+      operation.finishedAt = Date.now();
+      operation.message = operation.status === 'failed' ? `Codex 自动压缩失败：${params.turn.error?.message || '请稍后重试。'}`
+        : operation.status === 'cancelled' ? 'Codex 自动压缩已中止。' : 'Codex 自动压缩已完成，聊天记录已保留。';
     }
     const active = peer?.active;
     if (!peer || !active) return;
@@ -657,9 +683,6 @@ export class QQBridge {
       active.id = params.turn.id;
       if (active.cancelled && !active.interruptSent) void this.interrupt(peer).catch(active.fail);
       return;
-    }
-    if (peer.contextOperation?.status === 'running' && peer.contextOperation.kind === 'compact' && params.item?.type === 'contextCompaction') {
-      peer.contextOperation.message = message.method === 'item/completed' ? '正在完成压缩…' : '正在压缩历史，整理早期上下文…';
     }
     if (message.method === 'item/started' && params.item?.type === 'agentMessage') {
       const item = params.item;
@@ -808,6 +831,9 @@ export class QQBridge {
         peer.threadId = undefined; peer.activePreset = undefined;
       }
       if ((patch.model !== undefined && patch.model !== peer.model || patch.modelProvider !== undefined && patch.modelProvider !== peer.modelProvider) && peer.contextUsage) peer.contextUsage.stale = true;
+      if (patch.contextWindow !== undefined && patch.contextWindow !== peer.contextWindow) {
+        if (peer.contextUsage) peer.contextUsage.stale = true;
+      }
       Object.assign(peer, patch); peer.loaded = false; this.save(peer);
     } else if (action === 'stop') {
       peer.generation++; await this.interrupt(peer); await peer.queue;
@@ -845,7 +871,7 @@ export class QQBridge {
           if (peer.loaded && peer.threadId) await this.client.call('thread/unsubscribe', { threadId: peer.threadId });
           peer.previousThreadId = peer.threadId || peer.previousThreadId;
           peer.threadId = undefined; peer.activePreset = undefined; peer.preparedSkills = undefined; peer.loaded = false;
-          peer.contextUsage = undefined; peer.autoCompactAttempt = undefined;
+          peer.contextUsage = undefined;
           this.save(peer);
           operation.message = '上下文已重置，下一条消息将开始新会话；历史存档与会话设置已保留。';
         } else if (!peer.threadId) {
@@ -922,28 +948,11 @@ export class QQBridge {
       const transmission = message.sentAt && Number.isFinite(message.sentAt) ? `${Math.max(0, receivedAt - message.sentAt)} ms（按消息时间估算）` : '无消息时间';
       await this.send(message.target, `pong · QQ Bot\n传输耗时：${transmission}\n接收至处理：${Math.max(0, Date.now() - receivedAt)} ms`);
     }
-    else if (command === '/bot-version') await this.send(message.target, 'QQ Bot 0.0.3');
+    else if (command === '/bot-version') await this.send(message.target, 'QQ Bot 0.0.4');
     else if (command === '/bot-help') await this.send(message.target, '/new 新会话\n/compact 压缩历史\n/model 查看或切换模型\n/preset 查看或切换预设\n/effort 查看或切换推理强度\n/stop 中止任务\n/bot-status 会话状态与 OpenID\n/bot-ping 连通检查\n/bot-version 版本\n/answer 请求编号 答案');
     else if (command === '/answer') { await this.send(message.target, '未找到匹配的待答请求，或当前用户不是本轮发起者。'); }
     else return false;
     return true;
-  }
-
-  private async autoCompact(peer: Peer): Promise<void> {
-    const usage = peer.contextUsage;
-    if (!(peer.autoCompact ?? this.config.autoCompact) || !usage || usage.stale || !usage.windowTokens || usage.threadId !== peer.threadId ||
-      usage.usedTokens < usage.windowTokens * (peer.autoCompactThreshold ?? this.config.autoCompactThreshold) / 100 || peer.autoCompactAttempt === usage.updatedAt) return;
-    peer.autoCompactAttempt = usage.updatedAt;
-    const operation: ContextOperation = { kind: 'compact', automatic: true, status: 'running', startedAt: Date.now(), message: '上下文达到阈值，正在自动压缩…' };
-    peer.contextOperation = operation;
-    try {
-      const completed = await this.compact(peer);
-      operation.status = completed ? 'completed' : 'cancelled';
-      operation.message = completed ? '上下文自动压缩完成，聊天记录已保留。' : '自动压缩已中止。';
-    } catch (error) {
-      operation.status = 'failed'; operation.message = `自动压缩失败：${error instanceof Error ? error.message : error}，将继续尝试处理当前消息。`;
-      this.logger.warn(operation.message);
-    } finally { operation.finishedAt = Date.now(); }
   }
 
   private async compact(peer: Peer): Promise<boolean> {

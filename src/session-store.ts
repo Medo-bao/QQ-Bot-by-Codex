@@ -15,8 +15,7 @@ export const sessionSettingsSchema = z.object({
   approvalsReviewer: z.enum(['', 'user', 'auto_review']),
   networkAccess: z.enum(['', 'enabled', 'disabled']),
   webSearch: z.enum(['', 'disabled', 'cached', 'indexed', 'live']),
-  autoCompact: z.boolean().nullable(),
-  autoCompactThreshold: z.number().int().min(10).max(95).nullable(),
+  contextWindow: z.number().int().min(0).nullable(),
 }).partial().strict().transform(patch => patch.sandbox === 'danger-full-access'
   ? { ...patch, approvalPolicy: 'never' as const, approvalsReviewer: 'user' as const, networkAccess: 'enabled' as const } : patch);
 export type SessionSettings = z.infer<typeof sessionSettingsSchema>;
@@ -38,6 +37,13 @@ export class SessionStore {
   constructor(directory: string) {
     this.path = join(directory, 'sessions.json');
     this.sessions = existsSync(this.path) ? JSON.parse(readFileSync(this.path, 'utf8')) : {};
+    let changed = false;
+    for (const session of Object.values(this.sessions)) {
+      for (const key of ['autoCompact', 'autoCompactThreshold']) if (key in session) {
+        delete (session as Record<string, unknown>)[key]; changed = true;
+      }
+    }
+    if (changed) writeJson(this.path, this.sessions);
   }
   get(key: string): SavedSession { return this.sessions[key] || {}; }
   entries(): Array<[string, SavedSession]> { return Object.entries(this.sessions); }

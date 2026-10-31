@@ -68,11 +68,18 @@ export class BotController {
   async configure(patch: Record<string, unknown>): Promise<unknown> {
     const bridge = this.bridge;
     const config = this.store.preview(patch);
+    const contextChanged = config.contextWindow !== this.store.read().contextWindow;
     const restart = bridge?.requiresRestart(config);
     if (bridge && restart && bridge.status().sessions.some(session => session.busy || session.queued)) {
       throw new Error('此设置需要重新连接 QQ，请等待当前任务与排队消息处理完成后保存，或先中止任务。');
     }
     this.store.update(patch);
+    if (!bridge && contextChanged) {
+      const sessions = new SessionStore(this.store.directory);
+      for (const [key, saved] of sessions.entries()) if (key.startsWith(`${config.appId}:`) && saved.contextWindow == null && saved.contextUsage) {
+        saved.contextUsage.stale = true; sessions.set(key, saved);
+      }
+    }
     if (bridge && !restart) { bridge.applyThreadSettings(config); return this.status(); }
     if (this.controlClient) { await this.controlClient.close(); this.controlClient = undefined; }
     if (bridge) { await this.stop(); return this.start(); }
@@ -176,7 +183,8 @@ export class BotController {
       const sessions = new SessionStore(this.store.directory);
       const key = `${config.appId}:${scope}:${peerId}`;
       const saved = sessions.get(key);
-      if (patch.preset !== undefined && patch.preset !== saved.preset) {
+      if (patch.contextWindow !== undefined && patch.contextWindow !== saved.contextWindow && saved.contextUsage) saved.contextUsage.stale = true;
+      if (patch.preset !== undefined && patch.preset !== (saved.preset || '')) {
         saved.previousThreadId = saved.threadId || saved.previousThreadId;
         saved.threadId = undefined; saved.activePreset = undefined;
       }

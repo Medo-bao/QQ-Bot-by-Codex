@@ -25,7 +25,7 @@ function usage(threadId, turnId) {
   const controlPath = join(directory, 'context-usage.json');
   const control = existsSync(controlPath) ? JSON.parse(readFileSync(controlPath, 'utf8')) : {};
   const used = control.usedTokens ?? 1280;
-  const window = 'windowTokens' in control ? control.windowTokens : 100000;
+  const window = 'windowTokens' in control ? control.windowTokens : loaded.get(threadId)?.settings.config?.model_context_window ?? 100000;
   notify('thread/tokenUsage/updated', { threadId, turnId, tokenUsage: {
     last: { inputTokens: used - 20, outputTokens: 20, cachedInputTokens: 0, reasoningOutputTokens: 0, totalTokens: used },
     total: { inputTokens: 999000000, outputTokens: 100000, cachedInputTokens: 0, reasoningOutputTokens: 0, totalTokens: 999100000 }, modelContextWindow: window,
@@ -44,6 +44,20 @@ async function execute(threadId, turnId, input) {
   const text = input.filter((item) => item.type === 'text' && !item.text.startsWith('[QQ Bot 本轮文件目录]\n') && !item.text.startsWith('[QQ Bot 群聊上下文：') && !item.text.startsWith('[QQ Bot 引用上下文：')).map((item) => item.text).join('\n');
   const clock = await ask('currentTime/read', {});
   trace({ clock });
+  if (text.includes('native-auto-compact')) {
+    const turn = histories[threadId].find(item => item.id === turnId);
+    const item = { id: 'native-compact-' + turnId, type: 'contextCompaction' };
+    turn.items.push(item); saveHistory();
+    notify('item/started', { ...common, item });
+    const controlPath = join(directory, 'compaction.json');
+    const control = existsSync(controlPath) ? JSON.parse(readFileSync(controlPath, 'utf8')) : {};
+    if (control.status === 'hang') return;
+    await new Promise(resolve => setTimeout(resolve, control.delayMs ?? 60));
+    if (turns.get(threadId) !== turnId) return;
+    if (control.status === 'failed') throw new Error('fixture native compaction failed');
+    if (existsSync(rollout(threadId))) appendFileSync(rollout(threadId), JSON.stringify({ type: 'compacted', timestamp: new Date().toISOString(), payload: {} }) + '\n');
+    notify('item/completed', { ...common, item });
+  }
   if (text.includes('hang')) return;
   let generatedFile;
   if (text.includes('send-parallel-files')) {

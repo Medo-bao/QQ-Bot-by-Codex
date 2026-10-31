@@ -1,6 +1,8 @@
 # QQ Bot
 
-Current plugin version: **0.0.3**.
+Current plugin version: **0.0.4**.
+
+Context-window length can be set globally under Runtime settings or overridden in each conversation's settings, in tokens (for example, `64000` or `128000`). `0` keeps the Codex model configuration. Restoring global settings clears the conversation override. Changes apply to the next response without resetting history; usage and automatic compaction use the capacity reported by Codex, which can be lower than the requested length. This setting does not expand the model's supported limit.
 
 The conversation view follows Codex typography, blue user bubbles, Markdown and
 collapsible activity, with code/reply copying, image previews and a latest-message button.
@@ -27,7 +29,7 @@ as the host plugins. Binding/login, access, models/presets, prompts, media, runt
 and session management remain available. A local browser URL opens the same UI when MCP Apps are unavailable.
 The Sessions detail pane is a live conversation window with paginated history and
 a composer. Desktop input continues the same AI thread and syncs replies to QQ.
-The sidebar is 240px wide, and the composer stays at the bottom in both embedded and standalone views. Its context indicator uses the last model request's token usage rather than cumulative billing totals. Automatic compaction defaults to 80% of the reported context window before the next reply, with global and per-session controls, progress feedback and preserved chat history.
+The sidebar is 240px wide, and the composer stays at the bottom in both embedded and standalone views. Its context indicator uses the last model request's token usage rather than cumulative billing totals. Codex natively manages automatic compaction using its model and configuration, without a separate plugin toggle or percentage threshold. Retired plugin compaction settings are removed. Native events provide progress and results; manual history compaction and `/compact` remain available and preserve the thread and chat history.
 The Session settings button opens a separate dialog; new sessions follow global
 settings by default, with optional overrides and a restore-global action.
 Use the pencil beside the conversation title to rename it. Names persist across

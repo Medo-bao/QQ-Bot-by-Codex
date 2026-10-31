@@ -90,8 +90,7 @@ const fields: Record<string, Field[]> = {
     { path: 'responsesTransport', label: 'OpenAI 模型连接方式', kind: 'select', options: ['http', 'auto'], help: '默认使用 HTTP 流式，避免 WebSocket 连接反复超时后才开始回复；自定义模型提供商保持原连接方式。' },
     { path: 'autoStart', label: '随 Codex 启动 QQ Bot', kind: 'boolean', wide: true, help: '默认开启：插件加载后自动连接已绑定的机器人。手动停止后，状态刷新不会重新启动连接。' },
     { path: 'webSearch', label: '网页搜索', kind: 'select', options: ['live', 'cached', 'indexed', 'disabled'] },
-    { path: 'autoCompact', label: '默认自动压缩上下文', kind: 'boolean', wide: true },
-    { path: 'autoCompactThreshold', label: '默认自动压缩阈值（%）', kind: 'number', min: 10, max: 95, help: '达到模型上下文容量的此比例后，在下一次回复前压缩；保留聊天记录。默认 80%。' },
+    { path: 'contextWindow', label: '默认上下文长度（Tokens）', kind: 'number', min: 0, help: '0 跟随 Codex 模型配置，例如可设置 128000。保存后下次回复生效；请勿超过模型支持的上限，实际可用容量以返回统计为准。' },
     { path: 'sessionIdleTimeout', label: '空闲会话回收（毫秒）', kind: 'number' },
     { path: 'processingTimeoutMs', label: '单次任务超时（毫秒）', kind: 'number' },
     { path: 'askTimeoutMs', label: '问题与审批等待时间（毫秒）', kind: 'number' },
@@ -399,7 +398,7 @@ function renderChat(session: any): void {
   $('chatPermissions').textContent = `${labels[permissions.sandbox] || ''} · ${labels[permissions.approvalPolicy] || ''} · ${permissions.networkAccess ? '允许联网' : '命令不联网'} · ${labels[permissions.webSearch] || '网页搜索'}`;
   record.taskError = session.lastError;
   const values = session.settings || session;
-  const custom = ['model', 'modelProvider', 'effort', 'preset', 'cwd', 'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'webSearch'].some((name) => values[name] && values[name] !== '(Codex default)') || values.prompt != null || values.autoCompact != null || values.autoCompactThreshold != null;
+  const custom = ['model', 'modelProvider', 'effort', 'preset', 'cwd', 'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'webSearch'].some((name) => values[name] && values[name] !== '(Codex default)') || values.prompt != null || values.contextWindow != null;
   const operation = contextRequests.get(key) || session.contextOperation;
   const progress = operation?.status === 'running' ? operation.kind === 'compact' ? '正在压缩历史' : '正在重置上下文' : undefined;
   $('chatState').textContent = `${progress || (session.busy ? 'AI 正在回复' : session.queued ? '正在准备会话' : '已就绪')} · ${effectiveModel(session)} · ${custom ? '独立设置' : '跟随全局设置'}`;
@@ -713,15 +712,16 @@ function openDirectMessage(key: string): void {
 function renderContextUsage(session: any): void {
   const usage = session.contextUsage;
   const value = session.settings || session;
-  const settings = session.contextSettings || { autoCompact: value.autoCompact ?? state.config.autoCompact, threshold: value.autoCompactThreshold ?? state.config.autoCompactThreshold };
+  const settings = session.contextSettings || { contextWindow: value.contextWindow ?? state.config.contextWindow };
   let text = !session.threadId ? '上下文：新会话' : '上下文：等待统计';
   if (usage && !usage.stale && usage.threadId === session.threadId) {
     const used = Number(usage.usedTokens).toLocaleString('zh-CN');
     text = usage.windowTokens ? `上下文 ${used} / ${Number(usage.windowTokens).toLocaleString('zh-CN')} Tokens · ${Math.round(usage.usedTokens / usage.windowTokens * 100)}%` : `上下文 ${used} Tokens · 容量未提供`;
   } else if (usage?.stale) text = '上下文：等待重新统计';
   $('chatContextUsage').textContent = text;
-  $('chatContextUsage').title = '依据模型最近一次输入与输出 Token 统计，非累计计费用量。压缩后等待下一次回复更新。';
-  $('contextUsageDetails').textContent = `${text} · ${settings.autoCompact ? `自动压缩阈值 ${settings.threshold}%` : '自动压缩已关闭'}`;
+  const length = settings.contextWindow > 0 ? `自定义长度 ${Number(settings.contextWindow).toLocaleString('zh-CN')} Tokens` : '长度跟随 Codex 模型配置';
+  $('chatContextUsage').title = `依据模型最近一次输入与输出 Token 统计，非累计计费用量。压缩或修改长度后等待下一次回复更新。${length}。实际可用容量以模型返回为准。`;
+  $('contextUsageDetails').textContent = `${text} · ${length} · 自动压缩由 Codex 管理`;
 }
 
 function renderContextOperation(session: any): void {
@@ -774,10 +774,10 @@ function openSessionSettings(session: any): void {
   }
   const value = session.settings || session;
   const model = value.model === '(Codex default)' ? '' : value.model || '';
-  const overrides = ['modelProvider', 'effort', 'preset', 'cwd', 'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'webSearch'].some((name) => Boolean(value[name])) || Boolean(model) || value.prompt != null || value.autoCompact != null || value.autoCompactThreshold != null;
+  const overrides = ['modelProvider', 'effort', 'preset', 'cwd', 'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'webSearch'].some((name) => Boolean(value[name])) || Boolean(model) || value.prompt != null || value.contextWindow != null;
   const settings = { model, modelProvider: value.modelProvider || '', effort: value.effort || '', preset: value.preset || '', cwd: value.cwd || '',
     sandbox: value.sandbox || '', approvalPolicy: value.approvalPolicy || '', approvalsReviewer: value.approvalsReviewer || '', networkAccess: value.networkAccess || '', webSearch: value.webSearch || '',
-    followGlobal: !overrides, useCustomPrompt: value.prompt != null, prompt: value.prompt || '', autoCompact: value.autoCompact ?? state.config.autoCompact, autoCompactThreshold: value.autoCompactThreshold ?? state.config.autoCompactThreshold };
+    followGlobal: !overrides, useCustomPrompt: value.prompt != null, prompt: value.prompt || '', contextWindow: value.contextWindow ?? state.config.contextWindow ?? 0 };
   const editor = document.createElement('div'); editor.className = 'session-settings';
   const intro = document.createElement('p'); intro.className = 'notice'; intro.textContent = '默认跟随 QQ Bot 全局设置。关闭后可单独覆盖，留空的项目仍跟随全局。';
   const grid = document.createElement('div'); grid.className = 'fields';
@@ -788,7 +788,7 @@ function openSessionSettings(session: any): void {
   let permissions: ReturnType<typeof permissionPicker> | undefined;
   const syncDisabled = () => {
     grid.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | HTMLButtonElement>('[data-field]').forEach((input) => {
-      input.disabled = input.dataset.field !== 'followGlobal' && (settings.followGlobal || (input.dataset.field === 'prompt' && !settings.useCustomPrompt) || (input.dataset.field === 'autoCompactThreshold' && !settings.autoCompact));
+      input.disabled = input.dataset.field !== 'followGlobal' && (settings.followGlobal || (input.dataset.field === 'prompt' && !settings.useCustomPrompt));
     });
     permissions?.refresh(settings.followGlobal);
   };
@@ -805,8 +805,7 @@ function openSessionSettings(session: any): void {
     { path: 'preset', label: '预设', kind: 'select', options: ['', ...Object.keys(state.config.presets || {})] },
     { path: 'cwd', label: '工作目录', wide: true },
     { path: 'webSearch', label: '网页搜索', kind: 'select', options: ['', 'live', 'cached', 'indexed', 'disabled'] },
-    { path: 'autoCompact', label: '自动压缩上下文', kind: 'boolean', wide: true },
-    { path: 'autoCompactThreshold', label: '自动压缩阈值（%）', kind: 'number', min: 10, max: 95, help: '达到此比例后，在下一次回复前自动压缩，聊天记录保留。' },
+    { path: 'contextWindow', label: '上下文长度（Tokens）', kind: 'number', min: 0, help: '0 使用 Codex 模型配置，例如可设置 64000 或 128000。保存后下次回复生效，不重置聊天；请勿超过模型支持的上限，实际可用容量以返回统计为准。' },
     { path: 'useCustomPrompt', label: '使用会话专属提示词', kind: 'boolean', wide: true },
     { path: 'prompt', label: '角色与额外提示词', kind: 'textarea', wide: true, help: '开启后替代全局及预设的提示词；关闭则跟随全局，内容留空表示不附加角色。' },
   ];
@@ -837,10 +836,10 @@ function openSessionSettings(session: any): void {
   save.onclick = async () => {
     if (save.dataset.saving) return;
     const invalid = grid.querySelector<HTMLInputElement>(':invalid'); if (invalid) { invalid.reportValidity(); return; }
-    const values = settings.followGlobal ? { model: '', modelProvider: '', effort: '', preset: '', cwd: '', prompt: null, sandbox: '', approvalPolicy: '', approvalsReviewer: '', networkAccess: '', webSearch: '', autoCompact: null, autoCompactThreshold: null }
+    const values = settings.followGlobal ? { model: '', modelProvider: '', effort: '', preset: '', cwd: '', prompt: null, sandbox: '', approvalPolicy: '', approvalsReviewer: '', networkAccess: '', webSearch: '', contextWindow: null }
       : { model: settings.model, modelProvider: settings.modelProvider, effort: settings.effort, preset: settings.preset, cwd: settings.cwd, prompt: settings.useCustomPrompt ? settings.prompt : null,
         sandbox: settings.sandbox, approvalPolicy: settings.approvalPolicy, approvalsReviewer: settings.approvalsReviewer, networkAccess: settings.networkAccess, webSearch: settings.webSearch,
-        autoCompact: settings.autoCompact, autoCompactThreshold: settings.autoCompactThreshold };
+        contextWindow: settings.contextWindow };
     const submitted = revision;
     save.dataset.saving = 'true'; save.disabled = true; discard.disabled = true; save.textContent = '保存中…'; note.textContent = '正在保存会话设置…'; note.classList.remove('form-error');
     try {
@@ -863,7 +862,7 @@ function openSessionSettings(session: any): void {
     management.append(button);
   }
   const progress = document.createElement('p'); progress.id = 'contextOperationStatus'; progress.className = 'context-operation'; progress.setAttribute('role', 'status');
-  const help = document.createElement('p'); help.className = 'notice'; help.textContent = '压缩历史会整理 AI 上下文，聊天记录仍然保留。重置上下文会中止当前任务，让下一条消息开始新会话，保留历史存档和会话设置。';
+  const help = document.createElement('p'); help.className = 'notice'; help.textContent = '自动压缩由 Codex 原生机制管理，无需设置开关或比例阈值。也可手动压缩历史，聊天记录仍然保留。重置上下文会中止当前任务，让下一条消息开始新会话，保留历史存档和会话设置。';
   management.append(progress, help);
   editor.append(intro, grid, note, actions, management); $('sessionSettingsBody').replaceChildren(editor); dialog.showModal(); renderContextOperation(session);
 }
@@ -1097,7 +1096,7 @@ function bindEvents(): void {
 async function main(): Promise<void> {
   document.body.dataset.transport = mode;
   if (mode === 'mcp') {
-    app = new App({ name: 'codex-qqbot-settings', title: 'QQ Bot', version: '0.0.3' }, {});
+    app = new App({ name: 'codex-qqbot-settings', title: 'QQ Bot', version: '0.0.4' }, {});
     app.onhostcontextchanged = (context) => { if (context.theme) document.body.dataset.theme = context.theme; };
     await app.connect();
     const theme = app.getHostContext()?.theme; if (theme) document.body.dataset.theme = theme;

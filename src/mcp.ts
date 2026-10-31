@@ -7,7 +7,7 @@ import { uiDocument } from './ui-document.ts';
 import { fileSendModeSchema } from './media.ts';
 
 export async function startMcp(): Promise<void> {
-  const server = new McpServer({ name: 'codex-qqbot', title: 'QQ Bot', version: '0.0.3' });
+  const server = new McpServer({ name: 'codex-qqbot', title: 'QQ Bot', version: '0.0.4' });
   const textResult = (value: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
     ...(value && typeof value === 'object' && !Array.isArray(value) ? { structuredContent: value as Record<string, unknown> } : {}) });
   const execute = async (method: string, params: Record<string, unknown> = {}) => {
@@ -51,7 +51,7 @@ export async function startMcp(): Promise<void> {
     server.registerTool('qqbot_start', { title: '启动 QQ Bot', description: 'Start the configured QQ connection and route authorized QQ messages into independent local Codex sessions. Requires previously saved QQ credentials.', inputSchema: {} }, () => execute('start'));
     server.registerTool('qqbot_stop', { title: '停止 QQ Bot', description: 'Stop the QQ connection and its active Codex tasks.', inputSchema: {} }, () => execute('stop'));
     server.registerTool('qqbot_configure', { title: 'QQ Bot 配置', description: 'Update QQ bridge settings. Use the local setup page for credentials. Model, prompt and permission changes apply to subsequent messages without interrupting active tasks. Connection changes require idle conversations before reconnecting.', inputSchema: {
-      changes: z.record(z.string(), z.unknown()).describe('Configuration patch: cwd, modelProvider, model, effort, preset, presets, prompts, streaming, access, media, vision, sendFile, timeouts, queue/history limits, sandbox, approvalPolicy, debug and Codex launch settings.'),
+      changes: z.record(z.string(), z.unknown()).describe('Configuration patch: cwd, modelProvider, model, effort, preset, presets, prompts, contextWindow (tokens; 0 keeps Codex defaults), streaming, access, media, vision, sendFile, timeouts, queue/history limits, sandbox, approvalPolicy, debug and Codex launch settings.'),
     } }, ({ changes }) => {
       if ('appId' in changes || 'appSecret' in changes) return Promise.resolve({ isError: true, ...textResult({ error: '凭据请在设置页填写。' }) });
       return execute('configure', changes);

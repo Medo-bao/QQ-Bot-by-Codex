@@ -24,8 +24,11 @@ async function main(): Promise<void> {
     const directory = dataDirectory(); new ConfigStore(directory);
     const log = createWriteStream(join(directory, 'runtime.log'), { flags: 'a', mode: 0o600 });
     for (const method of ['log', 'info', 'warn', 'error', 'debug'] as const) console[method] = (...args: unknown[]) => {
-      const prefix = `${new Date().toISOString()} [${method === 'log' ? 'INFO' : method.toUpperCase()}] `;
-      log.write(`${prefix}${format(...args).replace(/\r?\n/g, `\n${prefix}`)}\n`);
+      const message = format(...args);
+      // Node emits runtime warnings through console.error, including a separate trace hint.
+      const warning = method === 'error' && /^(?:\(node:\d+\) (?:\[[^\]]+\] )?\w*Warning:|\(Use `node --trace-(?:warnings|deprecation))/.test(message);
+      const prefix = `${new Date().toISOString()} [${method === 'log' ? 'INFO' : warning ? 'WARN' : method.toUpperCase()}] `;
+      log.write(`${prefix}${message.replace(/\r?\n/g, `\n${prefix}`)}\n`);
     };
     const logger: Logger = {
       info: message => console.info(`[qqbot] ${message}`),
@@ -59,7 +62,7 @@ async function main(): Promise<void> {
     if (command !== 'shutdown' && command !== 'stop') await ensureService();
     process.stdout.write(`${JSON.stringify(await callService(command), null, 2)}\n`); return;
   }
-  process.stdout.write('QQ Bot 0.0.3\n\nnode dist/cli.js setup     本地扫码绑定与设置页\nnode dist/cli.js start     启动 QQ → Codex\nnode dist/cli.js status    查看状态\nnode dist/cli.js models    查看 Codex 模型\nnode dist/cli.js stop      停止 QQ 连接\nnode dist/cli.js shutdown  退出共享后台进程\nnode dist/cli.js mcp       Codex 插件 MCP 入口\n');
+  process.stdout.write('QQ Bot 0.0.4\n\nnode dist/cli.js setup     本地扫码绑定与设置页\nnode dist/cli.js start     启动 QQ → Codex\nnode dist/cli.js status    查看状态\nnode dist/cli.js models    查看 Codex 模型\nnode dist/cli.js stop      停止 QQ 连接\nnode dist/cli.js shutdown  退出共享后台进程\nnode dist/cli.js mcp       Codex 插件 MCP 入口\n');
 }
 
 main().catch((error: Error) => { console.error(error.message); process.exitCode = 1; });

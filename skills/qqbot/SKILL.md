@@ -5,7 +5,7 @@ description: 设置、绑定和管理 QQ Bot，让 QQ 私聊或群聊通过本�
 
 # QQ Bot
 
-The current plugin version is 0.0.3. Change it only when explicitly requested.
+The current plugin version is 0.0.4. Change it only when explicitly requested.
 
 Use this plugin's `qqbot_*` MCP tools. If they are absent, ask the user to install
 and enable `codex-qqbot` from the local marketplace, then open a new chat.
@@ -52,6 +52,9 @@ their original Codex history remains available. Resetting context keeps settings
 peer IDs group Markdown/JSON history, received attachments and generated files.
 Sessions can also override sandbox, approval policy, command network access and
 web search. Empty values inherit global settings; restore-global clears all overrides.
+`contextWindow` sets the context length in tokens globally or per session; `0`
+uses the Codex model configuration. Codex natively manages automatic compaction,
+with no plugin-specific toggle or threshold. Manual `/compact` stays available.
 Activity details are local by default, including recovered tool failures. Only sync
 those diagnostics to QQ when the configured showToolResults option is enabled.
 Public reasoning summaries and plans appear alongside progress and streamed command
@@ -62,7 +65,7 @@ Recent group context is persistent and includes complete received messages with
 stable speaker IDs and bot replies. Existing current-thread history is backfilled;
 only messages actually delivered to the bot can be recovered. Authorized non-mention
 messages remain context without triggering replies. Explicit resets clear recent
-context and preserve archived records. The plugin version remains 0.0.3.
+context and preserve archived records. The plugin version remains 0.0.4.
 Group messages require an @mention by default. `/new`, `/compact`, `/model`, `/effort`,
 `/preset`, `/stop`, `/bot-status`, `/bot-help` and `/answer` work inside QQ. Codex approvals
 and questions are delivered to QQ; QQ replies must come from the task's initiating

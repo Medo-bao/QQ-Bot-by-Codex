@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.0.4 - 2026-10-31
+
+- Delegate automatic compaction entirely to Codex, remove plugin toggles, percentage thresholds and retired settings, and retain native progress feedback and manual compaction.
+- Add global and per-conversation context-window lengths in tokens, preserve Codex defaults and conversation history, and refresh usage statistics after the next response.
+- Log Node runtime warnings, including SQLite experimental notices and trace hints, at WARN while retaining ERROR for actual failures.
+- Read the effective catalog from compaction checkpoints and native tool-update records; append a catalog update so compacted conversations discover `voice` without rewriting history or shifting its indexed offsets.
+- Synchronize all QQ tool definitions and indexes on cold resume, restore question and image-analysis tools missing from partial indexes, and leave rollout files untouched for index-only repairs.
+- Align plugin metadata, MCP services, UI, QQ version commands and SDK identification at 0.0.4.
+
 ## 0.0.3 - 2026-10-30
 
 - Refresh persisted file-tool metadata and indexes on cold resume so existing conversations discover `voice` without resetting context.

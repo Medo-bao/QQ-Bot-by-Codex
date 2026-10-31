@@ -10,7 +10,7 @@ import { promisify } from 'node:util';
 import { WebSocketServer } from 'ws';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { ConfigStore, CodexClient, QQBridge, QQTransport, BotController, InteractionBroker, MediaStore, configSchema, callService, describeImage, dynamicTools,
+import { ConfigStore, SessionStore, CodexClient, QQBridge, QQTransport, BotController, InteractionBroker, MediaStore, configSchema, callService, describeImage, dynamicTools,
   ReplyLimiter, replyPolicy, cacheMsgId, getCachedReplyIds, resolveReplyTarget } from '../dist/index.js';
 
 const quiet = { info() {}, warn() {}, error() {}, debug() {} };
@@ -36,34 +36,51 @@ class FakeQQ {
   openStream(target) { const receipt = { id: 'stream-' + this.streams.length, ext_info: { ref_idx: 'stream-ref-' + this.streams.length } }; const stream = { target, receipt, updates: [], completeCount: 0, async update(text) { this.updates.push(text); }, async complete() { this.completeCount++; return receipt; } }; this.streams.push(stream); return stream; }
 }
 
-test('Persisted QQ file tools refresh modes without replacing history or unrelated tools', async () => {
+test('Persisted QQ tools refresh complete indexes without replacing history or unrelated tools', async () => {
   const { DatabaseSync } = await import('node:sqlite');
   const directory = await temp(); const sessions = join(directory, 'sessions'); await mkdir(sessions);
   const threadId = '11111111-2222-4333-8444-555555555555', path = join(sessions, 'legacy.jsonl');
   const previous = structuredClone(dynamicTools[0]); previous.description = 'Legacy file sender'; delete previous.inputSchema.properties.send_as;
   const unrelated = { type: 'function', name: 'unrelated_tool', description: 'Preserved', inputSchema: { type: 'object' } };
-  const history = Buffer.from(JSON.stringify({ type: 'response_item', payload: { text: '保留群聊上下文和文件路径 %20.png' } }) + '\n');
-  await writeFile(path, Buffer.concat([Buffer.from(JSON.stringify({ type: 'session_meta', payload: { id: threadId, dynamic_tools: [previous, unrelated] } }) + '\n'), history]));
+  const history = Buffer.from(JSON.stringify({ ordinal: 1, type: 'response_item', payload: { text: '保留群聊上下文和文件路径 %20.png' } }) + '\n');
+  const checkpoint = { ordinal: 2, type: 'compacted', payload: { message: 'Preserved summary', resume_metadata: {
+    dynamic_tools: { thread_id: threadId, tools: [previous, ...dynamicTools.slice(1), unrelated] } } } };
+  const original = Buffer.concat([Buffer.from(JSON.stringify({ ordinal: 0, type: 'session_meta', payload: { id: threadId, history_mode: 'paginated', dynamic_tools: [...dynamicTools, unrelated] } }) + '\n'), history, Buffer.from(JSON.stringify(checkpoint) + '\n')]);
+  await writeFile(path, original);
   const state = new DatabaseSync(join(directory, 'state_5.sqlite'));
   state.exec('CREATE TABLE thread_dynamic_tools (thread_id TEXT, position INTEGER, name TEXT, description TEXT, input_schema TEXT, PRIMARY KEY(thread_id,position))');
   const insert = state.prepare('INSERT INTO thread_dynamic_tools VALUES (?, ?, ?, ?, ?)');
-  insert.run(threadId, 0, previous.name, previous.description, JSON.stringify(previous.inputSchema));
-  insert.run(threadId, 1, unrelated.name, unrelated.description, JSON.stringify(unrelated.inputSchema));
+  for (const [position, tool] of dynamicTools.entries()) insert.run(threadId, position, tool.name, tool.description, JSON.stringify(tool.inputSchema));
+  insert.run(threadId, 3, unrelated.name, unrelated.description, JSON.stringify(unrelated.inputSchema));
   const client = new CodexClient(configSchema.parse({ cwd: directory }), quiet); client.runtimeHome = directory;
   let loaded = false;
   client.call = async method => method === 'thread/read' ? { thread: { id: threadId, path } } : { data: loaded ? [threadId] : [] };
   try {
-    assert.equal(await client.refreshThreadTool(threadId, dynamicTools[0]), true);
+    assert.equal(await client.refreshThreadTools(threadId, dynamicTools), true);
     const updated = await readFile(path);
-    assert.ok(updated.subarray(updated.indexOf(10) + 1).equals(history));
-    const metadata = JSON.parse(updated.subarray(0, updated.indexOf(10)).toString());
-    assert.equal(metadata.payload.id, threadId);
-    assert.deepEqual(metadata.payload.dynamic_tools, [dynamicTools[0], unrelated]);
+    assert.ok(updated.subarray(0, original.length).equals(original), 'chat records, compaction state and their byte offsets are preserved');
+    const event = JSON.parse(updated.subarray(original.length).toString());
+    assert.equal(event.ordinal, 3);
+    assert.equal(event.type, 'dynamic_tools_updated');
+    assert.equal(event.payload.thread_id, threadId);
+    assert.deepEqual(event.payload.tools, [...dynamicTools, unrelated]);
     assert.deepEqual(JSON.parse(state.prepare('SELECT input_schema FROM thread_dynamic_tools WHERE name=?').get(previous.name).input_schema).properties.send_as.enum, ['auto', 'file', 'voice']);
     assert.deepEqual(state.prepare('SELECT description FROM thread_dynamic_tools WHERE name=?').get(unrelated.name).description, unrelated.description);
+    for (const tool of dynamicTools) {
+      const row = state.prepare('SELECT description,input_schema FROM thread_dynamic_tools WHERE name=?').get(tool.name);
+      assert.equal(row.description, tool.description);
+      assert.deepEqual(JSON.parse(row.input_schema), tool.inputSchema);
+    }
+    state.prepare('DELETE FROM thread_dynamic_tools WHERE name=?').run(dynamicTools[1].name);
     loaded = true;
-    assert.equal(await client.refreshThreadTool(threadId, dynamicTools[0]), false, 'current schemas do not reload an active cache');
-    await assert.rejects(client.refreshThreadTool(threadId, { ...dynamicTools[0], description: 'A later revision' }), /重启/);
+    await assert.rejects(client.refreshThreadTools(threadId, dynamicTools), /重启/, 'partial indexes are not changed while the thread is loaded');
+    loaded = false;
+    assert.equal(await client.refreshThreadTools(threadId, dynamicTools), true, 'complete metadata still repairs a partial SQL index');
+    assert.ok((await readFile(path)).equals(updated), 'index-only repair leaves the entire rollout untouched');
+    assert.ok(state.prepare('SELECT name FROM thread_dynamic_tools WHERE name=?').get(dynamicTools[1].name));
+    loaded = true;
+    assert.equal(await client.refreshThreadTools(threadId, dynamicTools), false, 'current schemas do not reload an active cache');
+    await assert.rejects(client.refreshThreadTools(threadId, [{ ...dynamicTools[0], description: 'A later revision' }, ...dynamicTools.slice(1)]), /重启/);
     assert.ok((await readFile(path)).equals(updated), 'loaded threads are never rewritten');
   } finally { state.close(); }
 });
@@ -602,7 +619,9 @@ test('Context reset and compaction report progress, retain settings and recover 
   const directory = await temp();
   const store = new ConfigStore(directory);
   const config = store.update({ appId: 'context-fixture', appSecret: 'fixture-secret', cwd: directory, streaming: false,
-    codexCommand: fixture, codexArgs: [directory], access: { c2cMode: 'open', groupMode: 'open' } });
+    codexCommand: fixture, codexArgs: [directory], access: { c2cMode: 'open', groupMode: 'open' }, autoCompact: false, autoCompactThreshold: 10 });
+  assert.equal('autoCompact' in config, false, 'retired plugin controls cannot disable native automatic compaction');
+  assert.equal('autoCompactThreshold' in JSON.parse(await readFile(store.path, 'utf8')), false);
   const qq = new FakeQQ();
   const bridge = new QQBridge(config, directory, qq, new CodexClient(config, quiet), quiet);
   const controller = new BotController(store, quiet);
@@ -668,7 +687,8 @@ test('Context reset and compaction report progress, retain settings and recover 
     assert.equal(empty.sessions.find(item => item.peerId === 'empty-peer').threadId, undefined);
     await waitFor(() => bridge.status().sessions.find(item => item.peerId === 'empty-peer').contextOperation.status === 'completed');
     const usageControl = value => writeFile(join(directory, 'context-usage.json'), JSON.stringify(value));
-    await bridge.manageSession('group', 'team', 'configure', { autoCompact: true, autoCompactThreshold: 70 });
+    await assert.rejects(bridge.manageSession('group', 'team', 'configure', { autoCompact: false }));
+    await assert.rejects(bridge.manageSession('group', 'team', 'configure', { autoCompactThreshold: 70 }));
     await usageControl({ usedTokens: 90000, windowTokens: 100000 });
     await bridge.handleMessage(group('fill context to ninety percent'));
     assert.equal(current().contextUsage.usedTokens, 90000, 'context uses the last request, not cumulative billed tokens');
@@ -676,34 +696,85 @@ test('Context reset and compaction report progress, retain settings and recover 
     const originalThread = current().threadId;
     const compactCount = () => requireTrace(directory).filter(item => item.method === 'thread/compact/start').length;
     const beforeAuto = compactCount();
+    await bridge.handleMessage(group('high usage alone must not trigger plugin compaction'));
+    assert.equal(compactCount(), beforeAuto, 'Codex decides whether and when automatic compaction runs');
     await control({ delayMs: 60 }); await usageControl({ usedTokens: 2000, windowTokens: 100000 });
-    const automatic = bridge.handleMessage(group('continue after automatic compaction'));
+    const automatic = bridge.handleMessage(group('native-auto-compact during the reply'));
     await waitFor(() => current().contextOperation?.automatic && current().contextOperation.status === 'running');
     await automatic;
-    assert.equal(compactCount(), beforeAuto + 1);
+    assert.equal(compactCount(), beforeAuto, 'native progress events never cause a second manual compaction request');
     assert.equal(current().threadId, originalThread);
     assert.equal(current().contextOperation.status, 'completed');
     assert.equal(current().contextUsage.usedTokens, 2000);
     assert.equal(current().contextUsage.stale, undefined, 'the next model response supplies a new measurement');
-    await bridge.manageSession('group', 'team', 'configure', { autoCompact: false });
-    await usageControl({ usedTokens: 95000, windowTokens: 100000 });
-    await bridge.handleMessage(group('high context with automatic compaction disabled'));
-    await bridge.handleMessage(group('keep automatic compaction disabled'));
-    assert.equal(compactCount(), beforeAuto + 1);
-    assert.equal(current().contextSettings.autoCompact, false);
-    await bridge.manageSession('group', 'team', 'configure', { autoCompact: null, autoCompactThreshold: null });
-    assert.deepEqual(current().contextSettings, { autoCompact: true, threshold: 80 });
+    assert.deepEqual(current().contextSettings, { contextWindow: 0 });
+    assert.equal('autoCompact' in current().settings, false);
     await control({ status: 'failed' }); await usageControl({ usedTokens: 3000, windowTokens: 100000 });
-    await bridge.handleMessage(group('continue even when automatic compaction fails'));
+    await bridge.handleMessage(group('native-auto-compact failed in Codex'));
     assert.equal(current().contextOperation.status, 'failed');
-    assert.ok(qq.messages.at(-1).text.includes('continue even when automatic compaction fails'));
-    await bridge.handleMessage(group('no redundant compaction after fresh low usage'));
-    assert.equal(compactCount(), beforeAuto + 2);
+    assert.match(current().contextOperation.message, /fixture native compaction failed/);
+    await bridge.handleMessage(group('continue after failed native compaction'));
+    assert.ok(qq.messages.at(-1).text.includes('continue after failed native compaction'));
+    await control({ status: 'hang' });
+    const nativePending = bridge.handleMessage(group('native-auto-compact interrupted by user'));
+    await waitFor(() => current().contextOperation?.automatic && current().contextOperation.status === 'running');
+    await controller.session('group', 'team', 'stop'); await nativePending;
+    assert.equal(current().contextOperation.status, 'cancelled');
+    await bridge.handleMessage(group('continue after cancelled native compaction'));
+    assert.ok(qq.messages.at(-1).text.includes('continue after cancelled native compaction'));
+    assert.equal(compactCount(), beforeAuto);
+    const selectedThread = current().threadId;
+    const nextContextConfig = { ...config, contextWindow: 128000 };
+    assert.equal(bridge.requiresRestart(nextContextConfig), false, 'global context length applies without reconnecting QQ');
+    store.update({ contextWindow: 128000 }); bridge.applyThreadSettings(nextContextConfig);
+    const lastResume = () => requireTrace(directory).filter(item => item.method === 'thread/resume' && item.params.threadId === selectedThread).at(-1).params;
+    await usageControl({ usedTokens: 3000 });
+    await bridge.handleMessage(group('inherit the global context length'));
+    assert.equal(lastResume().config.model_context_window, 128000);
+    for (const key of ['model_auto_compact_token_limit', 'model_post_turn_compact_threshold_percent', 'async_compaction_threshold_percent']) {
+      assert.equal(key in lastResume().config, false, 'native compaction policy inherits Codex configuration');
+    }
+    assert.equal(current().contextUsage.windowTokens, 128000);
+    await bridge.manageSession('group', 'team', 'configure', { contextWindow: 64000 });
+    assert.equal(current().contextUsage.stale, true, 'old capacity statistics are stale until the next response');
+    await bridge.handleMessage(group('use an independent context length'));
+    assert.equal(lastResume().config.model_context_window, 64000);
+    assert.equal(current().contextUsage.windowTokens, 64000);
+    await bridge.handleMessage(message('another group inherits globally', 'group', 'other-team'));
+    const otherThread = bridge.status().sessions.find(item => item.peerId === 'other-team').threadId;
+    assert.equal(requireTrace(directory).filter(item => item.method === 'thread/start').at(-1).params.config.model_context_window, 128000);
+    store.update({ contextWindow: 256000 }); bridge.applyThreadSettings({ ...config, contextWindow: 256000 });
+    assert.equal(current().contextSettings.contextWindow, 64000, 'a session override survives global changes');
+    await bridge.handleMessage(message('updated inherited context length', 'group', 'other-team'));
+    assert.equal(requireTrace(directory).filter(item => item.method === 'thread/resume' && item.params.threadId === otherThread).at(-1).params.config.model_context_window, 256000);
+    await bridge.manageSession('group', 'team', 'configure', { contextWindow: 0 });
+    await bridge.handleMessage(group('explicit model default despite a global override'));
+    assert.equal('model_context_window' in lastResume().config, false);
+    assert.equal(current().contextUsage.windowTokens, 100000);
+    await bridge.manageSession('group', 'team', 'configure', { contextWindow: null });
+    await bridge.handleMessage(group('restore global context inheritance'));
+    assert.equal(lastResume().config.model_context_window, 256000);
+    assert.equal(current().threadId, selectedThread, 'context length changes preserve the conversation');
+    await assert.rejects(bridge.manageSession('group', 'team', 'configure', { contextWindow: -1 }));
+    await assert.rejects(bridge.manageSession('group', 'team', 'configure', { contextWindow: 1.5 }));
+    assert.throws(() => store.update({ contextWindow: -1 }));
+    store.update({ contextWindow: 0 }); bridge.applyThreadSettings({ ...config, contextWindow: 0 });
+    await usageControl({ usedTokens: 3000, windowTokens: 100000 });
+    await bridge.handleMessage(group('continue with model defaults and retained context'));
     const saved = JSON.parse(await readFile(join(directory, 'sessions.json'), 'utf8'));
+    assert.equal(saved['context-fixture:group:team'].contextWindow, null);
     assert.equal(saved['context-fixture:group:team'].contextUsage.usedTokens, 3000);
     await controller.stop();
     delete saved['context-fixture:group:team'].contextUsage;
+    saved['context-fixture:group:team'].autoCompact = false;
+    saved['context-fixture:group:team'].autoCompactThreshold = 10;
     await writeFile(join(directory, 'sessions.json'), JSON.stringify(saved));
+    const migrated = new SessionStore(directory).get('context-fixture:group:team');
+    assert.equal('autoCompact' in migrated, false);
+    assert.equal('autoCompactThreshold' in migrated, false);
+    assert.equal(migrated.threadId, selectedThread, 'retiring plugin compaction settings keeps the same native thread');
+    assert.equal(migrated.prompt, 'exclusive-role');
+    assert.equal('autoCompact' in JSON.parse(await readFile(join(directory, 'sessions.json'), 'utf8'))['context-fixture:group:team'], false);
     const restored = new QQBridge(config, directory, new FakeQQ(), new CodexClient(config, quiet), quiet);
     try {
       await restored.start();
@@ -968,7 +1039,7 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
   try {
     assert.equal(client.getServerVersion().name, 'codex-qqbot');
     assert.equal(client.getServerVersion().title, 'QQ Bot');
-    assert.equal(client.getServerVersion().version, '0.0.3');
+    assert.equal(client.getServerVersion().version, '0.0.4');
     const tools = (await client.listTools()).tools.map((tool) => tool.name);
     assert.deepEqual(tools.sort(), ['qqbot_configure', 'qqbot_models', 'qqbot_send_file', 'qqbot_send_message', 'qqbot_setup', 'qqbot_start', 'qqbot_status', 'qqbot_stop', 'qqbot_ui'].sort());
     const details = (await client.listTools()).tools;

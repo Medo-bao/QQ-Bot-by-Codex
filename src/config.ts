@@ -42,8 +42,7 @@ export const configSchema = z.object({
   askTimeoutMs: z.number().int().min(1000).default(300000),
   maxQueue: z.number().int().min(1).max(100).default(20),
   historyLimit: z.number().int().min(0).max(100).default(10),
-  autoCompact: z.boolean().default(true),
-  autoCompactThreshold: z.number().int().min(10).max(95).default(80),
+  contextWindow: z.number().int().min(0).default(0),
   groupPrompt: z.string().default(''),
   directPrompt: z.string().default(''),
   showToolResults: z.boolean().default(false),
@@ -113,6 +112,8 @@ export class ConfigStore {
   private merge(patch: Record<string, unknown>): Record<string, unknown> {
     const raw = existsSync(this.path) ? JSON.parse(readFileSync(this.path, 'utf8')) : {};
     const merged = { ...raw, ...patch };
+    delete merged.autoCompact;
+    delete merged.autoCompactThreshold;
     for (const key of ['access', 'media', 'vision', 'sendFile']) {
       if (patch[key] && typeof patch[key] === 'object') merged[key] = { ...raw[key], ...patch[key] as object };
     }
