@@ -50,7 +50,7 @@ export class QQTransport implements ChatTransport {
       appId: config.appId,
       appSecret: config.appSecret,
       transport: 'websocket',
-      userAgent: 'codex-qqbot/0.0.4',
+      userAgent: 'codex-qqbot/0.0.5',
       logger,
       baseUrl: process.env.QQBOT_BASE_URL || 'https://api.bot.qq.com',
       tokenBaseUrl: process.env.QQBOT_TOKEN_BASE_URL || 'https://api.bot.qq.com',

@@ -5,7 +5,7 @@ description: 设置、绑定和管理 QQ Bot，让 QQ 私聊或群聊通过本�
 
 # QQ Bot
 
-The current plugin version is 0.0.4. Change it only when explicitly requested.
+The current plugin version is 0.0.5. Change it only when explicitly requested.
 
 Use this plugin's `qqbot_*` MCP tools. If they are absent, ask the user to install
 and enable `codex-qqbot` from the local marketplace, then open a new chat.
@@ -65,7 +65,7 @@ Recent group context is persistent and includes complete received messages with
 stable speaker IDs and bot replies. Existing current-thread history is backfilled;
 only messages actually delivered to the bot can be recovered. Authorized non-mention
 messages remain context without triggering replies. Explicit resets clear recent
-context and preserve archived records. The plugin version remains 0.0.4.
+context and preserve archived records. The plugin version remains 0.0.5.
 Group messages require an @mention by default. `/new`, `/compact`, `/model`, `/effort`,
 `/preset`, `/stop`, `/bot-status`, `/bot-help` and `/answer` work inside QQ. Codex approvals
 and questions are delivered to QQ; QQ replies must come from the task's initiating
@@ -88,5 +88,30 @@ ZIP merely to prevent a voice message. Ordinary audio (MP3, WAV, OGG, AAC, etc.)
 defaults to a file. Use `send_as: "voice"` only when a voice message is requested.
 `auto` keeps image/video previews and native SILK/AMR voice messages.
 
-QQ conversation threads automatically receive scoped `qqbot_send_file` and
-`qqbot_ask_question` tools. They do not start another bridge MCP instance.
+## Check website login state
+
+For questions such as whether X/Twitter is signed in in the Codex built-in
+browser, call `qqbot_browser` with the requested website URL. The scoped tool
+initializes the official desktop browser runtime and checks visible controls.
+It returns `signed_in`, `signed_out` or `unknown` plus evidence. Report unknown
+as unable to check; an HTTP 403, missing connector or unavailable browser never
+establishes signed-out status. Codex model authentication is separate from site
+authentication. Do not probe debug ports, read passwords or copy cookies.
+This read-only tool needs full access and an attached desktop chat using the
+same ChatGPT account. Native browser and website permission checks remain in force.
+
+## Dispatch to existing desktop conversations
+
+Use `qqbot_desktop` when the user explicitly asks another existing Codex
+conversation to work. Select the exact project and conversation using `list`
+and `read`, then `dispatch` the requested task once. `jobs` reports progress.
+The selected QQ conversation needs full access and `desktopControl` enabled.
+The desktop app must be running; the original desktop conversation keeps its
+model, permissions and context. A busy target waits until idle rather than
+being interrupted. The task's final text returns to its source QQ conversation
+by default, so do not send the same result again. Pending queued tasks can be
+cancelled; already dispatched work is stopped in its original Codex conversation.
+Never launch a second Codex process against the same desktop thread.
+
+QQ conversation threads automatically receive scoped file, question, image,
+desktop-task and website-login tools. They do not start another bridge MCP instance.

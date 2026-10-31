@@ -59,7 +59,20 @@ async function execute(threadId, turnId, input) {
     notify('item/completed', { ...common, item });
   }
   if (text.includes('hang')) return;
+  if (text.includes('long-command-failure')) {
+    const item = { id: 'failed-command-' + turnId, type: 'commandExecution', command: 'fixture-command', status: 'completed', exitCode: 1,
+      aggregatedOutput: 'PASS: preceding output\n'.repeat(400) + 'FINAL FAILURE: preserved error at the end' };
+    histories[threadId].find(item => item.id === turnId).items.push(item); saveHistory();
+    notify('item/completed', { ...common, item });
+  }
   let generatedFile;
+  if (text.includes('browser-login-check')) {
+    const browser = await ask('item/tool/call', { ...common, callId: 'browser-login', tool: 'qqbot_browser', arguments: { url: 'https://x.com/' } });
+    trace({ browserLogin: browser });
+    const item = { id: 'browser-' + turnId, type: 'dynamicToolCall', tool: 'qqbot_browser', status: browser.success ? 'completed' : 'failed', ...browser };
+    histories[threadId].find(turn => turn.id === turnId).items.push(item); saveHistory();
+    notify('item/completed', { ...common, item });
+  }
   if (text.includes('send-parallel-files')) {
     const folder = join(process.env.CODEX_HOME, 'generated_images', threadId); mkdirSync(folder, { recursive: true });
     const first = join(folder, 'first.txt'), second = join(folder, 'second.txt');

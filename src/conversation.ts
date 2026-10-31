@@ -29,11 +29,14 @@ export function conversationActivity(item: any): ConversationActivity | undefine
     mcpToolCall: ['tool', `使用 ${item.tool || '工具'}`], dynamicToolCall: ['tool', `使用 ${item.tool || '工具'}`],
     imageGeneration: ['image', '生成图片'], webSearch: ['search', '搜索网页'], contextCompaction: ['context', '压缩上下文'], plan: ['plan', '计划'] };
   const description = labels[item.type]; if (!description) return;
-  const failed = item.status === 'failed' || item.status === 'declined' || item.success === false || Boolean(item.failure || item.error || item.result?.isError);
+  const failed = item.status === 'failed' || item.status === 'declined' || item.success === false || Boolean(item.failure || item.error || item.result?.isError) ||
+    item.type === 'commandExecution' && typeof item.exitCode === 'number' && item.exitCode !== 0;
   const output = item.error?.message || item.failure?.message || item.result?.error?.message ||
     (item.contentItems || item.result?.content || []).filter((entry: any) => ['inputText', 'text', 'input_text'].includes(entry.type)).map((entry: any) => entry.text).join('\n');
-  const detail = item.type === 'plan' ? item.text || '' : [item.command, item.aggregatedOutput, item.changes?.map((change: any) => change.path).join('\n'),
-    item.arguments?.file_path, item.savedPath, item.action?.query, output].filter(Boolean).join('\n').slice(0, 4000);
+  const text = item.type === 'plan' ? item.text || '' : [item.command, failed && typeof item.exitCode === 'number' ? `退出码：${item.exitCode}` : '',
+    item.aggregatedOutput, item.changes?.map((change: any) => change.path).join('\n'),
+    item.arguments?.file_path, item.savedPath, item.action?.query, output].filter(Boolean).join('\n');
+  const detail = failed && text.length > 4000 ? `${text.slice(0, 1500)}\n…中间内容已省略…\n${text.slice(-2400)}` : text.slice(0, 4000);
   return { id: item.id, kind: description[0], label: description[1], detail,
     status: failed ? 'failed' : status };
 }

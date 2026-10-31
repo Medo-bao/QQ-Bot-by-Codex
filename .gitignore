@@ -10,8 +10,8 @@
 !/CHANGELOG_EN.md
 !/package.json
 !/package-lock.json
-!/plugin.json
-!/mcp.json
+!/.codex-plugin/
+!/.mcp.json
 !/tsconfig.json
 !/src/
 !/scripts/

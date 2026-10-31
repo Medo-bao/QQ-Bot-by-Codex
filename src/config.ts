@@ -43,6 +43,7 @@ export const configSchema = z.object({
   maxQueue: z.number().int().min(1).max(100).default(20),
   historyLimit: z.number().int().min(0).max(100).default(10),
   contextWindow: z.number().int().min(0).default(0),
+  desktopControl: z.boolean().default(true),
   groupPrompt: z.string().default(''),
   directPrompt: z.string().default(''),
   showToolResults: z.boolean().default(false),

@@ -5,13 +5,27 @@ import { ConfigStore } from './config.ts';
 import { callService, ensureService } from './service.ts';
 import { uiDocument } from './ui-document.ts';
 import { fileSendModeSchema } from './media.ts';
+import { browserEnvironmentKeys } from './browser-access.ts';
 
 export async function startMcp(): Promise<void> {
-  const server = new McpServer({ name: 'codex-qqbot', title: 'QQ Bot', version: '0.0.4' });
+  const server = new McpServer({ name: 'codex-qqbot', title: 'QQ Bot', version: '0.0.5' });
   const textResult = (value: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
     ...(value && typeof value === 'object' && !Array.isArray(value) ? { structuredContent: value as Record<string, unknown> } : {}) });
-  const execute = async (method: string, params: Record<string, unknown> = {}) => {
-    try { await ensureService(); return textResult(await callService(method, params)); }
+  const attachDesktop = async (meta?: Record<string, unknown>) => {
+    let context: any = meta?.['x-codex-turn-metadata'];
+    if (typeof context === 'string') { try { context = JSON.parse(context); } catch { context = undefined; } }
+    const threadId = context?.thread_id || context?.session_id || process.env.CODEX_THREAD_ID;
+    if (process.env.CODEX_APP_TOOLS_PIPE_PATH && typeof threadId === 'string' && threadId) await callService('desktopAttach', {
+      pipePath: process.env.CODEX_APP_TOOLS_PIPE_PATH, threadId,
+      browserEnvironment: Object.fromEntries(browserEnvironmentKeys.flatMap(key => process.env[key] ? [[key, process.env[key]!]] : [])),
+    });
+  };
+  const execute = async (method: string, params: Record<string, unknown> = {}, meta?: Record<string, unknown>) => {
+    try {
+      await ensureService();
+      await attachDesktop(meta);
+      return textResult(await callService(method, params));
+    }
     catch (error) { return { isError: true, ...textResult({ error: error instanceof Error ? error.message : String(error) }) }; }
   };
   server.registerTool('qqbot_status', { title: 'QQ Bot 连接状态', description: 'Read QQ bridge connection state, current Codex sessions, pending questions and observed user/group OpenIDs. Does not start a connection.', annotations: { readOnlyHint: true }, inputSchema: {} }, async () => {
@@ -28,6 +42,7 @@ export async function startMcp(): Promise<void> {
         const config = new ConfigStore().read();
         if (!config.autoStart || !config.appId || !config.appSecret) return;
         await ensureService();
+        await attachDesktop();
         await callService('start');
       })().catch((error) => console.error(`QQ Bot 自动启动失败：${error instanceof Error ? error.message : String(error)}`));
     };
@@ -41,13 +56,13 @@ export async function startMcp(): Promise<void> {
       description: 'Open the full QQ Bot settings app in the sidebar or beside this chat. Includes QQ binding, Codex login, models/presets, media, access control, runtime and sessions. A local browser URL is also returned.',
       inputSchema: {},
       _meta: { ui: { resourceUri: uri }, 'openai/ui': { entrypoints: [{ type: 'global' }, { type: 'thread' }] } },
-    }, () => execute('setup'));
+    }, (_params, extra) => execute('setup', {}, extra._meta));
     server.registerTool('qqbot_ui', {
       title: 'QQ Bot 页面操作',
       description: 'Settings app backend. Called only by the plugin UI, never by the model.',
       inputSchema: { action: z.enum(['status', 'configure', 'bind', 'cancelBind', 'unbind', 'credentials', 'start', 'stop', 'models', 'catalog', 'account', 'login', 'qr', 'session', 'shutdown']), payload: z.record(z.string(), z.unknown()).optional() },
       _meta: { ui: { visibility: ['app'] } },
-    }, ({ action, payload }) => execute(action, payload || {}));
+    }, ({ action, payload }, extra) => execute(action, payload || {}, extra._meta));
     server.registerTool('qqbot_start', { title: '启动 QQ Bot', description: 'Start the configured QQ connection and route authorized QQ messages into independent local Codex sessions. Requires previously saved QQ credentials.', inputSchema: {} }, () => execute('start'));
     server.registerTool('qqbot_stop', { title: '停止 QQ Bot', description: 'Stop the QQ connection and its active Codex tasks.', inputSchema: {} }, () => execute('stop'));
     server.registerTool('qqbot_configure', { title: 'QQ Bot 配置', description: 'Update QQ bridge settings. Use the local setup page for credentials. Model, prompt and permission changes apply to subsequent messages without interrupting active tasks. Connection changes require idle conversations before reconnecting.', inputSchema: {
@@ -58,6 +73,13 @@ export async function startMcp(): Promise<void> {
     });
     server.registerTool('qqbot_models', { title: 'QQ Bot 可用模型', description: 'List models and reasoning efforts available through the installed Codex login and configuration.', annotations: { readOnlyHint: true }, inputSchema: {} }, () => execute('models'));
     const destination = { scope: z.enum(['c2c', 'group']), target_id: z.string().min(1) };
+    server.registerTool('qqbot_browser', { title: 'QQ Bot 网站登录检查', description: 'Read the requested website login state from the attached Codex desktop built-in browser. Returns signed_in, signed_out or unknown; connection errors and HTTP 403 never mean signed out. Requires full access in the selected QQ conversation. Does not log in, read cookies/passwords or post anything.', annotations: { readOnlyHint: true }, inputSchema: {
+      ...destination, url: z.string().url(),
+    } }, (params, extra) => execute('browser', params, extra._meta));
+    server.registerTool('qqbot_desktop', { title: 'QQ Bot 项目会话调度', description: 'List/read existing Codex desktop conversations and dispatch a task only when the human explicitly asks that conversation to work. Busy conversations wait until idle. Results can return to the selected QQ conversation. Requires that QQ conversation to have full access.', inputSchema: {
+      ...destination, action: z.enum(['list', 'read', 'dispatch', 'jobs', 'cancel', 'retry_delivery']), query: z.string().optional(), cursor: z.string().optional(),
+      thread_id: z.string().optional(), prompt: z.string().optional(), job_id: z.string().optional(), notify_qq: z.boolean().optional(),
+    } }, (params, extra) => execute('desktop', params, extra._meta));
     server.registerTool('qqbot_send_message', { title: 'QQ Bot 发送消息', description: 'Send a Markdown message to a specified QQ user or group. Use only when the human explicitly asks to send to this QQ conversation.', inputSchema: { ...destination, text: z.string().min(1) } }, (params) => execute('send', params));
     server.registerTool('qqbot_send_file', { title: 'QQ Bot 发送文件', description: 'Send an existing local file to a specified QQ conversation, within configured allowed paths. MP3 defaults to an original file. Set send_as=file to force a downloadable file or send_as=voice for a voice message. Requires an explicit human request to send to that recipient.', inputSchema: { ...destination, file_path: z.string().min(1), send_as: fileSendModeSchema.describe('auto previews images/videos and native QQ voice; ordinary audio such as MP3 is sent as a file. file always preserves the original file and filename. voice sends audio as a voice message.') } }, (params) => execute('sendFile', params));
   }

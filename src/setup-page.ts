@@ -28,6 +28,7 @@ export class SetupPage {
         let input: Record<string, unknown> = {};
         if (request.method === 'POST') {
           if (request.headers.origin && request.headers.origin !== `http://${request.headers.host}`) { response.writeHead(403).end(); return; }
+          request.setEncoding('utf8');
           let body = '';
           for await (const chunk of request) { body += chunk; if (Buffer.byteLength(body) > 512 * 1024) throw new Error('请求超过 512 KB。'); }
           input = body ? JSON.parse(body) : {};

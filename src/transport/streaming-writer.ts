@@ -4,8 +4,7 @@
  * 边界条件设计：
  *   - 节流（throttle）：固定间隔 flush，避免每 token 发 HTTP，同时保证长文本分多次推送
  *   - 串行队列（chain）：保证 update 顺序，finish 前最后一次文本必达
- *   - 降级（sentChunkCount === 0）：只有从未成功发送分片才降级静态，
- *     避免"已流式部分 + 静态全量"的重复内容
+ *   - 降级：最终全文未成功更新或关闭流失败时，补发完整静态回复
  *   - 终态幂等（finished）：finish/abort 后忽略 append，重复 finish 不重复 complete
  *   - 中止关闭（abort）：abort 时若 session 已打开，串行 complete 关闭，避免悬挂
  */
@@ -24,7 +23,8 @@ export interface StreamingWriterDeps {
 export class StreamingWriter {
   private fullText = '';
   private session: StreamSessionLike | null = null;
-  private sentChunkCount = 0;
+  private sentText?: string;
+  private completed = false;
   private failed = false;
   private finished = false;
   private aborted = false;
@@ -37,9 +37,9 @@ export class StreamingWriter {
     this.deps = deps;
   }
 
-  /** 是否应降级为静态发送：从未成功发送过任何分片 */
+  /** 只有最终全文及流关闭均已确认，才可省略静态补发。 */
   public get shouldFallback(): boolean {
-    return this.sentChunkCount === 0;
+    return !this.completed || this.sentText !== this.fullText;
   }
 
   /** 累积全文（降级静态发送时使用） */
@@ -50,9 +50,7 @@ export class StreamingWriter {
   /**
    * 重置累积文本（LLM 重试的新 attempt）。
    *
-   * 保留已打开的流式会话与 sentChunkCount：QQ 流式 update 是全量替换语义，
-   * 新 attempt 的增量会把同一条消息整体重写，用户不会看到两条消息；
-   * sentChunkCount 保留则防止重试后误判"从未发送"而降级静态造成重复。
+   * 保留已打开的流式会话与已确认文本；最终按实际送达的全文决定是否补发。
    */
   public reset(): void {
     if (this.finished) return;
@@ -92,7 +90,8 @@ export class StreamingWriter {
     if (this.session) {
       try {
         const receipt = await this.session.complete();
-        this.deps.onComplete?.(receipt, this.fullText);
+        this.completed = true;
+        if (this.sentText !== undefined) this.deps.onComplete?.(receipt, this.sentText);
       } catch (err) {
         this.deps.logger.error(
           `im-qqbot: stream complete failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -150,8 +149,9 @@ export class StreamingWriter {
     }
 
     try {
-      await this.session.update(this.fullText);
-      this.sentChunkCount++;
+      const text = this.fullText;
+      await this.session.update(text);
+      this.sentText = text;
     } catch (err) {
       // update 失败：不标记 failed（session 已打开，finish 会 complete 关闭）
       this.deps.logger.warn(

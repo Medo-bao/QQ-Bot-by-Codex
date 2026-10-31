@@ -62,7 +62,7 @@ async function main(): Promise<void> {
     if (command !== 'shutdown' && command !== 'stop') await ensureService();
     process.stdout.write(`${JSON.stringify(await callService(command), null, 2)}\n`); return;
   }
-  process.stdout.write('QQ Bot 0.0.4\n\nnode dist/cli.js setup     本地扫码绑定与设置页\nnode dist/cli.js start     启动 QQ → Codex\nnode dist/cli.js status    查看状态\nnode dist/cli.js models    查看 Codex 模型\nnode dist/cli.js stop      停止 QQ 连接\nnode dist/cli.js shutdown  退出共享后台进程\nnode dist/cli.js mcp       Codex 插件 MCP 入口\n');
+  process.stdout.write('QQ Bot 0.0.5\n\nnode dist/cli.js setup     本地扫码绑定与设置页\nnode dist/cli.js start     启动 QQ → Codex\nnode dist/cli.js status    查看状态\nnode dist/cli.js models    查看 Codex 模型\nnode dist/cli.js stop      停止 QQ 连接\nnode dist/cli.js shutdown  退出共享后台进程\nnode dist/cli.js mcp       Codex 插件 MCP 入口\n');
 }
 
 main().catch((error: Error) => { console.error(error.message); process.exitCode = 1; });

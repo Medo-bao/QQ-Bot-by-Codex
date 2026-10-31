@@ -10,8 +10,8 @@ import { promisify } from 'node:util';
 import { WebSocketServer } from 'ws';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { ConfigStore, SessionStore, CodexClient, QQBridge, QQTransport, BotController, InteractionBroker, MediaStore, configSchema, callService, describeImage, dynamicTools,
-  ReplyLimiter, replyPolicy, cacheMsgId, getCachedReplyIds, resolveReplyTarget } from '../dist/index.js';
+import { ConfigStore, SessionStore, CodexClient, QQBridge, QQTransport, BotController, InteractionBroker, MediaStore, configSchema, callService, describeImage, dynamicTools, DesktopTasks,
+  ReplyLimiter, replyPolicy, cacheMsgId, getCachedReplyIds, resolveReplyTarget, serviceAddress, BrowserAccess } from '../dist/index.js';
 
 const quiet = { info() {}, warn() {}, error() {}, debug() {} };
 const fixture = resolve('tests/fixtures/codex-server.mjs');
@@ -48,10 +48,11 @@ test('Persisted QQ tools refresh complete indexes without replacing history or u
   const original = Buffer.concat([Buffer.from(JSON.stringify({ ordinal: 0, type: 'session_meta', payload: { id: threadId, history_mode: 'paginated', dynamic_tools: [...dynamicTools, unrelated] } }) + '\n'), history, Buffer.from(JSON.stringify(checkpoint) + '\n')]);
   await writeFile(path, original);
   const state = new DatabaseSync(join(directory, 'state_5.sqlite'));
-  state.exec('CREATE TABLE thread_dynamic_tools (thread_id TEXT, position INTEGER, name TEXT, description TEXT, input_schema TEXT, PRIMARY KEY(thread_id,position))');
+  state.exec('PRAGMA foreign_keys = ON; CREATE TABLE threads (id TEXT PRIMARY KEY); CREATE TABLE thread_dynamic_tools (thread_id TEXT REFERENCES threads(id), position INTEGER, name TEXT, description TEXT, input_schema TEXT, PRIMARY KEY(thread_id,position))');
+  state.prepare('INSERT INTO threads VALUES (?)').run(threadId);
   const insert = state.prepare('INSERT INTO thread_dynamic_tools VALUES (?, ?, ?, ?, ?)');
   for (const [position, tool] of dynamicTools.entries()) insert.run(threadId, position, tool.name, tool.description, JSON.stringify(tool.inputSchema));
-  insert.run(threadId, 3, unrelated.name, unrelated.description, JSON.stringify(unrelated.inputSchema));
+  insert.run(threadId, dynamicTools.length, unrelated.name, unrelated.description, JSON.stringify(unrelated.inputSchema));
   const client = new CodexClient(configSchema.parse({ cwd: directory }), quiet); client.runtimeHome = directory;
   let loaded = false;
   client.call = async method => method === 'thread/read' ? { thread: { id: threadId, path } } : { data: loaded ? [threadId] : [] };
@@ -73,16 +74,192 @@ test('Persisted QQ tools refresh complete indexes without replacing history or u
     }
     state.prepare('DELETE FROM thread_dynamic_tools WHERE name=?').run(dynamicTools[1].name);
     loaded = true;
-    await assert.rejects(client.refreshThreadTools(threadId, dynamicTools), /重启/, 'partial indexes are not changed while the thread is loaded');
-    loaded = false;
-    assert.equal(await client.refreshThreadTools(threadId, dynamicTools), true, 'complete metadata still repairs a partial SQL index');
+    assert.equal(await client.refreshThreadTools(threadId, dynamicTools), true, 'a current loaded catalog permits index-only repair without interrupting the thread');
     assert.ok((await readFile(path)).equals(updated), 'index-only repair leaves the entire rollout untouched');
     assert.ok(state.prepare('SELECT name FROM thread_dynamic_tools WHERE name=?').get(dynamicTools[1].name));
+    for (const tool of dynamicTools) state.prepare('DELETE FROM thread_dynamic_tools WHERE name=?').run(tool.name);
+    assert.equal(await client.refreshThreadTools(threadId, dynamicTools), true, 'fresh native threads receive every missing tool index');
+    assert.ok((await readFile(path)).equals(updated), 'initial index population never rewrites the loaded conversation');
+    assert.equal(state.prepare('SELECT COUNT(*) AS n FROM thread_dynamic_tools WHERE thread_id=?').get(threadId).n, dynamicTools.length + 1);
     loaded = true;
     assert.equal(await client.refreshThreadTools(threadId, dynamicTools), false, 'current schemas do not reload an active cache');
     await assert.rejects(client.refreshThreadTools(threadId, [{ ...dynamicTools[0], description: 'A later revision' }, ...dynamicTools.slice(1)]), /重启/);
     assert.ok((await readFile(path)).equals(updated), 'loaded threads are never rewritten');
+    const pendingId = '11111111-2222-4333-8444-666666666666', pendingPath = join(sessions, 'pending-rollout.jsonl');
+    client.call = async method => method === 'thread/read' ? { thread: { id: pendingId, path: pendingPath } } : { data: [pendingId] };
+    assert.equal(await client.refreshThreadTools(pendingId, dynamicTools, { created: true }), false, 'new-thread creation proceeds before the native parent row is persisted');
+    assert.equal(state.prepare('SELECT COUNT(*) AS n FROM thread_dynamic_tools WHERE thread_id=?').get(pendingId).n, 0);
+    state.prepare('INSERT INTO threads VALUES (?)').run(pendingId);
+    assert.equal(await client.refreshThreadTools(pendingId, dynamicTools, { created: true }), true, 'new-thread indexes can be filled without waiting for the asynchronous rollout writer');
+    assert.deepEqual(state.prepare('SELECT name FROM thread_dynamic_tools WHERE thread_id=? ORDER BY position').all(pendingId).map(row => row.name), dynamicTools.map(tool => tool.name));
+    await assert.rejects(readFile(pendingPath), { code: 'ENOENT' }, 'index initialization neither reads nor creates the pending native rollout');
+    await assert.rejects(client.refreshThreadTools(pendingId, dynamicTools), { code: 'ENOENT' }, 'missing established history is not silently ignored');
+    const persisted = JSON.stringify({ ordinal: 0, type: 'session_meta', payload: { id: pendingId, dynamic_tools: dynamicTools } }) + '\n';
+    await writeFile(pendingPath, persisted);
+    assert.equal(await client.refreshThreadTools(pendingId, dynamicTools), false);
+    assert.equal(await readFile(pendingPath, 'utf8'), persisted, 'later native persistence and cold-resume repair keep the same history');
   } finally { state.close(); }
+});
+
+test('Desktop dispatch preserves original threads, queues busy targets, scopes jobs and recovers delivery after restart', { timeout: 10000 }, async t => {
+  const { desktopFixture } = await import('./fixtures/desktop-server.mjs');
+  const directory = await temp(); const desktop = await desktopFixture(directory);
+  const delivered = []; let failDelivery = false; let controller;
+  const notify = async (target, text) => { if (failDelivery) { failDelivery = false; throw new Error('fixture QQ offline'); } delivered.push({ target, text }); };
+  let manager = new DesktopTasks(directory, quiet, notify, () => true);
+  t.after(async () => { await controller?.dispose(); manager.close(); await desktop.close(); });
+  manager.attach(desktop.pipePath, desktop.owner);
+  const source = { scope: 'group', targetId: 'source-group', replyUserId: 'alice' };
+  const listed = await manager.list(source);
+  assert.equal(listed.threads.length, 2);
+  assert.ok(!listed.threads.some(thread => thread.id === desktop.owner));
+  const job = await manager.action(source, { action: 'dispatch', thread_id: 'desktop-alpha', prompt: '继续原项目，完成这次任务。' });
+  assert.equal(job.status, 'submitted'); assert.equal(delivered.length, 0, 'a previous final answer is never relayed as a new result');
+  const sent = () => desktop.calls.filter(call => call.params?.tool === 'send_message_to_thread');
+  assert.equal(sent().length, 1);
+  assert.deepEqual(Object.keys(sent()[0].params.arguments).sort(), ['hostId', 'prompt', 'threadId'], 'dispatch never overrides the target model, permissions or context');
+  assert.match(sent()[0].params.arguments.prompt, /继续原项目/);
+  await manager.poll(); assert.equal(manager.listJobs(source)[0].status, 'running');
+  desktop.threads.get('desktop-alpha').activeFlags = ['waitingOnApproval']; await manager.poll();
+  assert.equal(manager.listJobs(source)[0].status, 'waiting');
+  desktop.threads.get('desktop-alpha').activeFlags = [];
+  await assert.rejects(manager.action(source, { action: 'cancel', job_id: job.id }), /已经交给/);
+  desktop.finish('desktop-alpha', '这是本次任务的新结果。'); await manager.poll(); await manager.poll();
+  assert.equal(delivered.length, 1); assert.match(delivered[0].text, /本次任务的新结果/); assert.equal(delivered[0].target.replyUserId, 'alice');
+  assert.equal(manager.listJobs({ scope: 'group', targetId: 'another-group' }).length, 0);
+  await assert.rejects(manager.action({ scope: 'group', targetId: 'another-group' }, { action: 'retry_delivery', job_id: job.id }), /没有/);
+  const cancelled = await manager.action(source, { action: 'dispatch', thread_id: 'desktop-beta', prompt: '等待后执行' });
+  assert.equal(cancelled.status, 'queued'); assert.equal(sent().length, 1);
+  await manager.action(source, { action: 'cancel', job_id: cancelled.id });
+  const queued = await manager.action(source, { action: 'dispatch', thread_id: 'desktop-beta', prompt: '重启后台后继续等待' });
+  manager.close(); manager = new DesktopTasks(directory, quiet, notify, () => true); manager.attach(desktop.pipePath, desktop.owner);
+  await manager.poll(); assert.equal(manager.listJobs(source).find(item => item.id === queued.id).status, 'queued');
+  desktop.finish('desktop-beta', '原任务结束'); await manager.poll(); assert.equal(sent().length, 2);
+  const dispatchedTurn = desktop.threads.get('desktop-beta').turns[0].id;
+  failDelivery = true; desktop.finish('desktop-beta', '恢复后的派发结果');
+  desktop.threads.get('desktop-beta').turns.unshift({ id: 'later-unrelated-turn', status: 'completed', items: [{ type: 'agentMessage', id: 'later-answer', phase: 'final_answer', text: '另一轮结果，不能当作派发结果。' }] });
+  await manager.poll();
+  assert.equal(manager.listJobs(source).find(item => item.id === queued.id).turnId, dispatchedTurn, 'native summaries without user inputs identify the task acknowledgement, including tasks completed before polling');
+  assert.match(manager.listJobs(source).find(item => item.id === queued.id).deliveryError, /fixture QQ offline/);
+  await manager.action(source, { action: 'retry_delivery', job_id: queued.id });
+  assert.equal(sent().length, 2, 'delivery retry never dispatches the task again');
+  assert.equal(delivered.length, 2);
+  assert.match(delivered[1].text, /恢复后的派发结果/);
+  assert.doesNotMatch(delivered[1].text, /另一轮结果/);
+  assert.doesNotMatch(delivered[1].text, /QQ Bot 任务 #/, 'internal task identifiers are removed from QQ results');
+  const store = new ConfigStore(directory); store.update({ appId: 'desktop-fixture', cwd: directory });
+  new SessionStore(directory).set('desktop-fixture:group:source-group', { threadId: 'qq-thread', prompt: 'QQ role remains local' });
+  controller = new BotController(store, quiet);
+  await controller.invoke('desktopAttach', { pipePath: desktop.pipePath, threadId: desktop.owner });
+  const payload = { scope: 'group', target_id: 'source-group', action: 'desktop', operation: 'list' };
+  await assert.rejects(controller.invoke('session', payload), /完全访问/);
+  store.update({ sandbox: 'danger-full-access' });
+  assert.equal((await controller.invoke('session', payload)).threads.length, 2);
+  store.update({ desktopControl: false }); await assert.rejects(controller.invoke('session', payload), /已关闭/);
+  assert.ok(!desktop.calls.some(call => /thread\/start|thread\/resume|turn\/interrupt/.test(call.method)), 'only the desktop app controls its existing threads');
+  assert.ok(!desktop.calls.some(call => call.params?.tool === 'wait_threads'), 'background monitoring works after the calling desktop turn has completed');
+});
+
+test('Desktop dispatch identifies concurrent turns and fairly polls blocked targets', { timeout: 10000 }, async t => {
+  const { desktopFixture } = await import('./fixtures/desktop-server.mjs');
+  const options = { acknowledge: false, beforeDispatch(thread) {
+    thread.turns.unshift({ id: 'human-' + thread.id, status: 'completed', items: [
+      { type: 'agentMessage', phase: 'final_answer', text: 'Unrelated human result' },
+    ] });
+  } };
+  const directory = await temp(), desktop = await desktopFixture(directory, options), delivered = [];
+  const manager = new DesktopTasks(directory, quiet, async (_target, text) => delivered.push(text), () => true);
+  t.after(async () => { manager.close(); await desktop.close(); });
+  manager.attach(desktop.pipePath, desktop.owner);
+  const source = { scope: 'group', targetId: 'source' };
+  const racing = await manager.action(source, { action: 'dispatch', thread_id: 'desktop-alpha', prompt: 'Requested task' });
+  await manager.poll();
+  assert.equal(manager.listJobs(source)[0].turnId, undefined, 'a newer unrelated turn cannot establish ownership');
+  assert.equal(manager.listJobs(source)[0].status, 'submitted');
+  assert.equal(delivered.length, 0);
+  const actual = desktop.threads.get('desktop-alpha').turns[0];
+  actual.items.push({ type: 'agentMessage', phase: 'commentary', text: `QQ Bot 任务 #${racing.id}\nActual progress` });
+  await manager.poll();
+  assert.equal(manager.listJobs(source)[0].turnId, actual.id);
+  desktop.finish('desktop-alpha', 'Requested result'); await manager.poll();
+  assert.equal(delivered.length, 1); assert.match(delivered[0], /Requested result/);
+  assert.doesNotMatch(delivered[0], /Unrelated|QQ Bot 任务 #/);
+  options.beforeDispatch = undefined; options.acknowledge = true;
+  for (let index = 0; index < 8; index++) await manager.action(source, { action: 'dispatch', thread_id: 'desktop-beta', prompt: 'Blocked ' + index, notify_qq: false });
+  const free = await manager.action(source, { action: 'dispatch', thread_id: 'desktop-alpha', prompt: 'Independent work', notify_qq: false });
+  assert.equal(free.status, 'submitted', 'eight jobs waiting on one target do not block a different target');
+  desktop.finish('desktop-alpha'); await manager.poll();
+  for (let index = 0; index < 8; index++) {
+    const id = 'busy-' + index;
+    desktop.threads.set(id, { id, kind: 'codex', title: id, cwd: directory, turns: [{ id: 'old-' + id, status: 'inProgress', items: [] }] });
+    await manager.action(source, { action: 'dispatch', thread_id: id, prompt: 'Blocked unique target', notify_qq: false });
+  }
+  const last = await manager.action(source, { action: 'dispatch', thread_id: 'desktop-alpha', prompt: 'Round robin work', notify_qq: false });
+  await manager.poll(); await manager.poll();
+  assert.equal(manager.listJobs(source).find(job => job.id === last.id).status, 'running', 'targets beyond the first eight are polled on subsequent cycles');
+});
+
+test('Streaming delivery only confirms sent text and falls back when the final update or completion fails', async () => {
+  const { transform } = await import('esbuild');
+  const { code } = await transform(await readFile('src/transport/streaming-writer.ts', 'utf8'), { loader: 'ts', format: 'esm' });
+  const { StreamingWriter } = await import('data:text/javascript;base64,' + Buffer.from(code).toString('base64'));
+  for (const failure of ['none', 'update', 'complete', 'first']) {
+    const confirmed = []; let visible = '', calls = 0, completions = 0;
+    const writer = new StreamingWriter({ target: { scope: 'c2c', targetId: 'fixture' }, logger: quiet, throttleMs: 60000,
+      bot: { openStream() { return {
+        async update(text) { calls++; if (failure === 'first' || failure === 'update' && calls > 1) throw new Error('update failed'); visible = text; },
+        async complete() { completions++; if (failure === 'complete') throw new Error('complete failed'); return 'receipt'; },
+      }; } }, onComplete(_receipt, text) { confirmed.push(text); } });
+    writer.append('first'); await writer.pushUpdate();
+    writer.append(' + final'); await writer.finish(); await writer.finish();
+    assert.equal(completions, 1, 'finish remains idempotent');
+    assert.equal(writer.shouldFallback, failure !== 'none');
+    assert.deepEqual(confirmed, failure === 'none' ? ['first + final'] : failure === 'update' ? ['first'] : []);
+    assert.equal(visible, failure === 'update' ? 'first' : failure === 'first' ? '' : 'first + final');
+  }
+});
+
+test('Browser login checks initialize desktop CUA, preserve user tabs, enforce permissions and distinguish failure from signed out', { timeout: 10000 }, async t => {
+  const directory = await temp();
+  const runtime = join(process.env.CODEX_HOME, 'plugins/cache/openai-bundled/unified-computer-use/0.0.1');
+  await mkdir(runtime, { recursive: true }); await mkdir(join(directory, 'codex-home'));
+  await writeFile(join(runtime, '.mcp.json'), JSON.stringify({ mcpServers: { cua_repl: { command: process.execPath, args: [resolve('tests/fixtures/browser-server.mjs'), directory], enabled: true } } }));
+  const previous = Object.fromEntries(['BROWSER_USE_ACCESS_EXECUTOR_ID', 'BROWSER_USE_ACCESS_PIPE_PATH', 'BROWSER_USE_ACCESS_VERIFYING_IDENTITY'].map(key => [key, process.env[key]]));
+  Object.assign(process.env, { BROWSER_USE_ACCESS_EXECUTOR_ID: '["fixture-desktop","native-browser-plugin"]', BROWSER_USE_ACCESS_PIPE_PATH: 'fixture-pipe', BROWSER_USE_ACCESS_VERIFYING_IDENTITY: 'fixture-key' });
+  const claims = { 'https://api.openai.com/auth': { chatgpt_account_id: 'fixture-account', chatgpt_user_id: 'fixture-user' } };
+  await writeFile(join(directory, 'codex-home/auth.json'), JSON.stringify({ auth_mode: 'chatgpt', tokens: { account_id: 'fixture-account', id_token: 'e30.' + Buffer.from(JSON.stringify(claims)).toString('base64url') + '.signature' } }));
+  const access = new BrowserAccess(directory, async () => ({ threadId: 'bound-desktop', turnId: 'completed-desktop-turn' }));
+  const calls = () => readFileSync(join(directory, 'browser-calls.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  const mode = value => writeFile(join(directory, 'browser-state.json'), JSON.stringify(value));
+  let bridge, controller;
+  t.after(async () => { await bridge?.close(); await controller?.dispose(); await access.close(); for (const [key, value] of Object.entries(previous)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; } await rm(runtime, { recursive: true }); });
+  await mode({ snapshot: '- button "Account menu":\n- link "Profile":\n  - /url: /fixture_user\nSecret page body stays local' });
+  const signedIn = await access.inspect('https://x.com/?private=hidden');
+  assert.equal(signedIn.state, 'signed_in'); assert.equal(signedIn.account, '@fixture_user');
+  assert.doesNotMatch(JSON.stringify(signedIn), /Secret page body|private=hidden/);
+  assert.ok(calls().every(call => call.meta.session_id === 'bound-desktop' && call.meta.turn_id === 'completed-desktop-turn'));
+  assert.deepEqual(calls()[0].identity, ['fixture-desktop', 'fixture-account', 'fixture-user']);
+  assert.ok(!calls().some(call => call.code.includes('.close()')), 'existing user tabs remain open');
+  await mode({ tabs: [], url: 'https://x.com/i/flow/login', snapshot: '- heading "Sign in to X"\n- textbox "Password"' });
+  assert.equal((await access.inspect('https://x.com/')).state, 'signed_out');
+  assert.equal(calls().filter(call => call.code.includes('.close()')).length, 1, 'only the temporary check tab is closed');
+  await mode({ snapshot: '- heading "Forbidden"\n403' }); assert.equal((await access.inspect('https://x.com/')).state, 'unknown');
+  await mode({ error: 'Local browser use is disabled in Work settings' });
+  const denied = await access.inspect('https://x.com/'); assert.equal(denied.state, 'unknown'); assert.match(denied.reason, /disabled/);
+  const count = calls().length; assert.equal((await access.inspect('file:///private')).state, 'unknown'); assert.equal(calls().length, count);
+  await mode({ snapshot: '- button "Account menu":\n- link "Profile":\n  - /url: /fixture_user' });
+  const config = configSchema.parse({ appId: 'browser-fixture', appSecret: 'fixture-secret', cwd: directory, codexCommand: fixture, codexArgs: [directory], sandbox: 'danger-full-access', access: { c2cMode: 'open' } });
+  const qq = new FakeQQ(); const client = new CodexClient(config, quiet);
+  bridge = new QQBridge(config, directory, qq, client, quiet, undefined, (_target, url) => access.inspect(url));
+  await bridge.start(); await bridge.handleMessage(message('browser-login-check'));
+  const result = requireTrace(directory).find(item => item.browserLogin).browserLogin;
+  assert.equal(result.success, true); assert.match(JSON.stringify(result.contentItems), /signed_in/);
+  const turn = requireTrace(directory).find(item => item.method === 'turn/start');
+  assert.ok(turn.params.input.some(item => item.text?.includes('调用 qqbot_browser')));
+  const store = new ConfigStore(directory); store.update(config); controller = new BotController(store, quiet);
+  new SessionStore(directory).set('browser-fixture:c2c:alice', { threadId: 'retained-thread', sandbox: 'read-only' });
+  await assert.rejects(controller.invoke('browser', { scope: 'c2c', target_id: 'alice', url: 'https://x.com/' }), /完全访问/);
+  store.update({ desktopControl: false }); await assert.rejects(controller.invoke('browser', { scope: 'c2c', target_id: 'alice', url: 'https://x.com/' }), /已关闭/);
 });
 
 test('QQ → real JSONL child process: isolation, streaming, approvals, questions, file delivery, cancel and resume', { timeout: 30000 }, async t => {
@@ -623,7 +800,18 @@ test('Context reset and compaction report progress, retain settings and recover 
   assert.equal('autoCompact' in config, false, 'retired plugin controls cannot disable native automatic compaction');
   assert.equal('autoCompactThreshold' in JSON.parse(await readFile(store.path, 'utf8')), false);
   const qq = new FakeQQ();
-  const bridge = new QQBridge(config, directory, qq, new CodexClient(config, quiet), quiet);
+  const warnings = [];
+  const client = new CodexClient(config, quiet), refresh = client.refreshThreadTools.bind(client), indexed = [];
+  client.refreshThreadTools = async (id, tools, options) => {
+    if (!options?.created) return refresh(id, tools, options);
+    const thread = (await client.call('thread/read', { threadId: id, includeTurns: false })).thread;
+    assert.ok(thread.path, 'new-thread indexing waits until the first native turn has persisted history');
+    await readFile(thread.path);
+    indexed.push(id);
+    await refresh(id, tools, options);
+    return true;
+  };
+  const bridge = new QQBridge(config, directory, qq, client, { ...quiet, warn: text => warnings.push(text) });
   const controller = new BotController(store, quiet);
   await bridge.start(); controller.bridge = bridge; controller.connected = true;
   const current = () => bridge.status().sessions.find(item => item.peerId === 'team');
@@ -632,6 +820,16 @@ test('Context reset and compaction report progress, retain settings and recover 
   const waitOperation = async () => { await waitFor(() => current().contextOperation?.status !== 'running'); return current().contextOperation; };
   try {
     await bridge.handleMessage(group('original group history'));
+    assert.deepEqual(indexed, [current().threadId], 'the first reply completes and then populates its derived index');
+    await bridge.handleMessage(group('long-command-failure'));
+    assert.equal(indexed.length, 1, 'an indexed active conversation needs no extra repair on each reply');
+    const failedCommand = (await controller.conversation('group', 'team')).activities.find(item => item.label === '运行命令');
+    assert.equal(failedCommand.status, 'failed', 'a nonzero exit code is a failure even when the command item is completed');
+    assert.match(failedCommand.detail, /退出码：1/);
+    assert.match(failedCommand.detail, /PASS: preceding output/);
+    assert.match(failedCommand.detail, /FINAL FAILURE: preserved error at the end/);
+    assert.ok(failedCommand.detail.length <= 4000);
+    assert.ok(warnings.some(text => text.includes('FINAL FAILURE: preserved error at the end')), 'runtime logs retain the actual failure reason');
     await bridge.manageSession('group', 'team', 'rename', { name: '群聊名称' });
     await bridge.manageSession('group', 'team', 'configure', { prompt: 'exclusive-role', model: 'fixture-model', sandbox: 'danger-full-access' });
     await bridge.handleMessage(group('history with saved settings'));
@@ -1010,7 +1208,7 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
   const directory = await temp();
   const store = new ConfigStore(directory);
   assert.equal(store.read().autoStart, true);
-  const manifest = JSON.parse(await readFile('mcp.json', 'utf8'));
+  const manifest = JSON.parse(await readFile('.mcp.json', 'utf8'));
   assert.deepEqual(Object.keys(manifest.mcpServers), ['qqbot'], 'retain the existing tool namespace');
   store.update({ autoStart: false, appId: 'saved-app', appSecret: 'super-secret-fixture', cwd: directory, codexCommand: fixture, codexArgs: [directory] });
   const desktopAuthPath = join(process.env.CODEX_HOME, 'auth.json');
@@ -1039,9 +1237,9 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
   try {
     assert.equal(client.getServerVersion().name, 'codex-qqbot');
     assert.equal(client.getServerVersion().title, 'QQ Bot');
-    assert.equal(client.getServerVersion().version, '0.0.4');
+    assert.equal(client.getServerVersion().version, '0.0.5');
     const tools = (await client.listTools()).tools.map((tool) => tool.name);
-    assert.deepEqual(tools.sort(), ['qqbot_configure', 'qqbot_models', 'qqbot_send_file', 'qqbot_send_message', 'qqbot_setup', 'qqbot_start', 'qqbot_status', 'qqbot_stop', 'qqbot_ui'].sort());
+    assert.deepEqual(tools.sort(), ['qqbot_browser', 'qqbot_configure', 'qqbot_desktop', 'qqbot_models', 'qqbot_send_file', 'qqbot_send_message', 'qqbot_setup', 'qqbot_start', 'qqbot_status', 'qqbot_stop', 'qqbot_ui'].sort());
     const details = (await client.listTools()).tools;
     assert.ok(details.every(tool => tool.title?.includes('QQ Bot')), 'all user-facing tool names use QQ Bot');
     const entry = details.find((tool) => tool.name === 'qqbot_setup');
@@ -1096,6 +1294,35 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
     assert.equal(store.read().appSecret, 'super-secret-fixture');
     assert.equal(store.read().directPrompt.length, 6000);
     assert.equal((await callService('status', {}, directory)).config.access.c2cAllow[0], 'alice');
+    const unicodePrompt = '中文🐾'.repeat(10000);
+    const { createConnection } = await import('node:net');
+    await new Promise((resolve, reject) => {
+      const socket = createConnection(serviceAddress(directory)); socket.setEncoding('utf8');
+      let response = ''; socket.on('error', reject);
+      socket.on('connect', async () => {
+        const payload = Buffer.from(JSON.stringify({ method: 'configure', params: { directPrompt: unicodePrompt } }) + '\n');
+        const split = payload.indexOf(Buffer.from('中')) + 1;
+        socket.write(payload.subarray(0, split));
+        await new Promise(done => setTimeout(done, 10)); socket.write(payload.subarray(split));
+      });
+      socket.on('data', part => { response += part; });
+      socket.on('end', () => { try { const result = JSON.parse(response); if (result.error) reject(new Error(result.error)); else resolve(); } catch (error) { reject(error); } });
+    });
+    assert.equal(store.read().directPrompt, unicodePrompt, 'fragmented incoming UTF-8 preserves Chinese text and emoji');
+    assert.equal((await callService('status', {}, directory)).config.directPrompt, unicodePrompt, 'long outgoing responses preserve multibyte text at transport chunk boundaries');
+    const httpPrompt = '网页任务🙂'.repeat(9000);
+    const { request: httpRequest } = await import('node:http');
+    await new Promise((resolve, reject) => {
+      const request = httpRequest(base + '/api/configure', { method: 'POST', headers: { cookie, origin: base } }, response => {
+        response.resume(); response.on('end', () => response.statusCode === 200 ? resolve() : reject(new Error(`HTTP ${response.statusCode}`)));
+      });
+      request.on('error', reject);
+      const payload = Buffer.from(JSON.stringify({ directPrompt: httpPrompt }));
+      const split = payload.indexOf(Buffer.from('网')) + 1;
+      request.write(payload.subarray(0, split)); setTimeout(() => request.end(payload.subarray(split)), 10);
+    });
+    assert.equal(store.read().directPrompt, httpPrompt, 'browser fallback preserves fragmented Chinese task text');
+    await callService('configure', { directPrompt: 'x'.repeat(6000) }, directory);
     const models = await client.callTool({ name: 'qqbot_models', arguments: {} });
     assert.equal(JSON.parse(models.content[0].text).data[0].model, 'fixture-model');
     const runtimeConfig = await readFile(join(directory, 'codex-home', 'config.toml'), 'utf8');

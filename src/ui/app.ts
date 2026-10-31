@@ -33,6 +33,11 @@ let directSending = false;
 const dirtySessions = new Set<string>();
 const sessionEditors = new Map<string, HTMLElement>();
 const contextRequests = new Map<string, any>();
+const desktopDrafts = new Map<string, string>();
+let desktopThreads: any[] = [];
+let desktopCursor: string | null = null;
+let desktopGeneration = 0;
+let desktopJobsLoading = false;
 type ChatRecord = { threadId?: string | null; turnIds: string[]; messages: any[]; activities: any[]; activityOpen: Map<string, boolean>; previews: Map<string, string>; activeTurnId?: string; pending: any[]; optimistic: any[]; draft: string; draftRevision: number; scrollTop: number; followLatest: boolean; loaded: boolean; loading: boolean; olderLoaded: boolean; nextCursor?: string | null; lastActive?: number; error?: string; taskError?: string; sending?: boolean };
 const chats = new Map<string, ChatRecord>();
 const chatRecord = (key: string): ChatRecord => {
@@ -91,6 +96,7 @@ const fields: Record<string, Field[]> = {
     { path: 'autoStart', label: '随 Codex 启动 QQ Bot', kind: 'boolean', wide: true, help: '默认开启：插件加载后自动连接已绑定的机器人。手动停止后，状态刷新不会重新启动连接。' },
     { path: 'webSearch', label: '网页搜索', kind: 'select', options: ['live', 'cached', 'indexed', 'disabled'] },
     { path: 'contextWindow', label: '默认上下文长度（Tokens）', kind: 'number', min: 0, help: '0 跟随 Codex 模型配置，例如可设置 128000。保存后下次回复生效；请勿超过模型支持的上限，实际可用容量以返回统计为准。' },
+    { path: 'desktopControl', label: '允许访问 Codex 桌面会话与网站登录状态', kind: 'boolean', wide: true, help: '允许完全访问的 QQ 会话调度已有桌面会话，以及只读检查绑定的内置浏览器网站登录状态。目标会话沿用原有设置，浏览器检查保留原生账号和网站权限校验。' },
     { path: 'sessionIdleTimeout', label: '空闲会话回收（毫秒）', kind: 'number' },
     { path: 'processingTimeoutMs', label: '单次任务超时（毫秒）', kind: 'number' },
     { path: 'askTimeoutMs', label: '问题与审批等待时间（毫秒）', kind: 'number' },
@@ -360,6 +366,8 @@ function renderChat(session: any): void {
     actions.append(stop, settings);
     const direct = document.createElement('button'); direct.id = 'openDirectMessage'; direct.textContent = '直接发送'; direct.title = '通过机器人直接发送原文';
     direct.onclick = () => openDirectMessage(key); actions.append(direct);
+    const desktop = document.createElement('button'); desktop.id = 'openDesktopSessions'; desktop.textContent = '项目会话'; desktop.title = '查看和调度 Codex 中其他项目的会话';
+    desktop.onclick = () => { void openDesktopSessions(key); }; actions.append(desktop);
     header.append(heading, actions);
     const history = document.createElement('div'); history.id = 'chatHistory'; history.className = 'chat-history'; history.setAttribute('aria-label', '聊天记录');
     const composer = document.createElement('form'); composer.className = 'chat-composer'; composer.id = 'chatComposer';
@@ -709,6 +717,126 @@ function openDirectMessage(key: string): void {
   dialog.showModal(); $<HTMLTextAreaElement>('directMessageText').focus();
 }
 
+function desktopSourceSession(): any {
+  const key = $('desktopSessionsDialog').dataset.session;
+  return state.sessions.find((session: any) => sessionKey(session) === key);
+}
+async function desktopApi(payload: any): Promise<any> {
+  const session = desktopSourceSession();
+  if (!session) throw new Error('发起任务的 QQ 会话已不存在。');
+  return api('session', { ...payload, scope: session.scope, target_id: session.peerId, operation: payload.action, action: 'desktop' });
+}
+function saveDesktopDraft(): void {
+  const dialog = $('desktopSessionsDialog');
+  if (dialog.dataset.thread) desktopDrafts.set(`${dialog.dataset.session}:${dialog.dataset.thread}`, $<HTMLTextAreaElement>('desktopPrompt').value);
+}
+function updateDesktopSend(): void {
+  $<HTMLButtonElement>('desktopDispatch').disabled = Boolean($('desktopDispatch').dataset.sending) || !($('desktopSessionsDialog').dataset.thread && $<HTMLTextAreaElement>('desktopPrompt').value.trim());
+}
+function desktopOptions(preferred?: string): void {
+  const select = $<HTMLSelectElement>('desktopThreadList');
+  const query = $<HTMLInputElement>('desktopSearch').value.trim().toLowerCase();
+  const project = $<HTMLSelectElement>('desktopProject').value;
+  const shown = desktopThreads.filter(thread => (!project || thread.cwd === project) && (!query || `${thread.title} ${thread.cwd}`.toLowerCase().includes(query)));
+  select.replaceChildren(...shown.map(thread => {
+    const option = document.createElement('option'); option.value = thread.id; option.textContent = thread.title || '未命名会话'; option.title = `${thread.title}\n${thread.cwd || ''}`; return option;
+  }));
+  select.value = preferred && shown.some(thread => thread.id === preferred) ? preferred : shown[0]?.id || '';
+  $('desktopListStatus').textContent = `${shown.length} 个匹配会话${desktopCursor ? ' · 可继续加载较早会话' : ''}`;
+  $('desktopMore').hidden = !desktopCursor;
+  void selectDesktopThread();
+}
+async function selectDesktopThread(): Promise<void> {
+  saveDesktopDraft();
+  const dialog = $('desktopSessionsDialog'); const id = $<HTMLSelectElement>('desktopThreadList').value;
+  dialog.dataset.thread = id;
+  $<HTMLTextAreaElement>('desktopPrompt').value = desktopDrafts.get(`${dialog.dataset.session}:${id}`) || '';
+  updateDesktopSend(); $('desktopHistory').replaceChildren();
+  const thread = desktopThreads.find(thread => thread.id === id);
+  $('desktopTargetTitle').textContent = thread?.title || '选择一项会话'; $('desktopTargetInfo').textContent = thread?.cwd || '';
+  const link = $<HTMLAnchorElement>('desktopOpenTarget'); link.hidden = !id; link.href = `codex://threads/${encodeURIComponent(id)}`;
+  if (!id) return;
+  const generation = desktopGeneration;
+  $('desktopHistory').textContent = '正在读取近期回复与状态…';
+  try {
+    const result = await desktopApi({ action: 'read', thread_id: id });
+    if (generation !== desktopGeneration || dialog.dataset.thread !== id) return;
+    const list = document.createDocumentFragment();
+    for (const turn of [...(result.turns || [])].reverse()) for (const item of turn.items || []) {
+      if (!['userMessage', 'agentMessage'].includes(item.type)) continue;
+      const text = item.type === 'userMessage' ? (item.content || []).filter((part: any) => part.type === 'text').map((part: any) => part.text).join('\n') : item.text;
+      if (!text) continue;
+      const article = document.createElement('article'); const label = document.createElement('small'); label.textContent = item.type === 'userMessage' ? '用户' : item.phase === 'commentary' ? '活动' : 'Codex';
+      const body = renderMarkdown(text); article.append(label, body); list.append(article);
+    }
+    $('desktopHistory').replaceChildren(list);
+    if (!$('desktopHistory').childElementCount) $('desktopHistory').textContent = '暂无可显示的消息。';
+    $('desktopHistory').scrollTop = $('desktopHistory').scrollHeight;
+  } catch (error) { if (generation === desktopGeneration && dialog.dataset.thread === id) $('desktopHistory').textContent = `读取失败：${error instanceof Error ? error.message : error}`; }
+}
+function renderDesktopJobs(jobs: any[]): void {
+  const labels: Record<string, string> = { queued: '等待派发', submitting: '正在派发', submitted: '已派发', running: '执行中', waiting: '等待确认', completed: '已完成', failed: '失败', cancelled: '已取消', unknown: '待核实' };
+  const container = $('desktopJobs'); container.replaceChildren();
+  if (!jobs.length) { container.textContent = '还没有从当前 QQ 会话派发的任务。'; return; }
+  for (const job of jobs) {
+    const card = document.createElement('article'); card.className = 'desktop-job';
+    const title = document.createElement('strong'); title.textContent = `${job.title} · ${labels[job.status] || job.status}`;
+    const prompt = document.createElement('p'); prompt.className = 'notice'; prompt.textContent = job.prompt;
+    const detail = document.createElement('p'); detail.textContent = job.result || job.error || job.progress || '';
+    const buttons = document.createElement('div'); buttons.className = 'row';
+    const open = document.createElement('a'); open.textContent = '在 Codex 中打开'; open.href = `codex://threads/${encodeURIComponent(job.threadId)}`; buttons.append(open);
+    if (job.status === 'queued' || job.deliveryError) {
+      const button = document.createElement('button'); button.type = 'button'; button.textContent = job.deliveryError ? '重试回传 QQ' : '取消等待';
+      button.onclick = async () => { button.disabled = true; try { await desktopApi({ action: job.deliveryError ? 'retry_delivery' : 'cancel', job_id: job.id }); await refreshDesktopJobs(); }
+        catch (error) { $('desktopError').textContent = error instanceof Error ? error.message : String(error); } finally { button.disabled = false; } };
+      buttons.append(button);
+    }
+    card.append(title, prompt, detail);
+    if (job.deliveryError) { const error = document.createElement('p'); error.className = 'form-error'; error.textContent = `回传未完成：${job.deliveryError}`; card.append(error); }
+    else if (job.delivered) { const done = document.createElement('p'); done.className = 'notice'; done.textContent = '结果已回传 QQ'; card.append(done); }
+    card.append(buttons); container.append(card);
+  }
+}
+async function refreshDesktopJobs(): Promise<void> {
+  const dialog = $<HTMLDialogElement>('desktopSessionsDialog');
+  if (!dialog.open || desktopJobsLoading) return;
+  desktopJobsLoading = true; const generation = desktopGeneration;
+  try { const result = await desktopApi({ action: 'jobs' }); if (generation === desktopGeneration) renderDesktopJobs(result.jobs || []); }
+  catch (error) { if (generation === desktopGeneration) $('desktopError').textContent = error instanceof Error ? error.message : String(error); }
+  finally { desktopJobsLoading = false; }
+}
+async function loadDesktopThreads(more = false): Promise<void> {
+  const generation = desktopGeneration; const preferred = $('desktopSessionsDialog').dataset.thread;
+  const button = $<HTMLButtonElement>(more ? 'desktopMore' : 'desktopReload'); button.disabled = true;
+  $('desktopError').textContent = ''; $('desktopListStatus').textContent = '正在读取 Codex 会话…';
+  try {
+    const result = await desktopApi({ action: 'list', ...(more && desktopCursor ? { cursor: desktopCursor } : {}) });
+    if (generation !== desktopGeneration) return;
+    desktopThreads = [...new Map([...(more ? desktopThreads : []), ...(result.threads || [])].map(thread => [thread.id, thread])).values()];
+    desktopCursor = result.nextCursor;
+    const project = $<HTMLSelectElement>('desktopProject'); const selected = project.value;
+    project.replaceChildren(); const all = document.createElement('option'); all.value = ''; all.textContent = '全部项目'; project.append(all);
+    for (const path of [...new Set<string>(desktopThreads.map(thread => thread.cwd).filter(Boolean))]) {
+      const option = document.createElement('option'); option.value = path; option.textContent = path.split(/[\\/]/).filter(Boolean).at(-1) || path; option.title = path; project.append(option);
+    }
+    if ([...project.options].some(option => option.value === selected)) project.value = selected;
+    desktopOptions(preferred); renderDesktopJobs(result.jobs || []);
+  } catch (error) { if (generation === desktopGeneration) { $('desktopError').textContent = error instanceof Error ? error.message : String(error); $('desktopListStatus').textContent = '未能读取会话，可重试。'; } }
+  finally { button.disabled = false; }
+}
+async function openDesktopSessions(key: string): Promise<void> {
+  saveDesktopDraft(); desktopGeneration++;
+  const dialog = $<HTMLDialogElement>('desktopSessionsDialog');
+  if (dialog.dataset.session !== key) { delete dialog.dataset.thread; desktopThreads = []; desktopCursor = null; }
+  dialog.dataset.session = key;
+  const session = desktopSourceSession(); $('desktopSource').textContent = `发起与接收结果：${sessionTitle(session)}`;
+  $('desktopThreadList').replaceChildren(); $('desktopHistory').replaceChildren(); $('desktopJobs').replaceChildren();
+  $('desktopDispatchStatus').textContent = '';
+  if (!dialog.open) dialog.showModal();
+  $('desktopSearch').focus();
+  await loadDesktopThreads();
+}
+
 function renderContextUsage(session: any): void {
   const usage = session.contextUsage;
   const value = session.settings || session;
@@ -923,6 +1051,37 @@ async function catalog(): Promise<void> {
 }
 
 function bindEvents(): void {
+  const desktopDialog = $<HTMLDialogElement>('desktopSessionsDialog');
+  const desktopPrompt = $<HTMLTextAreaElement>('desktopPrompt');
+  const desktopSend = $<HTMLButtonElement>('desktopDispatch');
+  $('closeDesktopSessions').onclick = () => desktopDialog.close();
+  desktopDialog.oncancel = event => { if (desktopSend.dataset.sending) event.preventDefault(); };
+  desktopDialog.onclose = () => { saveDesktopDraft(); desktopGeneration++; };
+  $('desktopSearch').oninput = () => desktopOptions(desktopDialog.dataset.thread);
+  $('desktopProject').onchange = () => desktopOptions(desktopDialog.dataset.thread);
+  $('desktopThreadList').onchange = () => { void selectDesktopThread(); };
+  $('desktopReload').onclick = () => { void loadDesktopThreads(); };
+  $('desktopMore').onclick = () => { void loadDesktopThreads(true); };
+  $('desktopRefreshJobs').onclick = () => { void refreshDesktopJobs(); };
+  desktopPrompt.oninput = () => { saveDesktopDraft(); updateDesktopSend(); };
+  desktopPrompt.onkeydown = event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing) { event.preventDefault(); if (!desktopSend.disabled) $<HTMLFormElement>('desktopTaskForm').requestSubmit(); } };
+  $('desktopTaskForm').onsubmit = async event => {
+    event.preventDefault(); if (desktopSend.dataset.sending || desktopSend.disabled) return;
+    const threadId = desktopDialog.dataset.thread!; const prompt = desktopPrompt.value.trim(); const generation = desktopGeneration;
+    desktopSend.dataset.sending = 'true'; desktopSend.textContent = '派发中…'; updateDesktopSend();
+    const controls = ['closeDesktopSessions', 'desktopThreadList', 'desktopProject', 'desktopSearch', 'desktopPrompt', 'desktopNotify', 'desktopReload', 'desktopMore'];
+    for (const id of controls) $<HTMLInputElement | HTMLButtonElement>(id).disabled = true;
+    $('desktopError').textContent = ''; $('desktopDispatchStatus').textContent = '正在提交任务…';
+    try {
+      const job = await desktopApi({ action: 'dispatch', thread_id: threadId, prompt, notify_qq: $<HTMLInputElement>('desktopNotify').checked });
+      if (generation === desktopGeneration) {
+        desktopPrompt.value = ''; desktopDrafts.delete(`${desktopDialog.dataset.session}:${threadId}`);
+        $('desktopDispatchStatus').textContent = job.status === 'queued' ? '已加入队列，目标空闲后派发。' : job.status === 'unknown' ? '派发结果待核实，请查看下方任务状态。' : '任务已派发，可在下方查看进度。';
+        await refreshDesktopJobs();
+      }
+    } catch (error) { $('desktopError').textContent = error instanceof Error ? error.message : String(error); $('desktopDispatchStatus').textContent = '任务未能提交，内容已保留。'; }
+    finally { delete desktopSend.dataset.sending; desktopSend.textContent = '派发任务'; for (const id of controls) $<HTMLInputElement | HTMLButtonElement>(id).disabled = false; updateDesktopSend(); }
+  };
   document.addEventListener('click', event => { if (!(event.target as HTMLElement).closest('.permission-picker')) closePermissionMenus(); });
   window.addEventListener('resize', closePermissionMenus);
   const directDialog = $<HTMLDialogElement>('directMessageDialog');
@@ -1096,12 +1255,12 @@ function bindEvents(): void {
 async function main(): Promise<void> {
   document.body.dataset.transport = mode;
   if (mode === 'mcp') {
-    app = new App({ name: 'codex-qqbot-settings', title: 'QQ Bot', version: '0.0.4' }, {});
+    app = new App({ name: 'codex-qqbot-settings', title: 'QQ Bot', version: '0.0.5' }, {});
     app.onhostcontextchanged = (context) => { if (context.theme) document.body.dataset.theme = context.theme; };
     await app.connect();
     const theme = app.getHostContext()?.theme; if (theme) document.body.dataset.theme = theme;
   } else history.replaceState(null, '', location.pathname);
   bindEvents(); await refresh(); void account(); void catalog();
-  setInterval(() => { if (!exited && document.visibilityState !== 'hidden' && !busy) void refresh(); }, 3000);
+  setInterval(() => { if (!exited && document.visibilityState !== 'hidden' && !busy) { void refresh(); void refreshDesktopJobs(); } }, 3000);
 }
 void main().catch((error) => { $('error').textContent = error.message; });

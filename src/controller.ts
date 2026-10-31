@@ -11,6 +11,8 @@ import { ConversationStorage } from './storage.ts';
 import { MediaStore, fileSendModeSchema } from './media.ts';
 import { readFile, stat } from 'node:fs/promises';
 import { basename, extname } from 'node:path';
+import { DesktopTasks } from './desktop-tasks.ts';
+import { BrowserAccess } from './browser-access.ts';
 
 export class BotController {
   private bridge?: QQBridge;
@@ -21,7 +23,12 @@ export class BotController {
   private lastError?: string;
   private connected = false;
   private controlClient?: CodexClient;
-  constructor(readonly store: ConfigStore, private readonly logger: Logger) {}
+  private readonly desktopTasks: DesktopTasks;
+  private readonly browserAccess: BrowserAccess;
+  constructor(readonly store: ConfigStore, private readonly logger: Logger) {
+    this.desktopTasks = new DesktopTasks(store.directory, logger, (target, text) => this.send(target, text), () => this.store.read().desktopControl);
+    this.browserAccess = new BrowserAccess(store.directory, () => this.desktopTasks.browserContext());
+  }
 
   status() {
     const storage = new ConversationStorage(this.store.directory, this.store.read());
@@ -46,7 +53,9 @@ export class BotController {
       debug: (text) => { if (config.debug) this.logger.info(text); else this.logger.debug(text); } };
     const transport = new QQTransport(config, logger);
     const client = new CodexClient(config, logger);
-    const bridge = new QQBridge(config, this.store.directory, transport, client, logger);
+    const bridge = new QQBridge(config, this.store.directory, transport, client, logger,
+      (target, params) => this.desktop(target.scope, target.targetId, params, target.replyUserId),
+      (target, url) => this.inspectBrowser(target.scope, target.targetId, url));
     this.bridge = bridge;
     transport.onDisconnected = (reason) => { if (this.bridge === bridge) { this.connected = false; this.lastError = reason; } };
     transport.onConnected = () => { if (this.bridge === bridge) { this.connected = true; this.lastError = undefined; } };
@@ -152,6 +161,8 @@ export class BotController {
   async login(): Promise<unknown> { return (await this.controls()).call('account/login/start', { type: 'chatgpt' }); }
 
   async dispose(): Promise<void> {
+    await this.browserAccess.dispose();
+    this.desktopTasks.close();
     this.cancelBinding(); await this.stop(); await this.controlClient?.close(); this.controlClient = undefined;
   }
 
@@ -237,9 +248,37 @@ export class BotController {
     return { name: basename(actual), dataUrl: `data:${mime};base64,${(await readFile(actual)).toString('base64')}` };
   }
 
+  private async desktop(scope: 'c2c' | 'group', peerId: string, params: Record<string, any>, replyUserId?: string): Promise<unknown> {
+    const config = this.store.read();
+    if (!config.desktopControl) throw new Error('桌面会话调度已关闭，可在运行设置中开启。');
+    if ((scope !== 'c2c' && scope !== 'group') || typeof peerId !== 'string') throw new Error('请先选择发起任务的 QQ 会话。');
+    const sessions = new SessionStore(this.store.directory);
+    const key = `${config.appId}:${scope}:${peerId}`;
+    if (!sessions.entries().some(([id]) => id === key)) throw new Error('请先选择已有的 QQ 会话。');
+    if (sessionPermissions(config, sessions.get(key)).sandbox !== 'danger-full-access') throw new Error('访问其他项目会话需要当前 QQ 会话使用完全访问权限。');
+    return this.desktopTasks.action({ scope, targetId: peerId, ...(replyUserId ? { replyUserId } : {}) }, params);
+  }
+
+  private async inspectBrowser(scope: 'c2c' | 'group', peerId: string, url: string): Promise<unknown> {
+    const config = this.store.read();
+    if (!config.desktopControl) throw new Error('桌面会话与浏览器访问已关闭。');
+    if (!['c2c', 'group'].includes(scope) || typeof peerId !== 'string' || typeof url !== 'string') throw new Error('需要有效的 QQ 会话和网站地址。');
+    const key = `${config.appId}:${scope}:${peerId}`;
+    const sessions = new SessionStore(this.store.directory);
+    if (!sessions.entries().some(([id]) => id === key)) throw new Error('请先选择已有的 QQ 会话。');
+    if (sessionPermissions(config, sessions.get(key)).sandbox !== 'danger-full-access') throw new Error('查看桌面网站登录状态需要当前 QQ 会话使用完全访问权限。');
+    return this.browserAccess.inspect(url);
+  }
+
   async invoke(action: string, params: Record<string, any> = {}): Promise<unknown> {
     switch (action) {
       case 'status': return this.status();
+      case 'desktopAttach':
+        if (typeof params.pipePath === 'string' && typeof params.threadId === 'string') this.desktopTasks.attach(params.pipePath, params.threadId);
+        this.browserAccess.attach(params.browserEnvironment);
+        return { attached: this.desktopTasks.available };
+      case 'desktop': return this.desktop(params.scope, params.target_id, params);
+      case 'browser': return this.inspectBrowser(params.scope, params.target_id, params.url);
       case 'start': return this.start();
       case 'stop': return this.stop();
       case 'configure':
@@ -261,6 +300,7 @@ export class BotController {
       }
       case 'session':
         if ((params.scope !== 'c2c' && params.scope !== 'group') || !params.target_id) throw new Error('需要有效的会话目标。');
+        if (params.action === 'desktop') return this.desktop(params.scope, params.target_id, { ...params, action: params.operation });
         if (params.action === 'preview') {
           if (typeof params.file_path !== 'string') throw new Error('需要有效的图片路径。');
           return this.previewImage(params.scope, params.target_id, params.file_path);

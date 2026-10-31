@@ -19,12 +19,13 @@ export function serviceAddress(directory: string): string {
 export function callService(method: string, params: Record<string, unknown> = {}, directory = dataDirectory()): Promise<any> {
   return new Promise((resolve, reject) => {
     const socket = createConnection(serviceAddress(directory));
+    socket.setEncoding('utf8');
     socket.setTimeout(65000, () => socket.destroy(new Error('QQ 后台服务响应超时。')));
     let buffer = '';
     socket.on('error', reject);
     socket.on('connect', () => socket.write(`${JSON.stringify({ method, params })}\n`));
     socket.on('data', (data) => {
-      buffer += data.toString();
+      buffer += data;
       if (!buffer.includes('\n')) return;
       socket.end();
       try {
@@ -74,12 +75,13 @@ export async function startService(logger: Logger, directory = dataDirectory()):
   let closing = false;
   const sockets = new Set<Socket>();
   const server = createServer((socket) => {
+    socket.setEncoding('utf8');
     sockets.add(socket); socket.on('close', () => sockets.delete(socket));
     socket.on('error', (error) => logger.warn(error.message));
     let buffer = ''; let handled = false;
     socket.on('data', (chunk) => {
       if (handled) return;
-      buffer += chunk.toString();
+      buffer += chunk;
       if (Buffer.byteLength(buffer) > 1024 * 1024) { socket.destroy(); return; }
       if (!buffer.includes('\n')) return;
       handled = true;
@@ -99,9 +101,10 @@ export async function startService(logger: Logger, directory = dataDirectory()):
           if (request.method === 'shutdown') void shutdown();
         } catch (error) { socket.end(`${JSON.stringify({ error: error instanceof Error ? error.message : String(error) })}\n`); }
       };
-      let method: string;
-      try { method = JSON.parse(buffer.slice(0, buffer.indexOf('\n'))).method; } catch { void respond(); return; }
-      if (method === 'status' || method === 'setup' || method === 'models') void respond();
+      let request: ServiceRequest;
+      try { request = JSON.parse(buffer.slice(0, buffer.indexOf('\n'))); } catch { void respond(); return; }
+      if (['status', 'setup', 'models', 'browser'].includes(request.method) || request.method === 'desktop' && ['list', 'read', 'jobs'].includes(request.params?.action) ||
+        request.method === 'session' && request.params?.action === 'desktop' && ['list', 'read', 'jobs'].includes(request.params.operation)) void respond();
       else { mutation = mutation.then(respond); }
     });
   });

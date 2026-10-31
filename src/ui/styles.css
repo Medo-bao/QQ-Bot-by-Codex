@@ -328,3 +328,20 @@ code { overflow-wrap: anywhere; }
   .dialog-body .fields { grid-template-columns: 1fr; }
   .dialog-actions { align-items: stretch; flex-direction: column; }
 }
+:root .desktop-dialog{width:min(1040px,calc(100vw - 40px));max-width:none;max-height:90dvh}
+.desktop-layout{display:grid;grid-template-columns:240px minmax(0,1fr);gap:24px}
+.desktop-picker{display:flex;flex-direction:column;gap:12px;min-width:0}
+.desktop-picker select,.desktop-picker input{width:100%}
+#desktopThreadList{min-height:260px;padding:8px}
+#desktopThreadList option{padding:9px 8px;border-radius:8px}
+.desktop-detail{min-width:0}.desktop-detail h3{margin-top:0}
+.desktop-history{max-height:260px;min-height:80px;overflow:auto;margin:16px 0;padding-right:8px}
+.desktop-history article{padding:10px 0;border-bottom:1px solid var(--line)}
+.desktop-history article small{color:var(--muted)}
+.desktop-history article>div{overflow-wrap:anywhere}
+.desktop-notify{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px}
+.desktop-notify input{width:auto}
+.desktop-job{padding:16px 0;border-bottom:1px solid var(--line)}
+.desktop-job p{white-space:pre-wrap;overflow-wrap:anywhere}
+.desktop-job .row{margin-top:10px}
+@media(max-width:700px){.desktop-layout{grid-template-columns:minmax(0,1fr);gap:20px}.desktop-history{max-height:200px}#desktopThreadList{min-height:160px}.desktop-dialog{width:calc(100vw - 24px)}}

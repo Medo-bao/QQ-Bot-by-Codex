@@ -17,6 +17,7 @@ import { ConversationStorage } from './storage.ts';
 import { GroupContextStore, type GroupContextEntry } from './group-context.ts';
 import { MessageReferenceStore, type MessageReference, type ReferenceFile } from './message-reference.ts';
 import { contextUsage, type ContextUsage } from './context-usage.ts';
+import type { ThreadToolSpec } from './thread-tool-cache.ts';
 
 interface AgentMessage {
   text: string;
@@ -63,6 +64,7 @@ interface Peer extends Pick<SessionSettings, 'sandbox' | 'approvalPolicy' | 'app
   activePreset?: string;
   activePrompt?: string;
   preparedSkills?: CodexInput[];
+  pendingToolIndex?: readonly ThreadToolSpec[];
   effort?: string;
   cwd?: string;
   prompt?: string | null;
@@ -84,6 +86,10 @@ export const dynamicTools = [
   { type: 'function', name: 'qqbot_send_file', description: 'Send an existing local file to the QQ user or group that requested this task. Set send_as=file to deliver the original downloadable file, or send_as=voice for a voice message. MP3 defaults to a file; ZIP wrapping is unnecessary.', inputSchema: fileParameters },
   { type: 'function', name: 'qqbot_ask_question', description: 'Ask the current QQ user a question and wait for their choice or free text. Set multiple=true to accept several numbered choices.', inputSchema: { type: 'object', properties: { question: { type: 'string' }, options: { type: 'array', items: { type: 'string' } }, multiple: { type: 'boolean' } }, required: ['question'], additionalProperties: false } },
   { type: 'function', name: 'qqbot_describe_image', description: 'Analyze a local image through the configured Codex vision model. Use when the user sends an image or asks about a screenshot.', inputSchema: { type: 'object', properties: { file_path: { type: 'string' }, prompt: { type: 'string' } }, required: ['file_path'], additionalProperties: false } },
+  { type: 'function', name: 'qqbot_desktop', description: 'List and read existing Codex desktop project conversations, or dispatch a task to one ONLY when the current human asks that conversation to work. Use list/read to select the exact target, dispatch once, then jobs to check progress. Busy target conversations wait until idle. By default the completed result is automatically sent to this QQ conversation; do not send it again. Keeps the desktop conversation model, permissions and context. Requires full access. Never start a second Codex process to resume the desktop thread.', inputSchema: {
+    type: 'object', properties: { action: { type: 'string', enum: ['list', 'read', 'dispatch', 'jobs', 'cancel', 'retry_delivery'] },
+      query: { type: 'string' }, cursor: { type: 'string' }, thread_id: { type: 'string' }, prompt: { type: 'string' }, job_id: { type: 'string' }, notify_qq: { type: 'boolean', default: true } }, required: ['action'], additionalProperties: false } },
+  { type: 'function', name: 'qqbot_browser', description: 'Check whether the human-requested website is signed in in the attached Codex desktop built-in browser. Use this for X/Twitter or other website login-status questions instead of searching for a site-specific connector or probing debug ports. Returns signed_in, signed_out or unknown based on visible page controls. Read-only; does not log in, expose cookies or passwords, or send posts. Requires full access and the desktop browser connection. Unknown means inspection failed or evidence is insufficient, not signed out.', inputSchema: { type: 'object', properties: { url: { type: 'string', description: 'The website the human asked to inspect, for example https://x.com/' } }, required: ['url'], additionalProperties: false } },
 ];
 
 export class QQBridge {
@@ -102,7 +108,9 @@ export class QQBridge {
   readonly observedPeers = new Map<string, { senderId: string; lastSeen: string; allowed: boolean }>();
 
   constructor(readonly config: BotConfig, directory: string, private readonly transport: ChatTransport,
-    readonly client: CodexClient, private readonly logger: Logger) {
+    readonly client: CodexClient, private readonly logger: Logger,
+    private readonly desktop?: (target: ReplyTarget, params: Record<string, unknown>) => Promise<unknown>,
+    private readonly inspectBrowser?: (target: ReplyTarget, url: string) => Promise<unknown>) {
     this.sessions = new SessionStore(directory);
     this.broker = new InteractionBroker(transport, config.askTimeoutMs);
     this.media = new MediaStore(directory, config);
@@ -164,7 +172,7 @@ export class QQBridge {
 
   requiresRestart(config: BotConfig): boolean {
     const threadSettings = new Set(['model', 'modelProvider', 'effort', 'preset', 'presets', 'directPrompt', 'groupPrompt',
-      'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'webSearch', 'contextWindow']);
+      'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'webSearch', 'contextWindow', 'desktopControl']);
     return (Object.keys(config) as Array<keyof BotConfig>).some(key =>
       !threadSettings.has(key) && JSON.stringify(config[key]) !== JSON.stringify(this.config[key]));
   }
@@ -485,11 +493,16 @@ export class QQBridge {
     if (peer.threadId) {
       await this.client.call('thread/unsubscribe', { threadId: peer.threadId });
       if (await this.client.refreshThreadTools(peer.threadId, dynamicTools)) this.logger.info('QQ 会话工具定义与索引已更新，原上下文已保留。');
+      peer.pendingToolIndex = undefined;
     }
+    const tools = dynamicTools.filter((tool) => tool.name !== 'qqbot_describe_image' || this.config.vision.enabled);
     const result = peer.threadId
       ? await this.client.call('thread/resume', { threadId: peer.threadId, excludeTurns: true, ...params })
-      : await this.client.call('thread/start', { ...params, dynamicTools: dynamicTools.filter((tool) => tool.name !== 'qqbot_describe_image' || this.config.vision.enabled) });
+      : await this.client.call('thread/start', { ...params, dynamicTools: tools });
     if (!peer.threadId) {
+      // thread/start installs the usable catalog immediately, but persistence is deferred.
+      // Populate its derived index after the first turn, without delaying the initial reply.
+      peer.pendingToolIndex = tools;
       peer.activePreset = presetId;
       if (preset?.skills.length) {
         const available = await this.client.call('skills/list', { cwds: [params.cwd] });
@@ -530,6 +543,8 @@ export class QQBridge {
     this.rememberMessage(message, files);
     const inputs: CodexInput[] = [{ type: 'text', text: inputText }, ...receivedFiles, ...(peer.preparedSkills || []),
       { type: 'text', text: `${storageMessagePrefix}${output}\n将本轮新生成的文档、导出文件等保存在上述目录，避免散落到项目根目录。图片生成工具的原生输出目录已关联到该会话的 images 子目录。使用 qqbot_send_file 交付用户需要的文件，支持 send_as: "auto" | "file" | "voice"；发送原始文件时指定 "file"，语音消息指定 "voice"。MP3 等普通音频默认按文件发送，无需改为 ZIP。完全访问模式会将发送目录外的本机文件自动复制到当前会话归档再发送；其他模式须先将获准读取的文件复制到上述目录，不能改变权限来绕过限制。\n调用工具时以当前工具定义为准。image_gen.imagegen 不接受 size、n 或 model 参数；尺寸和构图要求写入 prompt，参考图片只使用 referenced_image_paths 或 num_last_images_to_include 其中一种。\n从网页搜索结果下载参考图片或文件时，优先运行 Node 下载器：${JSON.stringify(process.execPath)} ${JSON.stringify(fileURLToPath(new URL('./cli.js', import.meta.url)))} download <HTTP(S) URL> ${JSON.stringify(output)} ${this.config.media.maxMB}。它使用 Node HTTPS，可避免 Windows 沙箱中 PowerShell 的 TLS 错误，仍受本会话的联网与文件权限限制；不会自动发送文件。` }];
+    const browserHint = inputs.find(input => input.type === 'text' && input.text.startsWith(storageMessagePrefix));
+    if (browserHint?.type === 'text') browserHint.text += '\n用户询问网站是否登录时，调用 qqbot_browser（例如 url="https://x.com/"）检查绑定的 Codex 内置浏览器。它会初始化官方浏览器工具并返回 signed_in、signed_out 或 unknown；unknown、403、缺少专用网站连接器都不能解释为未登录。Codex 模型账号认证不代表网站登录。不要通过扫描调试端口、读取密码或复制 Cookie 判断登录。';
     if (message.reference) {
       const quoted = await this.referenceInputs(peer.target, message.reference, [...files]);
       inputs.push({ type: 'text', text: referenceMessagePrefix + JSON.stringify({ reference: quoted.context, archivePath: this.references.path(peer.target) }) }, ...quoted.inputs);
@@ -599,6 +614,11 @@ export class QQBridge {
       active.abort.abort();
       peer.active = undefined;
       await this.storage.archive(this.client, peer.target, peer.threadId!).catch((error) => this.logger.warn(`会话归档：${error instanceof Error ? error.message : error}`));
+      if (peer.pendingToolIndex) {
+        try {
+          if (await this.client.refreshThreadTools(peer.threadId!, peer.pendingToolIndex, { created: true })) peer.pendingToolIndex = undefined;
+        } catch (error) { this.logger.warn(`会话工具索引补齐：${error instanceof Error ? error.message : error}`); }
+      }
     }
   }
 
@@ -948,7 +968,7 @@ export class QQBridge {
       const transmission = message.sentAt && Number.isFinite(message.sentAt) ? `${Math.max(0, receivedAt - message.sentAt)} ms（按消息时间估算）` : '无消息时间';
       await this.send(message.target, `pong · QQ Bot\n传输耗时：${transmission}\n接收至处理：${Math.max(0, Date.now() - receivedAt)} ms`);
     }
-    else if (command === '/bot-version') await this.send(message.target, 'QQ Bot 0.0.4');
+    else if (command === '/bot-version') await this.send(message.target, 'QQ Bot 0.0.5');
     else if (command === '/bot-help') await this.send(message.target, '/new 新会话\n/compact 压缩历史\n/model 查看或切换模型\n/preset 查看或切换预设\n/effort 查看或切换推理强度\n/stop 中止任务\n/bot-status 会话状态与 OpenID\n/bot-ping 连通检查\n/bot-version 版本\n/answer 请求编号 答案');
     else if (command === '/answer') { await this.send(message.target, '未找到匹配的待答请求，或当前用户不是本轮发起者。'); }
     else return false;
@@ -998,6 +1018,16 @@ export class QQBridge {
           const path = await this.deliverFile(active, args.file_path, mode);
           return { success: true, contentItems: [{ type: 'inputText', text: `已发送 ${basename(path)}` },
             { type: 'inputText', text: sentFilePrefix + JSON.stringify({ path, kind: fileSendKind(path, mode) }) }] };
+        } else if (params.tool === 'qqbot_desktop') {
+          if (!this.desktop) throw new Error('桌面会话调度不可用，请更新 QQ Bot 后台后重试。');
+          if (sessionPermissions(this.config, peer).sandbox !== 'danger-full-access') throw new Error('访问其他项目会话需要完全访问权限。');
+          text = JSON.stringify(await this.desktop({ scope: active.target.scope, targetId: active.target.targetId,
+            ...(active.target.scope === 'group' && active.senderId !== 'qqbot-local-ui' ? { replyUserId: active.senderId } : {}) }, args));
+        } else if (params.tool === 'qqbot_browser') {
+          if (!this.inspectBrowser) throw new Error('网站登录检查不可用，请更新 QQ Bot 后台。');
+          if (typeof args.url !== 'string') throw new Error('url 必须是网站地址。');
+          if (sessionPermissions(this.config, peer).sandbox !== 'danger-full-access') throw new Error('查看桌面网站登录状态需要完全访问权限。');
+          text = JSON.stringify(await this.inspectBrowser(active.target, args.url));
         } else if (params.tool === 'qqbot_describe_image') {
           if (typeof args.file_path !== 'string') throw new Error('file_path 必须是字符串。');
           const path = await this.filePath(active.target, args.file_path);

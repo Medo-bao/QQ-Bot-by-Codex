@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.0.5 - 2026-10-31
+
+- Add desktop project-conversation browsing, recent replies/status, task dispatch, queueing and final-text delivery to QQ.
+- Match results with a unique task marker to avoid unrelated turns; rotate polling across targets and retain pending cancellation and delivery retries.
+- Add read-only website login checks through the desktop browser, distinguish signed in/out/unknown, and preserve native account/origin checks.
+- Restore plugin MCP loading and QQ auto-start after desktop restarts with supported manifests, working-directory resolution and environment forwarding.
+- Fix tool-index initialization while native rollout and database records are still being persisted, retaining original conversations and history.
+- Preserve long Chinese text and emoji across UTF-8 chunks in local communication.
+- Confirm final private-stream updates and closure before marking delivery; fall back to a complete reply on failure and index only confirmed sent text.
+- Rewrite the Chinese and English README around installation, access, file delivery, project tasks and local data.
+- Align package, plugin, MCP, UI, QQ command and SDK versions at 0.0.5; publish source, tests, documentation and icons only.
+
 ## 0.0.4 - 2026-10-31
 
 - Delegate automatic compaction entirely to Codex, remove plugin toggles, percentage thresholds and retired settings, and retain native progress feedback and manual compaction.

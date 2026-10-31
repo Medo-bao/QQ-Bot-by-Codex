@@ -58,9 +58,9 @@ export class CodexClient {
     return this.runtimeHome ? join(this.runtimeHome, 'generated_images', threadId) : undefined;
   }
 
-  async refreshThreadTools(threadId: string, tools: readonly ThreadToolSpec[]): Promise<boolean> {
+  async refreshThreadTools(threadId: string, tools: readonly ThreadToolSpec[], options: { created?: boolean } = {}): Promise<boolean> {
     if (!this.runtimeHome) throw new Error('Codex App Server 尚未启动。');
-    return refreshThreadTools(this, this.runtimeHome, threadId, tools);
+    return refreshThreadTools(this, this.runtimeHome, threadId, tools, options);
   }
 
   async readContextUsage(threadId: string): Promise<ContextUsage | undefined> {
@@ -138,7 +138,7 @@ export class CodexClient {
       }
     });
     await this.call('initialize', {
-      clientInfo: { name: 'codex_qqbot', title: 'QQ Bot', version: '0.0.4' },
+      clientInfo: { name: 'codex_qqbot', title: 'QQ Bot', version: '0.0.5' },
       capabilities: { experimentalApi: true },
     });
     this.notify('initialized', {});

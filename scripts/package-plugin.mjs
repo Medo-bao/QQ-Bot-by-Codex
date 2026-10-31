@@ -1,9 +1,10 @@
-import { cp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 const output = resolve('release/codex-qqbot');
 await mkdir(output, { recursive: true });
-for (const path of ['plugin.json', 'mcp.json', 'skills', 'assets', 'LICENSE', 'README.md']) {
+for (const path of ['plugin.json', 'mcp.json']) await rm(resolve(output, path), { force: true });
+for (const path of ['.codex-plugin', '.mcp.json', 'skills', 'assets', 'LICENSE', 'README.md']) {
   await cp(resolve(path), resolve(output, path), { recursive: true, force: true });
 }
 await mkdir(resolve(output, 'dist'), { recursive: true });
