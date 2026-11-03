@@ -103,7 +103,7 @@ export async function startService(logger: Logger, directory = dataDirectory()):
       };
       let request: ServiceRequest;
       try { request = JSON.parse(buffer.slice(0, buffer.indexOf('\n'))); } catch { void respond(); return; }
-      if (['status', 'setup', 'models', 'browser'].includes(request.method) || request.method === 'desktop' && ['list', 'read', 'jobs'].includes(request.params?.action) ||
+      if (['status', 'setup', 'models', 'browser', 'live'].includes(request.method) || request.method === 'desktop' && ['list', 'read', 'jobs'].includes(request.params?.action) ||
         request.method === 'session' && request.params?.action === 'desktop' && ['list', 'read', 'jobs'].includes(request.params.operation)) void respond();
       else { mutation = mutation.then(respond); }
     });

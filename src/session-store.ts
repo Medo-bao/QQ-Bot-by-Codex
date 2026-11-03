@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { writeJson, type BotConfig } from './config.ts';
 import { z } from 'zod';
@@ -33,10 +33,10 @@ export interface SavedSession extends Omit<SessionSettings, 'effort'> {
 
 export class SessionStore {
   private readonly path: string;
-  private readonly sessions: Record<string, SavedSession>;
+  private sessions: Record<string, SavedSession>;
   constructor(directory: string) {
     this.path = join(directory, 'sessions.json');
-    this.sessions = existsSync(this.path) ? JSON.parse(readFileSync(this.path, 'utf8')) : {};
+    this.sessions = this.readDisk();
     let changed = false;
     for (const session of Object.values(this.sessions)) {
       for (const key of ['autoCompact', 'autoCompactThreshold']) if (key in session) {
@@ -55,5 +55,19 @@ export class SessionStore {
       return [{ ...session, scope, peerId: target.join(':'), busy: false, queued: 0, loaded: false }];
     });
   }
-  set(key: string, session: SavedSession): void { this.sessions[key] = session; writeJson(this.path, this.sessions); }
+  private readDisk(): Record<string, SavedSession> {
+    let raw: string;
+    try { raw = readFileSync(this.path, 'utf8'); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {}; throw error; }
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error(`会话记录格式错误：${this.path}`);
+    return data;
+  }
+  set(key: string, session: SavedSession): void {
+    // A stale store must not overwrite other peers saved by another writer.
+    // A corrupt/unreadable file is an error, never an empty replacement map.
+    const merged = { ...this.readDisk(), [key]: session };
+    writeJson(this.path, merged);
+    this.sessions = merged;
+  }
 }

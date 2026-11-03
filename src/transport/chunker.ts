@@ -81,5 +81,16 @@ export function chunkMarkdownText(text: string, limit: number): string[] {
   flushTable();
   if (current) chunks.push(current);
 
-  return chunks.length > 0 ? chunks : [text];
+  // A paragraph, code line or table can itself exceed the limit. Bound those
+  // chunks too, keeping UTF-16 surrogate pairs together when splitting emoji.
+  return (chunks.length > 0 ? chunks : [text]).flatMap(block => {
+    const bounded: string[] = [];
+    while (block.length > limit) {
+      let end = limit;
+      if (/[\uD800-\uDBFF]/.test(block[end - 1]!) && /[\uDC00-\uDFFF]/.test(block[end]!)) end = end > 1 ? end - 1 : 2;
+      bounded.push(block.slice(0, end)); block = block.slice(end);
+    }
+    if (block) bounded.push(block);
+    return bounded;
+  });
 }

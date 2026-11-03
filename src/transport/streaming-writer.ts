@@ -17,6 +17,7 @@ export interface StreamingWriterDeps {
   logger: Logger;
   /** 节流间隔（ms）：连续 append 累积后，停顿该间隔才 update */
   throttleMs: number;
+  formatText?: (text: string, partial: boolean) => string;
   onComplete?: (receipt: unknown, text: string) => void;
 }
 
@@ -39,7 +40,7 @@ export class StreamingWriter {
 
   /** 只有最终全文及流关闭均已确认，才可省略静态补发。 */
   public get shouldFallback(): boolean {
-    return !this.completed || this.sentText !== this.fullText;
+    return !this.completed || this.sentText !== (this.deps.formatText?.(this.fullText, false) ?? this.fullText);
   }
 
   /** 累积全文（降级静态发送时使用） */
@@ -133,6 +134,8 @@ export class StreamingWriter {
   /** 推送当前累积文本（首次 openStream + update 全量） */
   private async pushUpdate(): Promise<void> {
     if (this.aborted || this.failed || !this.fullText) return;
+    const text = this.deps.formatText?.(this.fullText, !this.finished) ?? this.fullText;
+    if (!text.trim() || text === this.sentText) return;
 
     if (!this.session) {
       try {
@@ -149,7 +152,6 @@ export class StreamingWriter {
     }
 
     try {
-      const text = this.fullText;
       await this.session.update(text);
       this.sentText = text;
     } catch (err) {

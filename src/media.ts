@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import type { BotConfig } from './config.ts';
 import { fileSendModes, type FileSendMode, type RawAttachment } from './types.ts';
 import { z } from 'zod';
+import { correctImageExtension, isImageContentType } from './image-format.ts';
 
 export const fileSendModeSchema = z.enum(fileSendModes).default('auto');
 
@@ -27,23 +28,62 @@ export function fileSendKind(path: string, sendAs: FileSendMode = 'auto'): 'file
 
 export type CodexInput = { type: 'text'; text: string } | { type: 'localImage'; path: string } | { type: 'skill'; name: string; path: string };
 
+const transientDownloadCodes = new Set(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET']);
+
+function downloadCauses(error: unknown): Array<{ message?: string; code?: string }> {
+  const outer = error as Error & { code?: string; cause?: Error & { code?: string; errors?: Error[] } };
+  return [outer, outer?.cause, ...(outer?.cause?.errors || [])].filter((value): value is Error & { code?: string } => Boolean(value && typeof value === 'object'));
+}
+
+function downloadFailure(url: URL, error: unknown): Error {
+  const details = [...new Set(downloadCauses(error).flatMap(cause => [cause.message, cause.code]).filter(Boolean))].join('；');
+  return new Error(`下载失败（${url.hostname}）：${details || String(error)}`, { cause: error });
+}
+
+async function downloadResponse(url: URL): Promise<Response> {
+  // GET is safe to retry before any response/file exists. Both attempts share
+  // the original deadline, rather than extending an already slow QQ task.
+  const signal = AbortSignal.timeout(60000);
+  for (let attempt = 0; ; attempt++) {
+    try { return await fetch(url, { signal }); }
+    catch (error) {
+      if (attempt === 0 && !signal.aborted && downloadCauses(error).some(cause => transientDownloadCodes.has(cause.code || ''))) {
+        await new Promise(resolve => setTimeout(resolve, 300));
+        continue;
+      }
+      throw downloadFailure(url, error);
+    }
+  }
+}
+
+async function checkDownload(response: Response, limit: number): Promise<void> {
+  const failure = !response.ok || !response.body ? `下载失败 (HTTP ${response.status})`
+    : Number(response.headers.get('content-length')) > limit ? '附件下载超过大小上限。' : undefined;
+  if (failure) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(failure);
+  }
+}
+
 export async function downloadFile(address: string, directory: string, maxMB: number, filename?: string): Promise<string> {
   if (!isAbsolute(directory)) throw new Error('输出目录必须是绝对路径。');
   const url = new URL(address); if (!['https:', 'http:'].includes(url.protocol)) throw new Error('下载地址须为 HTTP(S)。');
-  const response = await fetch(url, { signal: AbortSignal.timeout(60000) });
-  if (!response.ok || !response.body) throw new Error(`下载失败 (HTTP ${response.status})`);
+  const response = await downloadResponse(url);
   const limit = maxMB * 1024 * 1024;
-  if (Number(response.headers.get('content-length')) > limit) throw new Error('附件下载超过大小上限。');
+  await checkDownload(response, limit);
   let label = filename || basename(url.pathname) || 'download';
   try { label = decodeURIComponent(label); } catch { /* Literal percent signs are valid names. */ }
   const extensions: Record<string, string> = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp', 'image/gif': '.gif', 'application/pdf': '.pdf' };
   if (!extname(label)) label += extensions[response.headers.get('content-type')?.split(';')[0] || ''] || '';
   const name = basename(label).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
   await mkdir(directory, { recursive: true });
-  const path = join(directory, `${randomUUID()}-${name}`); let bytes = 0;
+  let path = join(directory, `${randomUUID()}-${name}`); let bytes = 0;
   const limiter = new Transform({ transform(chunk: Buffer, _encoding, callback) { bytes += chunk.length; callback(bytes > limit ? new Error('附件下载超过大小上限。') : null, chunk); } });
-  try { await pipeline(Readable.fromWeb(response.body as any), limiter, createWriteStream(path, { mode: 0o600 })); }
-  catch (error) { await rm(path, { force: true }); throw error; }
+  try {
+    await pipeline(Readable.fromWeb(response.body as any), limiter, createWriteStream(path, { mode: 0o600 }));
+    if (isImageContentType(response.headers.get('content-type') || '') || fileSendKind(path) === 'image') path = await correctImageExtension(path);
+  }
+  catch (error) { await rm(path, { force: true }); throw downloadCauses(error).some(cause => cause.code?.startsWith('UND_ERR_')) ? downloadFailure(url, error) : error; }
   return path;
 }
 
@@ -65,19 +105,21 @@ export class MediaStore {
       const url = new URL(attachment.url);
       if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new Error('附件下载地址须为 HTTP(S)。');
       const name = basename(attachment.filename || `attachment${extname(url.pathname)}`).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
-      const path = join(directory, `${randomUUID()}-${name}`);
-      const response = await fetch(url, { signal: AbortSignal.timeout(60000) });
-      if (!response.ok || !response.body) throw new Error(`附件下载失败 (HTTP ${response.status})`);
-      if (Number(response.headers.get('content-length')) > limit) throw new Error('附件下载超过大小上限。');
+      let path = join(directory, `${randomUUID()}-${name}`);
+      const response = await downloadResponse(url);
+      await checkDownload(response, limit);
       let bytes = 0;
       const limiter = new Transform({ transform(chunk: Buffer, _encoding, callback) {
         bytes += chunk.length;
         callback(bytes > limit ? new Error('附件下载超过大小上限。') : null, chunk);
       } });
-      try { await pipeline(Readable.fromWeb(response.body as any), limiter, createWriteStream(path, { mode: 0o600 })); }
-      catch (error) { await rm(path, { force: true }); throw error; }
+      try {
+        await pipeline(Readable.fromWeb(response.body as any), limiter, createWriteStream(path, { mode: 0o600 }));
+        if (isImageContentType(attachment.content_type)) path = await correctImageExtension(path);
+      }
+      catch (error) { await rm(path, { force: true }); throw downloadCauses(error).some(cause => cause.code?.startsWith('UND_ERR_')) ? downloadFailure(url, error) : error; }
       onDownload?.(path, attachment);
-      if ((attachment.content_type || '').startsWith('image/') && this.config.vision.enabled && !this.config.vision.model && !this.config.vision.provider) inputs.push({ type: 'localImage', path });
+      if (isImageContentType(attachment.content_type) && this.config.vision.enabled && !this.config.vision.model && !this.config.vision.provider) inputs.push({ type: 'localImage', path });
       inputs.push({ type: 'text', text: `QQ 附件：${name} (${attachment.content_type || 'file'})\n本地路径：${path}` });
     }
     return inputs;

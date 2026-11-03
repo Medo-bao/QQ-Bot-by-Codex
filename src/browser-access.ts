@@ -10,14 +10,40 @@ export interface BrowserContext { threadId: string; turnId: string; }
 export interface BrowserLoginResult {
   state: 'signed_in' | 'signed_out' | 'unknown'; url: string; checkedAt: string; evidence: string[]; account?: string; reason?: string;
 }
+export interface BrowserPageResult {
+  action: 'read'; status: 'ok' | 'blocked' | 'unavailable'; url: string; checkedAt: string;
+  content: string; truncated: boolean; login?: BrowserLoginResult; reason?: string;
+}
+const safePageUrl = (url: string) => { const page = new URL(url); return page.origin + page.pathname; };
+function sameWebsite(left: URL, right: URL): boolean {
+  const host = (url: URL) => url.hostname.replace(/^www\./, '').replace(/^twitter\.com$/, 'x.com');
+  return left.origin === right.origin || !left.port && !right.port && right.protocol === 'https:' && host(left) === host(right);
+}
+function pageAccessFailure(snapshot: string): boolean {
+  return !/^\s*- article(?:[ :])/m.test(snapshot) && /^\s*- (?:(?:heading|alert|generic|paragraph) "|text: "?)(?:Access denied|Forbidden|Verify you are human|Something went wrong|访问受限|验证您是真人|出了点问题)/im.test(snapshot);
+}
+function loadingContent(snapshot: string): { role: string; name?: string; region?: string } | undefined {
+  if (/^\s*- article(?:[ :])/m.test(snapshot)) return;
+  for (const match of snapshot.matchAll(/^\s*- (progressbar|status) "([^"]+)"/gm)) {
+    if (/Loading (?:posts|timeline|content)|(?:正在)?加载(?:帖子|内容|正文|页面)/i.test(match[2]!)) return { role: match[1]!, name: match[2]! };
+  }
+  const lines = snapshot.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const region = /^(\s*)- region "([^"]+)"/.exec(lines[i]!);
+    if (!region || !/posts|timeline|conversation|帖子|对话/i.test(region[2]!)) continue;
+    const body: string[] = [];
+    for (let j = i + 1; j < lines.length; j++) {
+      if (lines[j]!.trim() && /^\s*/.exec(lines[j]!)![0].length <= region[1]!.length) break;
+      body.push(lines[j]!);
+    }
+    if (body.some(line => /^\s*- progressbar(?:[ :]|$)/.test(line))) return { role: 'progressbar', region: region[2]! };
+  }
+}
 
 /** Only visible controls establish a login state; HTTP errors and missing tools do not. */
 export function browserLoginState(url: string, snapshot: string): Omit<BrowserLoginResult, 'checkedAt'> {
   const page = new URL(url); const safeUrl = page.origin + page.pathname;
   const unknown = { state: 'unknown' as const, url: safeUrl, evidence: [] };
-  if (/^\s*- (?:heading|alert|generic|paragraph) "(?:Access denied|Forbidden|Verify you are human|Something went wrong|访问受限|验证您是真人|出了点问题)/im.test(snapshot)) {
-    return { ...unknown, reason: '页面访问受限或要求验证，无法判断登录状态。' };
-  }
   const x = /(^|\.)(x|twitter)\.com$/i.test(page.hostname);
   const accountMenu = /^\s*- button "(?:Account menu|账号菜单|账户菜单)"/im.test(snapshot);
   const signOut = /^\s*- (?:button|link) "(?:Log out|Sign out|退出登录|登出)(?:[" ·])/im.test(snapshot);
@@ -25,6 +51,7 @@ export function browserLoginState(url: string, snapshot: string): Omit<BrowserLo
     const profile = /- link "(?:Profile|个人资料)"[^\n]*\n\s*- \/url: \/([\w]+)\s*$/im.exec(snapshot)?.[1];
     return { state: 'signed_in', url: safeUrl, evidence: [accountMenu ? '页面显示账户菜单。' : '页面显示退出登录控件。'], ...(profile ? { account: `@${profile}` } : {}) };
   }
+  if (pageAccessFailure(snapshot)) return { ...unknown, reason: '页面访问受限或要求验证，无法判断登录状态。' };
   const loginHeading = /^\s*- heading "(?:Sign in to X|Log in to X|登录 X|登入 X|登录到 X|登录|Sign in|Log in)"/im.test(snapshot);
   const passwordField = /^\s*- (?:textbox|text field) "[^"\n]*(?:Password|密码)/im.test(snapshot);
   const loggedOutX = x && /^\s*- (?:button|link) "(?:Log in|Sign in|登录|登入)"/im.test(snapshot) &&
@@ -35,7 +62,7 @@ export function browserLoginState(url: string, snapshot: string): Omit<BrowserLo
   return { ...unknown, reason: '页面没有足以确认登录或退出状态的控件。' };
 }
 
-/** Reads the attached desktop browser through its official CUA MCP runtime. No arbitrary scripts or account actions are exposed. */
+/** Reads visible page content through official desktop CUA. No arbitrary scripts or account actions are exposed. */
 export class BrowserAccess {
   private client?: Client;
   private environment: Record<string, string> = {};
@@ -77,14 +104,14 @@ export class BrowserAccess {
     } catch { throw new Error('无法确认机器人账号的浏览器身份，请检查 Codex 登录。'); }
   }
   private async connect(): Promise<Client> {
-    if (this.disposed) throw new Error('网站登录检查已关闭。');
+    if (this.disposed) throw new Error('桌面网页读取已关闭。');
     const identity = this.ownIdentity();
     if (this.client && this.identity === identity) return this.client;
     await this.close();
     const server = this.runtime();
     const transport = new StdioClientTransport({ command: server.command, args: server.args || [],
       env: { ...process.env, ...server.env, ...this.environment, BROWSER_USE_ACCESS_EXECUTOR_ID: identity }, stderr: 'pipe' });
-    const client = new Client({ name: 'qqbot-browser', version: '0.0.5' });
+    const client = new Client({ name: 'qqbot-browser', version: '0.0.6' });
     // Runtime diagnostics stay local and must not echo browser credentials into QQ.
     transport.stderr?.on('data', () => {});
     try { await client.connect(transport); }
@@ -93,7 +120,7 @@ export class BrowserAccess {
   }
   private async js(code: string, context: BrowserContext): Promise<string[]> {
     const client = await this.connect();
-    const response = await client.callTool({ name: 'js', arguments: { code, title: 'QQ Bot 网站登录检查', timeout_ms: 30000 },
+    const response = await client.callTool({ name: 'js', arguments: { code, title: 'QQ Bot 网页读取与登录检查', timeout_ms: 30000 },
       _meta: { 'x-codex-turn-metadata': JSON.stringify({ session_id: context.threadId, thread_id: context.threadId, turn_id: context.turnId }) } });
     const texts = (response.content as any[] || []).filter(item => item.type === 'text').map(item => item.text as string);
     if (response.isError) throw new Error(texts.at(-1) || '浏览器读取失败。');
@@ -104,15 +131,40 @@ export class BrowserAccess {
     throw new Error('浏览器没有返回可读取的页面状态。');
   }
   inspect(url: string): Promise<BrowserLoginResult> {
-    const operation = this.queue.then(() => this.inspectOnce(url));
-    this.queue = operation.catch(() => {}); return operation;
+    return this.enqueue<BrowserLoginResult>(async () => {
+      const checkedAt = new Date().toISOString();
+      try { return { ...await this.withPage(url, false, page => browserLoginState(page.url, page.snapshot)), checkedAt }; }
+      catch (error) { return { state: 'unknown', url: this.safeUrl(url), checkedAt, evidence: [], reason: this.failure(error) }; }
+    });
   }
-  private async inspectOnce(url: string): Promise<BrowserLoginResult> {
-    let owned = false; let failed = false; let context: BrowserContext | undefined; let safeUrl = '';
-    const checkedAt = new Date().toISOString();
+  read(url: string, maxChars = 20000): Promise<BrowserPageResult> {
+    return this.enqueue<BrowserPageResult>(async () => {
+      const checkedAt = new Date().toISOString();
+      try {
+        if (!Number.isInteger(maxChars) || maxChars < 1000 || maxChars > 50000) throw new Error('网页读取长度须为 1000 至 50000 的整数。');
+        return await this.withPage<BrowserPageResult>(url, true, page => {
+          const login = { ...browserLoginState(page.url, page.snapshot), checkedAt };
+          const accessFailed = pageAccessFailure(page.snapshot);
+          const blocked = accessFailed || login.state === 'signed_out' && /\/i\/flow\/login\b/.test(new URL(page.url).pathname);
+          if (blocked) return { action: 'read', status: 'blocked', url: login.url, checkedAt, content: '', truncated: false, login,
+            reason: accessFailed ? '页面访问受限或要求验证，未能读取目标内容。' : '目标页面要求登录，请在 Codex 内置浏览器中完成登录后重试。' };
+          if (!page.snapshot.trim()) throw new Error('页面尚未返回可读取的内容，请稍后重试。');
+          const characters = Array.from(page.snapshot);
+          return { action: 'read', status: 'ok', url: login.url, checkedAt, content: characters.slice(0, maxChars).join(''),
+            truncated: characters.length > maxChars, login };
+        });
+      } catch (error) { return { action: 'read', status: 'unavailable', url: this.safeUrl(url), checkedAt, content: '', truncated: false, reason: this.failure(error) }; }
+    });
+  }
+  private safeUrl(url: string): string { try { return safePageUrl(url); } catch { return ''; } }
+  private failure(error: unknown): string { return (error instanceof Error ? error.message : String(error)).slice(0, 500); }
+  private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const next = this.queue.then(operation); this.queue = next.catch(() => {}); return next;
+  }
+  private async withPage<T>(url: string, exact: boolean, consume: (page: { url: string; snapshot: string }) => T): Promise<T> {
+    let owned = false; let failed = false; let context: BrowserContext | undefined;
     try {
       const requested = new URL(url);
-      safeUrl = requested.origin + requested.pathname;
       if (!['http:', 'https:'].includes(requested.protocol) || requested.username || requested.password) throw new Error('请提供有效的 HTTP(S) 网站地址。');
       context = await this.context();
       if (this.boundContext && this.boundContext !== context.threadId) await this.close();
@@ -120,22 +172,33 @@ export class BrowserAccess {
       // A fresh CUA session's first call selects a browser and reads the runtime's instructions.
       if (!this.boundContext) { await this.js('var qqLoginBrowser = await cua.getBrowser({ id: "iab" });', context); this.boundContext = context.threadId; }
       const tabs = this.json(await this.js('nodeRepl.write(JSON.stringify(await cua.listTabs({ browser: qqLoginBrowser.browserId, emit: false })));', context));
-      const existing = tabs.find((tab: any) => tab.url === requested.href) || tabs.find((tab: any) => {
-        try { return new URL(tab.url).origin === requested.origin; } catch { return false; }
-      });
+      const existing = tabs.find((tab: any) => tab.url === requested.href) || (!exact && tabs.find((tab: any) => {
+        try { return sameWebsite(requested, new URL(tab.url)); } catch { return false; }
+      }));
       if (existing) await this.js(`var qqLoginTab = await qqLoginBrowser.tabs.get(${JSON.stringify(existing.id)});`, context);
       else {
         await this.js(`var qqLoginTab = await cua.createBrowserTab(qqLoginBrowser.browserId, ${JSON.stringify(requested.href)}, { visible: false });`, context);
         owned = true;
       }
-      const page = this.json(await this.js('nodeRepl.write(JSON.stringify({ url: await qqLoginTab.url(), snapshot: await qqLoginTab.playwright.domSnapshot() }));', context));
-      if (new URL(page.url).origin !== requested.origin) return { state: 'unknown', url: safeUrl, checkedAt, evidence: [], reason: '页面跳转到其他站点，无法确认目标网站的登录状态。' };
-      const result = browserLoginState(page.url, page.snapshot);
-      return { ...result, checkedAt };
+      const snapshotCode = 'nodeRepl.write(JSON.stringify({ url: await qqLoginTab.url(), snapshot: await qqLoginTab.playwright.domSnapshot() }));';
+      let page = this.json(await this.js(snapshotCode, context));
+      if (typeof page.url !== 'string' || typeof page.snapshot !== 'string') throw new Error('浏览器没有返回可读取的网页内容。');
+      if (!sameWebsite(requested, new URL(page.url))) throw new Error('页面跳转到其他站点，无法确认目标网站的内容与登录状态。');
+      for (let stage = 0; exact && stage < 2; stage++) {
+        const loading = loadingContent(page.snapshot); if (!loading) break;
+        const region = loading.region ? `qqLoginTab.playwright.getByRole("region", { name: ${JSON.stringify(loading.region)}, exact: true })` : 'qqLoginTab.playwright';
+        const locator = loading.name ? `${region}.getByRole(${JSON.stringify(loading.role)}, { name: ${JSON.stringify(loading.name)}, exact: true })` : `${region}.getByRole(${JSON.stringify(loading.role)}).first()`;
+        try {
+          await this.js(`await ${locator}.waitFor({ state: "hidden", timeoutMs: 15000 });`, context);
+        } catch (error) { if (!/timeout|timed out/i.test(this.failure(error))) throw error; }
+        page = this.json(await this.js(snapshotCode, context));
+        if (!sameWebsite(requested, new URL(page.url))) throw new Error('页面跳转到其他站点，无法确认目标网站的内容与登录状态。');
+      }
+      if (exact && loadingContent(page.snapshot)) throw new Error('目标内容仍在加载，尚未读到正文，请稍后重试。');
+      return consume(page);
     } catch (error) {
       failed = true;
-      const reason = (error instanceof Error ? error.message : String(error)).slice(0, 500);
-      return { state: 'unknown', url: safeUrl, checkedAt, evidence: [], reason };
+      throw error;
     } finally {
       if (owned && context) await this.js('await qqLoginTab.close();', context).catch(() => {});
       if (failed) await this.close();

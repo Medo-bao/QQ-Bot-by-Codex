@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.0.6 - 2026-11-03
+
+- Restore the locally saved desktop/browser attachment after a QQ daemon restart and refresh it from parent-session status metadata; retain native account and browser permission checks.
+- Add GPT-Live speech clips and prompt-created voices, local masked key setup, playback/download, cancellable background jobs, and file or QQ voice delivery with independent retry. Keep Codex task models, conversation archives and network permissions.
+- Adapt upstream 0.5.5 image-format detection, merge-before-save session persistence, isolated atomic-write temporary files, `/bot-me`, QR failure fallback and binding-state refresh, retaining native Codex conversations and existing access settings.
+- Add an off-by-default “Reply to @everyone” setting. It controls everyone-only mentions independently while preserving direct bot mentions and group-context recording.
+- Deliver completed native image-generation results to QQ without waiting for a text answer or file link, sharing deduplication, limits, opt-out and failure feedback with explicit file sends. In mention-only mode, everyone-only mentions remain in group history without triggering replies.
+- Retry transient download connection errors once within the original deadline and retain the underlying cause. Apply the same handling to web downloads and QQ attachments, preserve size limits and partial-file cleanup, and clarify waiting for background command results.
+- Render native file citations in QQ replies and plugin chats; automatically deliver declared outputs without resending source files. Preserve Unicode across streaming and long-message boundaries.
+- Set UTF-8 for Python tools, clarify available PDF readers instead of assuming fitz is installed, and decode child diagnostics across UTF-8 chunk boundaries.
+- Read authenticated webpage content through the desktop browser, select exact URLs, preserve user tabs, allow canonical domain redirects and report truncation/blocked/unavailable states. Update tool routing so failed public fetches can use browser reads instead of login checks alone.
+- Align package, plugin, MCP, UI, QQ version command and SDK metadata at 0.0.6; release source, tests, documentation and icons only.
+
 ## 0.0.5 - 2026-10-31
 
 - Add desktop project-conversation browsing, recent replies/status, task dispatch, queueing and final-text delivery to QQ.

@@ -23,6 +23,9 @@ export class ConversationStorage {
   }
 
   files(target: ReplyTarget, threadId: string): string { return join(this.paths(target).files, segment(threadId)); }
+  audioDirectory(target?: ReplyTarget, threadId = 'direct'): string {
+    return target ? join(this.files(target, threadId), 'audio') : join(this.root, `bot-${segment(this.config.appId)}`, 'voice-previews');
+  }
   historyFile(target: ReplyTarget, threadId: string): string { return join(this.paths(target).history, `${segment(threadId)}.json`); }
 
   saveSession(target: ReplyTarget, name: string, threadId?: string, previousThreadId?: string): void {

@@ -1,5 +1,8 @@
 import { App } from '@modelcontextprotocol/ext-apps';
 import { renderMarkdown } from './markdown.ts';
+import { assistantText } from '../message-format.ts';
+import { renderBindingQr } from './binding-qr.ts';
+import { bindLiveUi, refreshLiveUi } from './live.ts';
 import { permissionPicker, closePermissionMenus } from './permissions.ts';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -8,7 +11,7 @@ let app: App | undefined;
 let state: any;
 let draft: any;
 let dirty = false;
-let lastQr = '';
+let lastQr: string | undefined;
 let busy = false;
 let draftRevision = 0;
 let savingGlobal = false;
@@ -60,13 +63,14 @@ const fields: Record<string, Field[]> = {
     { path: 'preset', label: '默认预设', help: '填入下方的预设 ID，留空使用普通会话。' },
   ],
   promptFields: [
-    { path: 'requireMention', label: '群聊仅回复 @机器人的消息', kind: 'boolean', wide: true },
+    { path: 'requireMention', label: '群聊仅回复 @机器人的消息', kind: 'boolean', wide: true, help: '开启后普通群消息不触发回复；@全体成员按下方开关处理。' },
+    { path: 'replyToEveryone', label: '@全体成员时回复', kind: 'boolean', wide: true, help: '默认关闭。开启后 @全体成员可触发回复；关闭时不回复仅 @全体成员的消息，同时 @机器人仍会回复。' },
     { path: 'streaming', label: '私聊流式回复', kind: 'boolean', wide: true },
     { path: 'showToolResults', label: '显示工具执行结果', kind: 'boolean', wide: true },
     { path: 'directPrompt', label: '私聊额外提示词', kind: 'textarea', wide: true },
     { path: 'groupPrompt', label: '群聊额外提示词', kind: 'textarea', wide: true },
     { path: 'textChunkLimit', label: '单条消息字符上限', kind: 'number' },
-    { path: 'historyLimit', label: '每轮补充的群聊历史条数', kind: 'number', help: '按群持久保存，补入完整消息和机器人回复；0 表示不额外补入。仅在 @机器人时触发回复。' },
+    { path: 'historyLimit', label: '每轮补充的群聊历史条数', kind: 'number', help: '按群持久保存，补入完整消息和机器人回复；0 表示不额外补入。回复是否触发由上方群聊开关决定。' },
   ],
   mediaFields: [
     { path: 'storageDir', label: '会话与资源存储目录', wide: true, help: '按机器人和会话分别归档聊天记录、附件及生成文件。留空使用本机数据目录下的 storage。' },
@@ -80,10 +84,19 @@ const fields: Record<string, Field[]> = {
     { path: 'vision.maxBytes', label: '视觉输入大小上限（字节）', kind: 'number' },
     { path: 'vision.maxOutputChars', label: '图片分析回复字符上限', kind: 'number' },
     { path: 'vision.timeoutMs', label: '图片分析超时（毫秒）', kind: 'number' },
-    { path: 'sendFile.sendPresentedFiles', label: '自动发送回复中声明的交付文件', kind: 'boolean', wide: true },
+    { path: 'sendFile.sendPresentedFiles', label: '自动发送生成图片和回复中的交付文件', kind: 'boolean', wide: true },
     { path: 'sendFile.restrictPaths', label: '限制文件发送目录', kind: 'boolean', wide: true, help: '开启时隔离其他会话的归档。完全访问会话可将外部文件自动归档到当前会话后发送，受限会话仍遵守目录白名单。' },
     { path: 'sendFile.maxFiles', label: '单轮最多发送文件数', kind: 'number' },
     { path: 'sendFile.extraRoots', label: '额外允许发送的目录', kind: 'lines', wide: true, help: '工作目录和媒体目录已自动允许；每行一个绝对目录。' },
+  ],
+  liveFields: [
+    { path: 'live.enabled', label: '启用 GPT-Live 语音生成', kind: 'boolean', wide: true },
+    { path: 'live.model', label: 'GPT-Live 模型', help: '默认 gpt-live-1；需要当前 API 项目具有访问权限。' },
+    { path: 'live.voice', label: '内置音色', help: '默认 marin；填写官方支持的内置音色名称。' },
+    { path: 'live.customVoiceId', label: '自定义音色 ID', wide: true, help: '填写后优先使用此音色；留空使用上方内置音色。' },
+    { path: 'live.instructions', label: '发音与风格提示', kind: 'textarea', wide: true, help: '控制发音、语速和表达方式；不会修改 Codex 会话的角色提示词。' },
+    { path: 'live.maxDurationSeconds', label: '单次生成时长上限（秒）', kind: 'number', min: 5, max: 180 },
+    { path: 'live.silenceMs', label: '结束片段的静音时长（毫秒）', kind: 'number', min: 1000, max: 10000, help: '默认 2500；朗读中停顿较长时可调高。' },
   ],
   permissionFields: [
     { path: 'approvalPolicy', label: '操作确认方式', kind: 'select', options: ['on-request', 'untrusted', 'never'] },
@@ -96,7 +109,7 @@ const fields: Record<string, Field[]> = {
     { path: 'autoStart', label: '随 Codex 启动 QQ Bot', kind: 'boolean', wide: true, help: '默认开启：插件加载后自动连接已绑定的机器人。手动停止后，状态刷新不会重新启动连接。' },
     { path: 'webSearch', label: '网页搜索', kind: 'select', options: ['live', 'cached', 'indexed', 'disabled'] },
     { path: 'contextWindow', label: '默认上下文长度（Tokens）', kind: 'number', min: 0, help: '0 跟随 Codex 模型配置，例如可设置 128000。保存后下次回复生效；请勿超过模型支持的上限，实际可用容量以返回统计为准。' },
-    { path: 'desktopControl', label: '允许访问 Codex 桌面会话与网站登录状态', kind: 'boolean', wide: true, help: '允许完全访问的 QQ 会话调度已有桌面会话，以及只读检查绑定的内置浏览器网站登录状态。目标会话沿用原有设置，浏览器检查保留原生账号和网站权限校验。' },
+    { path: 'desktopControl', label: '允许访问 Codex 桌面会话与网页', kind: 'boolean', wide: true, help: '允许完全访问的 QQ 会话调度已有桌面会话、只读读取内置浏览器中的网页和检查登录状态。目标会话沿用原有设置，网页访问保留原生账号和网站权限校验。' },
     { path: 'sessionIdleTimeout', label: '空闲会话回收（毫秒）', kind: 'number' },
     { path: 'processingTimeoutMs', label: '单次任务超时（毫秒）', kind: 'number' },
     { path: 'askTimeoutMs', label: '问题与审批等待时间（毫秒）', kind: 'number' },
@@ -136,7 +149,7 @@ function updateHeader(): void {
   $<HTMLButtonElement>('save').disabled = savingGlobal || !dirty;
   $('save').textContent = savingGlobal ? '保存中…' : '保存';
   $<HTMLButtonElement>('reload').disabled = savingGlobal;
-  $('collectionSummary').textContent = view === 'settings' ? '6 项设置' : `1 个机器人 · ${state?.sessions?.length || 0} 个会话`;
+  $('collectionSummary').textContent = view === 'settings' ? '7 项设置' : `1 个机器人 · ${state?.sessions?.length || 0} 个会话`;
 }
 
 function showDetail(tab?: string): void {
@@ -571,7 +584,7 @@ function renderChatMessages(key: string, older = false): void {
     for (const file of message.files || []) if (![...text.querySelectorAll<HTMLElement>('.message-file')].some(card => card.dataset.filePath === file.path)) article.append(fileCard(file, key));
     if (message.role === 'assistant' && message.text) {
       const copy = document.createElement('button'); copy.className = 'copy-message'; copy.type = 'button'; copy.textContent = '复制'; copy.setAttribute('aria-label', '复制回复');
-      copy.onclick = async () => { try { await navigator.clipboard.writeText(message.text); copy.textContent = '已复制'; } catch { copy.textContent = '复制失败'; } };
+      copy.onclick = async () => { try { await navigator.clipboard.writeText(assistantText(message.text, 'ui')); copy.textContent = '已复制'; } catch { copy.textContent = '复制失败'; } };
       article.append(copy);
     }
     messages.append(article);
@@ -1013,20 +1026,21 @@ function refresh(fresh = false): Promise<void> {
 async function readStatus(): Promise<void> {
   try {
     state = await api('status');
-    if (!draft) { draft = structuredClone(state.config); delete draft.credentialsConfigured; renderForm(); }
+    const latestConfig = structuredClone(state.config); delete latestConfig.credentialsConfigured;
+    if (!draft || !dirty && JSON.stringify(draft) !== JSON.stringify(latestConfig)) { draft = latestConfig; renderForm(); }
     $('connectionStatus').textContent = state.connected ? 'QQ Bot 已连接' : state.running ? '连接中' : '连接未启动';
     $('connectionStatus').dataset.connected = String(Boolean(state.connected));
     const phase = state.binding || { phase: 'idle' };
     const phaseLabel: Record<string, string> = { idle: state.config.credentialsConfigured ? `已保存机器人 ${state.config.appId}` : '尚未绑定机器人', starting: '正在获取二维码…', waiting: '请用手机 QQ 扫码连接', expired: '二维码已过期，请刷新扫码', saving: '正在保存凭据…', bound: '已绑定并连接', failed: `绑定失败：${phase.reason}` };
     $('bindingStatus').textContent = phaseLabel[phase.phase] || phase.phase;
-    if (phase.qrUrl !== lastQr) {
-      lastQr = phase.qrUrl || '';
-      const qr = $<HTMLImageElement>('qr'); qr.style.display = lastQr ? 'block' : 'none';
-      if (lastQr) qr.src = (await api('qr')).dataUrl;
-      const link = $<HTMLAnchorElement>('qrLink'); link.href = lastQr; link.textContent = lastQr ? '打开 QQ 绑定链接' : '';
+    const qrUrl: string = phase.qrUrl || '';
+    if (qrUrl !== lastQr) {
+      lastQr = qrUrl;
+      await renderBindingQr($<HTMLImageElement>('qr'), $<HTMLAnchorElement>('qrLink'), $('qrStatus'), qrUrl, () => api('qr'));
     }
     $('dataLocation').textContent = state.dataDirectory || '';
     $('archiveLocation').textContent = state.storageDirectory || '';
+    refreshLiveUi(state);
     if ($<HTMLDialogElement>('directMessageDialog').open) updateDirectSend();
     if (state.error) $('error').textContent = state.error;
     else if (connectionError && $('error').textContent === connectionError) $('error').textContent = '';
@@ -1051,6 +1065,10 @@ async function catalog(): Promise<void> {
 }
 
 function bindEvents(): void {
+  bindLiveUi(api, () => state, (id) => {
+    draft.live.customVoiceId = id;
+    renderForm(); markDirty();
+  });
   const desktopDialog = $<HTMLDialogElement>('desktopSessionsDialog');
   const desktopPrompt = $<HTMLTextAreaElement>('desktopPrompt');
   const desktopSend = $<HTMLButtonElement>('desktopDispatch');
@@ -1255,7 +1273,7 @@ function bindEvents(): void {
 async function main(): Promise<void> {
   document.body.dataset.transport = mode;
   if (mode === 'mcp') {
-    app = new App({ name: 'codex-qqbot-settings', title: 'QQ Bot', version: '0.0.5' }, {});
+    app = new App({ name: 'codex-qqbot-settings', title: 'QQ Bot', version: '0.0.6' }, {});
     app.onhostcontextchanged = (context) => { if (context.theme) document.body.dataset.theme = context.theme; };
     await app.connect();
     const theme = app.getHostContext()?.theme; if (theme) document.body.dataset.theme = theme;

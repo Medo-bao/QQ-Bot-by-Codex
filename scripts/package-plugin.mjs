@@ -7,6 +7,8 @@ for (const path of ['plugin.json', 'mcp.json']) await rm(resolve(output, path), 
 for (const path of ['.codex-plugin', '.mcp.json', 'skills', 'assets', 'LICENSE', 'README.md']) {
   await cp(resolve(path), resolve(output, path), { recursive: true, force: true });
 }
+await mkdir(resolve(output, 'docs'), { recursive: true });
+await cp(resolve('docs/UPSTREAM_PORTS.md'), resolve(output, 'docs/UPSTREAM_PORTS.md'));
 await mkdir(resolve(output, 'dist'), { recursive: true });
 for (const path of ['cli.js', 'package.json', 'settings.html']) await cp(resolve('dist', path), resolve(output, 'dist', path));
 const pkg = JSON.parse(await readFile('package.json', 'utf8'));

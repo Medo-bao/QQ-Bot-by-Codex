@@ -2,11 +2,21 @@
 
 Use local Codex from QQ private chats, QQ groups and a desktop plugin interface to handle conversations, run tasks and deliver files.
 
-**Current version: 0.0.5** · [中文](README.md) · [Changelog](CHANGELOG_EN.md) · [Source release](https://github.com/Medo-bao/QQ-Bot-by-Codex/releases/tag/v0.0.5)
+**Current version: 0.0.6** · [中文](README.md) · [Changelog](CHANGELOG_EN.md) · [Source release](https://github.com/Medo-bao/QQ-Bot-by-Codex/releases/tag/v0.0.6)
 
 QQ Bot connects Tencent's QQ Bot SDK to a local Codex App Server and reuses your Codex login, model providers and tools. DSH is not required. Adapted from [tencent-connect/dsh-qqbot](https://github.com/tencent-connect/dsh-qqbot), under the MIT license.
 
+Desktop/browser routing is saved in the local data directory and restored after the QQ daemon restarts. Opening the plugin or checking status from a Codex conversation refreshes its parent context. Native browser identity and site permissions still apply; reopen the plugin if the desktop app exits or changes accounts.
+
 ## Features
+
+Optional **Settings → Voice and timbre** connects GPT-Live using an existing OpenAI project API key, separately from Codex login and billing. The password field stores the key locally without returning it in status responses; `OPENAI_API_KEY` is also supported. Enable the feature and save before generating clips.
+
+`qqbot_live` generates bounded WAV speech clips with built-in voices or a custom voice ID. The settings page can create a voice from a text description, play/download the generated clip, and optionally send it as an original file or a QQ voice message. Conversation clips stay in their archived thread's `audio` folder; standalone previews stay in the bot's `voice-previews` directory. Failed delivery can be retried without generating again. Codex continues to handle reasoning and tools.
+
+The MCP tool starts an asynchronous job: use `action: "generate"`, then poll `action: "status"` with the same destination and `job_id`. Sending requires explicit `send_to_qq: true`. The scoped QQ dynamic tool waits for generation and reports its send receipt. `action: "create_voice"` returns a voice ID without changing global settings.
+
+Live does not emit an audio-done event. Clips use a configurable silence window and require `session.closed` finalization; interrupted, timed-out and cancelled clips are not delivered. This is speech generation, without guaranteed verbatim wording, music synthesis or continuous microphone-call UI. See [OpenAI Live WebSockets](https://developers.openai.com/api/docs/guides/voice-websockets) and [custom voices](https://developers.openai.com/api/docs/guides/custom-voices).
 
 | Feature | What it does |
 | --- | --- |
@@ -15,7 +25,7 @@ QQ Bot connects Tencent's QQ Bot SDK to a local Codex App Server and reuses your
 | Native Codex tasks | Available command, file, search and tool capabilities, with public reasoning summaries, plans, progress and results in the UI. |
 | Images and files | Receive attachments and deliver generated resources, with explicit file, preview and voice delivery choices. |
 | Other project conversations | Browse existing Codex desktop chats, inspect recent replies and status, dispatch work and return final text to QQ. |
-| Website login checks | Read-only checks through the attached Codex desktop browser. |
+| Authenticated webpage reads | Read exact URLs through the desktop browser's existing login session, or inspect login state separately. |
 | Context management | Token usage, custom context-window lengths, native automatic compaction, manual compaction and reset feedback. |
 | Local management UI | Collapsible bot groups, conversation settings, a bottom AI composer and a separate direct-send dialog. |
 
@@ -55,7 +65,7 @@ Reopen Codex or refresh its plugins, select **QQ Bot**, and ask to set it up. MC
 1. Open settings and select a local task workspace.
 2. Bind with mobile QQ, or enter AppID / AppSecret in the local settings page.
 3. Configure access. Private chats default to an allowlist and groups default to disabled. Send a message to discover its OpenID under recent message sources.
-4. Enable group access and allow the group and requester. Replies require **@bot** by default.
+4. Enable group access and allow the group and requester. Replies require **@bot** by default. Under Settings → Replies and prompts, enable “Reply to @everyone” to also respond to everyone mentions. It defaults to off; direct bot mentions still work when it is off.
 5. Start the connection and send a task through QQ or the plugin's AI composer. Auto-start is configurable in Runtime settings.
 
 Group context depends on events delivered by QQ. To record messages without a mention, enable the corresponding QQ platform capability. The plugin records received messages permitted by its access rules.
@@ -95,9 +105,11 @@ You can also ask in QQ or the plugin's AI composer:
 
 Busy targets wait until idle. Tasks keep the target's model, permissions and context. Pending dispatches can be cancelled; stop already-started work and handle its approvals in the original Codex conversation.
 
-### Check website login state
+### Read authenticated pages and check login state
 
-With desktop access enabled, ask the bot to check a website's login state in the Codex browser. `qqbot_browser` distinguishes signed in, signed out and unknown. Connection failures or HTTP 403 do not imply signed out. Native account and website access checks remain in force; this feature does not enter credentials or bypass verification.
+With desktop access enabled, ask the bot to read an X post, Bilibili page or another exact URL. `qqbot_browser(action="read", url="...")` returns visible page content, its source URL and a truncation flag using the browser's existing login. Use it when ordinary fetching encounters a login wall or HTTP 403. Temporary tabs are closed after reading; existing user tabs are preserved.
+
+Use `action="status"` only for login questions. It distinguishes signed in, signed out and unknown; successful login detection does not imply that article content was read. Reads wait for observed content loaders and report pending, blocked or unavailable content explicitly. Native account and site checks remain in force, without entering credentials, posting or bypassing verification.
 
 ### QQ commands
 
@@ -110,8 +122,11 @@ With desktop access enabled, ask the bot to check a website's login state in the
 | `/effort`, `/effort high` | Inspect or change reasoning effort |
 | `/stop` | Interrupt the current task and cancel queued tasks |
 | `/bot-status` | Conversation, queue and OpenID information |
+| `/bot-me` | Your sender OpenID, plus the group OpenID in group chats |
 | `/bot-ping`, `/bot-version`, `/bot-help` | Connectivity, version and help |
 | `/answer <request-id> <answer>` | Respond to a pending question or approval |
+
+These commands work in permitted private and group chats and retain the configured access rules and request-owner checks. Downloaded image suffixes follow the actual file header without re-encoding. See the [upstream adaptation record](docs/UPSTREAM_PORTS.md) for the migration scope.
 
 ## Local data
 

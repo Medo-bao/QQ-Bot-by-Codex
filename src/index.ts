@@ -1,9 +1,10 @@
 export { ConfigStore, configSchema, dataDirectory } from './config.ts';
+export { GptLive, liveConfigSchema, liveGenerateSchema } from './gpt-live.ts';
 export type { BotConfig } from './config.ts';
 export { CodexClient, codexExecutable } from './codex-client.ts';
 export { QQBridge, dynamicTools } from './bridge.ts';
 export { InteractionBroker } from './interactions.ts';
-export { MediaStore } from './media.ts';
+export { MediaStore, downloadFile } from './media.ts';
 export { QQTransport } from './qq-transport.ts';
 export { BotController } from './controller.ts';
 export { SetupPage } from './setup-page.ts';

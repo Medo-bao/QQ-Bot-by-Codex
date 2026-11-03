@@ -12,7 +12,9 @@ import { MediaStore, fileSendModeSchema } from './media.ts';
 import { readFile, stat } from 'node:fs/promises';
 import { basename, extname } from 'node:path';
 import { DesktopTasks } from './desktop-tasks.ts';
-import { BrowserAccess } from './browser-access.ts';
+import { BrowserAccess, browserEnvironmentKeys } from './browser-access.ts';
+import { GptLive } from './gpt-live.ts';
+import { DesktopAttachmentStore } from './desktop-attachment.ts';
 
 export class BotController {
   private bridge?: QQBridge;
@@ -25,9 +27,22 @@ export class BotController {
   private controlClient?: CodexClient;
   private readonly desktopTasks: DesktopTasks;
   private readonly browserAccess: BrowserAccess;
+  private readonly liveAudio: GptLive;
+  private readonly desktopAttachment: DesktopAttachmentStore;
   constructor(readonly store: ConfigStore, private readonly logger: Logger) {
     this.desktopTasks = new DesktopTasks(store.directory, logger, (target, text) => this.send(target, text), () => this.store.read().desktopControl);
     this.browserAccess = new BrowserAccess(store.directory, () => this.desktopTasks.browserContext());
+    this.liveAudio = new GptLive(() => this.store.read().live);
+    this.desktopAttachment = new DesktopAttachmentStore(store.directory, logger);
+    const pipePath = process.env.CODEX_APP_TOOLS_PIPE_PATH;
+    const threadId = process.env.CODEX_THREAD_ID || process.env.CODEX_SESSION_ID;
+    const desktop = pipePath && threadId ? this.desktopAttachment.update({ pipePath, threadId,
+      browserEnvironment: Object.fromEntries(browserEnvironmentKeys.flatMap(key => process.env[key] ? [[key, process.env[key]!]] : [])),
+    }) : this.desktopAttachment.read();
+    if (desktop) {
+      this.desktopTasks.attach(desktop.pipePath, desktop.threadId);
+      this.browserAccess.attach(desktop.browserEnvironment);
+    }
   }
 
   status() {
@@ -55,7 +70,8 @@ export class BotController {
     const client = new CodexClient(config, logger);
     const bridge = new QQBridge(config, this.store.directory, transport, client, logger,
       (target, params) => this.desktop(target.scope, target.targetId, params, target.replyUserId),
-      (target, url) => this.inspectBrowser(target.scope, target.targetId, url));
+      (target, url, action, maxChars) => this.inspectBrowser(target.scope, target.targetId, url, action, maxChars),
+      (target, params, signal) => this.live({ ...params, scope: target.scope, target_id: target.targetId, send_to_qq: false }, signal, true));
     this.bridge = bridge;
     transport.onDisconnected = (reason) => { if (this.bridge === bridge) { this.connected = false; this.lastError = reason; } };
     transport.onConnected = () => { if (this.bridge === bridge) { this.connected = true; this.lastError = undefined; } };
@@ -161,6 +177,7 @@ export class BotController {
   async login(): Promise<unknown> { return (await this.controls()).call('account/login/start', { type: 'chatgpt' }); }
 
   async dispose(): Promise<void> {
+    await this.liveAudio.close();
     await this.browserAccess.dispose();
     this.desktopTasks.close();
     this.cancelBinding(); await this.stop(); await this.controlClient?.close(); this.controlClient = undefined;
@@ -259,26 +276,85 @@ export class BotController {
     return this.desktopTasks.action({ scope, targetId: peerId, ...(replyUserId ? { replyUserId } : {}) }, params);
   }
 
-  private async inspectBrowser(scope: 'c2c' | 'group', peerId: string, url: string): Promise<unknown> {
+  private async inspectBrowser(scope: 'c2c' | 'group', peerId: string, url: string, action = 'status', maxChars?: number): Promise<unknown> {
     const config = this.store.read();
     if (!config.desktopControl) throw new Error('桌面会话与浏览器访问已关闭。');
     if (!['c2c', 'group'].includes(scope) || typeof peerId !== 'string' || typeof url !== 'string') throw new Error('需要有效的 QQ 会话和网站地址。');
     const key = `${config.appId}:${scope}:${peerId}`;
     const sessions = new SessionStore(this.store.directory);
     if (!sessions.entries().some(([id]) => id === key)) throw new Error('请先选择已有的 QQ 会话。');
-    if (sessionPermissions(config, sessions.get(key)).sandbox !== 'danger-full-access') throw new Error('查看桌面网站登录状态需要当前 QQ 会话使用完全访问权限。');
-    return this.browserAccess.inspect(url);
+    if (sessionPermissions(config, sessions.get(key)).sandbox !== 'danger-full-access') throw new Error('读取桌面网页需要当前 QQ 会话使用完全访问权限。');
+    if (action === 'status') return this.browserAccess.inspect(url);
+    if (action === 'read') return this.browserAccess.read(url, maxChars);
+    throw new Error('网页操作须为 status 或 read。');
+  }
+
+  private async live(params: Record<string, any>, signal?: AbortSignal, wait = false): Promise<unknown> {
+    const config = this.store.read();
+    let target: ReplyTarget | undefined;
+    if (params.scope !== undefined || params.target_id !== undefined) {
+      if (!['c2c', 'group'].includes(params.scope) || typeof params.target_id !== 'string' || !params.target_id) throw new Error('需要有效的 QQ 会话目标。');
+      target = { scope: params.scope, targetId: params.target_id };
+      if (!new SessionStore(this.store.directory).entries().some(([key]) => key === `${config.appId}:${target!.scope}:${target!.targetId}`)) throw new Error('请先选择已有的 QQ 会话。');
+    }
+    const owner = `${config.appId}:${target ? `${target.scope}:${target.targetId}` : 'voice-preview'}`;
+    const operation = params.action || 'status';
+    if (['generate', 'create_voice', 'retry_send'].includes(operation)) {
+      const saved = target ? new SessionStore(this.store.directory).get(`${config.appId}:${target.scope}:${target.targetId}`) : undefined;
+      const permissions = sessionPermissions(config, saved || {});
+      if (!permissions.networkAccess && permissions.sandbox !== 'danger-full-access') throw new Error('当前会话禁止联网，无法调用语音服务；请在会话设置中调整。');
+    }
+    const deliver = (id: string) => {
+      if (!target) throw new Error('发送语音需要选择 QQ 接收会话。');
+      const destination = target, mode = fileSendModeSchema.parse(params.send_as || 'file');
+      if (!this.connected) throw new Error('请先启动 QQ 连接再发送语音。');
+      return this.liveAudio.deliver(owner, id, async result => {
+        if (this.store.read().appId !== config.appId) throw new Error('机器人已切换，音频保留在原目录，请重新选择接收会话。');
+        await this.sendFile(destination, result.path, mode);
+      }, mode);
+    };
+    switch (operation) {
+      case 'status': return params.job_id ? this.liveAudio.get(owner, params.job_id) : { jobs: this.liveAudio.list(owner) };
+      case 'cancel': return this.liveAudio.cancel(owner, params.job_id);
+      case 'create_voice': return this.liveAudio.createVoice(params);
+      case 'retry_send': return deliver(params.job_id);
+      case 'preview': {
+        const job = this.liveAudio.get(owner, params.job_id);
+        if (!job.result || job.status !== 'completed') throw new Error('语音尚未生成完成。');
+        return { dataUrl: `data:audio/wav;base64,${(await readFile(job.result.path)).toString('base64')}` };
+      }
+      case 'generate': {
+        if (params.send_to_qq && (!target || !this.connected)) throw new Error('请先连接 QQ 并选择接收会话。');
+        const storage = new ConversationStorage(this.store.directory, config);
+        const session = target ? new SessionStore(this.store.directory).get(`${config.appId}:${target.scope}:${target.targetId}`) : undefined;
+        const job = this.liveAudio.start(owner, storage.audioDirectory(target, session?.threadId), params, signal);
+        if (params.send_to_qq) void deliver(job.id);
+        return wait ? this.liveAudio.wait(owner, job.id) : job;
+      }
+      default: throw new Error('未知 GPT-Live 操作。');
+    }
   }
 
   async invoke(action: string, params: Record<string, any> = {}): Promise<unknown> {
     switch (action) {
       case 'status': return this.status();
-      case 'desktopAttach':
-        if (typeof params.pipePath === 'string' && typeof params.threadId === 'string') this.desktopTasks.attach(params.pipePath, params.threadId);
-        this.browserAccess.attach(params.browserEnvironment);
+      case 'live': return this.live(params);
+      case 'liveCredentials': {
+        if (process.env.OPENAI_API_KEY) throw new Error('当前使用环境变量 OPENAI_API_KEY，请在本机环境中修改或移除后重试。');
+        if (params.clear !== true && (typeof params.apiKey !== 'string' || !params.apiKey.trim())) throw new Error('请输入现有 API Key。');
+        await this.configure({ live: { apiKey: params.clear === true ? '' : params.apiKey.trim() } });
+        return this.status();
+      }
+      case 'desktopAttach': {
+        const desktop = this.desktopAttachment.update(params);
+        if (desktop) {
+          this.desktopTasks.attach(desktop.pipePath, desktop.threadId);
+          this.browserAccess.attach(desktop.browserEnvironment);
+        }
         return { attached: this.desktopTasks.available };
+      }
       case 'desktop': return this.desktop(params.scope, params.target_id, params);
-      case 'browser': return this.inspectBrowser(params.scope, params.target_id, params.url);
+      case 'browser': return this.inspectBrowser(params.scope, params.target_id, params.url, params.action, params.max_chars);
       case 'start': return this.start();
       case 'stop': return this.stop();
       case 'configure':

@@ -110,12 +110,14 @@ export class CodexClient {
       ...(this.config.responsesTransport !== 'auto' ? ['-c', `model_providers.${openAIHttpProvider}={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=false}`] : []),
       '-c', 'plugins.codex-qqbot@qqbot-local.enabled=false',
       '-c', 'notify=[]',
+      '-c', 'shell_environment_policy.set.PYTHONUTF8="1"',
+      '-c', 'shell_environment_policy.set.PYTHONIOENCODING="utf-8"',
       '-c', 'developer_instructions=""', '-c', 'project_doc_max_bytes=0', '-c', 'personality="none"',
       '-c', 'memories.use_memories=false', '-c', 'memories.generate_memories=false'], {
       cwd: this.config.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
-      env: { ...process.env, CODEX_HOME: this.runtimeHome, QQBOT_BRIDGE_CHILD: '1' },
+      env: { ...process.env, CODEX_HOME: this.runtimeHome, QQBOT_BRIDGE_CHILD: '1', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' },
     });
     this.child = child;
     const lines = createInterface({ input: child.stdout });
@@ -123,7 +125,8 @@ export class CodexClient {
       try { this.receive(JSON.parse(line)); }
       catch (error) { this.logger.warn(`Codex protocol: ${error instanceof Error ? error.message : error}`); }
     });
-    child.stderr.on('data', (chunk: Buffer) => this.logger.debug(chunk.toString().trim()));
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk: string) => this.logger.debug(chunk.trim()));
     child.stdin.on('error', (error) => this.failed(error));
     child.on('error', (error) => {
       if (this.child === child) { this.child = undefined; this.starting = undefined; }
@@ -138,7 +141,7 @@ export class CodexClient {
       }
     });
     await this.call('initialize', {
-      clientInfo: { name: 'codex_qqbot', title: 'QQ Bot', version: '0.0.5' },
+      clientInfo: { name: 'codex_qqbot', title: 'QQ Bot', version: '0.0.6' },
       capabilities: { experimentalApi: true },
     });
     this.notify('initialized', {});

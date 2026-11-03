@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -8,10 +8,11 @@ import { createServer } from 'node:http';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { WebSocketServer } from 'ws';
+import { liveFixture } from './fixtures/live-server.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { ConfigStore, SessionStore, CodexClient, QQBridge, QQTransport, BotController, InteractionBroker, MediaStore, configSchema, callService, describeImage, dynamicTools, DesktopTasks,
-  ReplyLimiter, replyPolicy, cacheMsgId, getCachedReplyIds, resolveReplyTarget, serviceAddress, BrowserAccess } from '../dist/index.js';
+  ReplyLimiter, replyPolicy, cacheMsgId, getCachedReplyIds, resolveReplyTarget, serviceAddress, BrowserAccess, downloadFile, GptLive } from '../dist/index.js';
 
 const quiet = { info() {}, warn() {}, error() {}, debug() {} };
 const fixture = resolve('tests/fixtures/codex-server.mjs');
@@ -28,13 +29,154 @@ const currentText = turn => turn.params.input.find(input => input.type === 'text
 const groupContext = (turn) => JSON.parse(turn.params.input.find(input => input.type === 'text' && input.text.startsWith('[QQ Bot 群聊上下文：')).text.split('\n').slice(1).join('\n'));
 const referenceContext = turn => JSON.parse(turn.params.input.find(input => input.type === 'text' && input.text.startsWith('[QQ Bot 引用上下文：')).text.split('\n').slice(1).join('\n')).reference;
 class FakeQQ {
-  messages = []; files = []; streams = []; failedSends = 0; failNextMarkdown = false; fileDelayMs = 0;
+  messages = []; files = []; streams = []; failedSends = 0; failNextMarkdown = false; failNextFile = false; fileDelayMs = 0;
   async connect(onMessage, onInteraction) { this.onMessage = onMessage; this.onInteraction = onInteraction; }
   close() { this.closed = true; }
   async sendMarkdown(target, text, opts) { if (this.failNextMarkdown) { this.failNextMarkdown = false; this.failedSends++; throw new Error('fixture QQ delivery unavailable'); } const receipt = { id: 'sent-' + this.messages.length, ext_info: { ref_idx: 'sent-ref-' + this.messages.length } }; this.messages.push({ target, text, opts, receipt }); return receipt; }
-  async sendFile(target, path, fileName, sendAs = 'auto') { if (this.fileDelayMs) await new Promise(resolve => setTimeout(resolve, this.fileDelayMs)); const receipt = { id: 'file-' + this.files.length, ext_info: { ref_idx: 'file-ref-' + this.files.length } }; this.files.push({ target, path, fileName, sendAs, receipt }); return { upload: { file_info: 'fixture-media' }, message: receipt }; }
+  async sendFile(target, path, fileName, sendAs = 'auto') { if (this.failNextFile) { this.failNextFile = false; throw new Error('fixture file delivery unavailable'); } if (this.fileDelayMs) await new Promise(resolve => setTimeout(resolve, this.fileDelayMs)); const receipt = { id: 'file-' + this.files.length, ext_info: { ref_idx: 'file-ref-' + this.files.length } }; this.files.push({ target, path, fileName, sendAs, receipt }); return { upload: { file_info: 'fixture-media' }, message: receipt }; }
   openStream(target) { const receipt = { id: 'stream-' + this.streams.length, ext_info: { ref_idx: 'stream-ref-' + this.streams.length } }; const stream = { target, receipt, updates: [], completeCount: 0, async update(text) { this.updates.push(text); }, async complete() { this.completeCount++; return receipt; } }; this.streams.push(stream); return stream; }
 }
+
+test('GPT-Live finalizes WAV clips, keeps tail audio, isolates jobs and handles cancellation, failure and delivery retry', { timeout: 15000 }, async () => {
+  const directory = await temp(), peer = await liveFixture();
+  const config = configSchema.parse({ live: { enabled: true, apiKey: 'fixture-api-secret', silenceMs: 1000, maxDurationSeconds: 5 } }).live;
+  let voiceRequest;
+  const live = new GptLive(() => config, { socket: (url, key) => peer.socket(url, key), fetch: async (url, options) => {
+    voiceRequest = { url, body: JSON.parse(options.body), authorization: options.headers.Authorization };
+    return new Response(JSON.stringify({ id: 'voice_fixture', name: '新音色' }), { status: 200 });
+  } });
+  try {
+    const initial = live.start('bot:c2c:alice', directory, { text: '你好，语音接口已接入。', voice_id: 'voice_fixture' });
+    assert.throws(() => live.get('bot:group:team', initial.id), /其他会话/);
+    const job = await live.wait('bot:c2c:alice', initial.id);
+    assert.equal(job.status, 'completed'); assert.equal(job.result.finalized, true);
+    assert.equal(job.result.transcript, '你好，语音接口已接入。'); assert.equal(job.result.stopReason, 'silence');
+    assert.equal(job.result.usage.seconds, 1.1);
+    const bytes = await readFile(job.result.path);
+    assert.equal(bytes.toString('ascii', 0, 4), 'RIFF'); assert.equal(bytes.readUInt32LE(24), 24000);
+    assert.equal(bytes.readUInt32LE(40), bytes.length - 44);
+    assert.equal(bytes.readInt16LE(bytes.length - 2), 4000, 'audio arriving after close request but before final event is retained');
+    assert.ok(!JSON.stringify(job).includes('fixture-api-secret'));
+    const record = peer.requests[0];
+    assert.equal(record.authorization, 'Bearer fixture-api-secret');
+    assert.equal(record.events[0].type, 'session.start');
+    assert.equal(record.events[0].session.store, false);
+    assert.deepEqual(record.events[0].session.audio.output.voice, { id: 'voice_fixture' });
+    assert.ok(record.events.some(event => event.type === 'session.close'));
+    let attempts = 0;
+    const failed = await live.deliver(job.owner, job.id, async () => { attempts++; throw new Error('fixture QQ unavailable'); });
+    assert.equal(failed.delivery, 'failed'); assert.equal(failed.status, 'completed');
+    live.cancel(job.owner, job.id);
+    await Promise.all([live.deliver(job.owner, job.id, async () => { attempts++; }), live.deliver(job.owner, job.id, async () => { attempts++; })]);
+    await live.deliver(job.owner, job.id, async () => { attempts++; });
+    assert.equal(attempts, 2, 'failed delivery retries once; concurrent and repeated success calls do not duplicate');
+    assert.equal(peer.requests.length, 1, 'retry never regenerates speech');
+    const voice = await live.createVoice({ name: '新音色', prompt: '成年女性声音，清晰温柔。' });
+    assert.equal(voice.id, 'voice_fixture'); assert.equal(voiceRequest.url, 'https://api.openai.com/v1/audio/voices');
+    assert.deepEqual(voiceRequest.body, { type: 'prompt', name: '新音色', prompt: '成年女性声音，清晰温柔。' });
+    peer.setMode('hold');
+    const running = live.start('bot:c2c:alice', directory, { text: '等待取消' });
+    assert.throws(() => live.start('bot:c2c:alice', directory, { text: '重复请求' }), /已有语音/);
+    await waitFor(() => live.get(running.owner, running.id).status === 'generating');
+    live.cancel(running.owner, running.id);
+    assert.equal((await live.wait(running.owner, running.id)).status, 'cancelled');
+    peer.setMode('error');
+    const errorJob = live.start('bot:c2c:alice', directory, { text: '测试拒绝' });
+    const rejected = await live.wait(errorJob.owner, errorJob.id);
+    assert.equal(rejected.status, 'failed'); assert.ok(!rejected.error.includes('fixture-api-secret'));
+    peer.setMode('filtered');
+    const filtered = live.start('bot:c2c:alice', directory, { text: '提前结束测试' });
+    assert.match((await live.wait(filtered.owner, filtered.id)).error, /提前结束/);
+    peer.setMode('disconnect');
+    const lost = live.start('bot:c2c:alice', directory, { text: '断线测试' });
+    assert.match((await live.wait(lost.owner, lost.id)).error, /session.closed/);
+    peer.setMode('hold');
+    const timed = live.start('bot:c2c:alice', directory, { text: '超时测试' });
+    assert.match((await live.wait(timed.owner, timed.id)).error, /时长上限/);
+    assert.deepEqual((await readdir(directory)).filter(name => name.endsWith('.wav')), [job.result.path.split(/[\\/]/).at(-1)], 'incomplete jobs leave no audio files');
+    config.enabled = false;
+    assert.throws(() => live.start('owner', directory, { text: '禁用' }), /尚未启用/);
+  } finally { await live.close(); await peer.close(); }
+});
+
+test('GPT-Live uses the real QQ dynamic-tool round trip, archives per thread, sends once and honors network restrictions', { timeout: 15000 }, async () => {
+  const directory = await temp(), peer = await liveFixture();
+  const config = configSchema.parse({ appId: 'live-bot', cwd: directory, codexCommand: fixture, codexArgs: [directory],
+    access: { c2cMode: 'open', groupMode: 'open' }, live: { enabled: true, apiKey: 'fixture-api-secret', silenceMs: 1000 } });
+  const live = new GptLive(() => config.live, { socket: (url, key) => peer.socket(url, key) });
+  const qq = new FakeQQ(), client = new CodexClient(config, quiet);
+  let bridge;
+  bridge = new QQBridge(config, directory, qq, client, quiet, undefined, undefined, async (target, params, signal) => {
+    const session = bridge.status().sessions.find(item => item.scope === target.scope && item.peerId === target.targetId);
+    const output = bridge.storage.audioDirectory(target, session.threadId);
+    const job = live.start(`${target.scope}:${target.targetId}`, output, params, signal);
+    return live.wait(job.owner, job.id);
+  });
+  try {
+    await bridge.start();
+    await bridge.handleMessage(message('gpt-live-check voice', 'group', 'team', 'alice'));
+    await waitFor(() => requireTrace(directory).some(item => item.liveAudio));
+    await waitFor(() => bridge.status().sessions.every(item => !item.busy && !item.queued));
+    const sent = requireTrace(directory).find(item => item.liveAudio).liveAudio;
+    assert.equal(sent.success, true);
+    const metadata = JSON.parse(sent.contentItems[0].text);
+    assert.equal(metadata.sent, true); assert.equal(metadata.send_as, 'voice');
+    assert.equal(qq.files.length, 1, 'the final file link does not resend an already delivered clip');
+    assert.equal(qq.files[0].sendAs, 'voice');
+    assert.ok(qq.files[0].path.startsWith(bridge.storage.paths({ scope: 'group', targetId: 'team' }).directory));
+    assert.match(qq.files[0].path, /audio[\\/]gpt-live-/);
+    const start = requireTrace(directory).find(item => item.method === 'thread/start');
+    assert.ok(start.params.dynamicTools.some(tool => tool.name === 'qqbot_live'));
+    const session = bridge.status().sessions[0];
+    await bridge.manageSession('group', 'team', 'configure', { networkAccess: 'disabled', sandbox: 'workspace-write' });
+    await bridge.handleMessage(message('gpt-live-check file', 'group', 'team', 'alice'));
+    await waitFor(() => requireTrace(directory).filter(item => item.liveAudio).length === 2);
+    await waitFor(() => bridge.status().sessions.every(item => !item.busy && !item.queued));
+    const denied = requireTrace(directory).filter(item => item.liveAudio).at(-1).liveAudio;
+    assert.equal(denied.success, false); assert.match(denied.contentItems[0].text, /禁止联网/);
+    assert.equal(peer.requests.length, 1); assert.equal(qq.files.length, 1);
+    assert.equal(bridge.status().sessions[0].threadId, session.threadId);
+  } finally { await bridge.close(); await live.close(); await peer.close(); }
+});
+
+test('Session persistence merges independent writers without losing other conversations and refuses corrupt history maps', async () => {
+  const directory = await temp(), first = new SessionStore(directory), second = new SessionStore(directory);
+  const alice = { threadId: 'alice-thread', name: '原私聊', prompt: '独立角色', sandbox: 'read-only' };
+  const group = { threadId: 'group-thread', name: '原群聊', model: 'group-model', previousThreadId: 'old-group-thread' };
+  first.set('app:c2c:alice', alice);
+  second.set('app:group:team', group);
+  first.set('app:c2c:alice', { ...alice, name: '已重命名' });
+  const restored = new SessionStore(directory);
+  assert.deepEqual(restored.get('app:group:team'), group, 'a stale writer preserves another peer saved since it was opened');
+  assert.deepEqual(restored.get('app:c2c:alice'), { ...alice, name: '已重命名' });
+  const healthy = await readFile(join(directory, 'sessions.json'), 'utf8');
+  await writeFile(join(directory, 'sessions.json'), '{"truncated":');
+  await assert.rejects(async () => first.set('app:c2c:alice', { ...alice, name: 'must not overwrite' }), SyntaxError);
+  assert.equal(await readFile(join(directory, 'sessions.json'), 'utf8'), '{"truncated":');
+  await writeFile(join(directory, 'sessions.json'), healthy);
+  second.set('other-bot:c2c:bob', { threadId: 'another-bot-thread', contextWindow: 128000 });
+  const all = JSON.parse(await readFile(join(directory, 'sessions.json'), 'utf8'));
+  assert.equal(Object.keys(all).length, 3); assert.equal(all['app:c2c:alice'].threadId, 'alice-thread');
+  assert.ok((await readdir(directory)).every(path => !path.endsWith('.tmp')), 'successful saves leave no temporary files');
+});
+
+test('Binding QR failures retain manual and link fallback and stale rendering cannot replace a refreshed code', async () => {
+  const { transform } = await import('esbuild');
+  const { code } = await transform(await readFile('src/ui/binding-qr.ts', 'utf8'), { loader: 'ts', format: 'esm' });
+  const { renderBindingQr } = await import('data:text/javascript;base64,' + Buffer.from(code).toString('base64'));
+  const image = { dataset: {}, style: {}, src: '', removeAttribute(name) { if (name === 'src') this.src = ''; } }, link = {}, status = {};
+  await renderBindingQr(image, link, status, 'https://q.qq.com/first', async () => { throw new Error('qrcode interop unavailable'); });
+  assert.equal(image.style.display, 'none'); assert.equal(link.href, 'https://q.qq.com/first'); assert.equal(link.hidden, false);
+  assert.equal(status.hidden, false); assert.match(status.textContent, /手动绑定/);
+  let release;
+  const old = renderBindingQr(image, link, status, 'https://q.qq.com/old', () => new Promise(resolve => { release = resolve; }));
+  await renderBindingQr(image, link, status, 'https://q.qq.com/new', async () => ({ dataUrl: 'data:image/png;base64,new' }));
+  release({ dataUrl: 'data:image/png;base64,old' }); await old;
+  assert.equal(image.src, 'data:image/png;base64,new'); assert.equal(link.href, 'https://q.qq.com/new'); assert.equal(status.hidden, true);
+  image.onerror(); assert.equal(image.style.display, 'none'); assert.equal(status.hidden, false); assert.equal(link.hidden, false);
+  await renderBindingQr(image, link, status, '', async () => { throw new Error('no code should be requested'); });
+  assert.equal(image.src, ''); assert.equal(image.style.display, 'none'); assert.equal(status.hidden, true); assert.equal(link.hidden, true);
+});
 
 test('Persisted QQ tools refresh complete indexes without replacing history or unrelated tools', async () => {
   const { DatabaseSync } = await import('node:sqlite');
@@ -155,6 +297,12 @@ test('Desktop dispatch preserves original threads, queues busy targets, scopes j
   await assert.rejects(controller.invoke('session', payload), /完全访问/);
   store.update({ sandbox: 'danger-full-access' });
   assert.equal((await controller.invoke('session', payload)).threads.length, 2);
+  const desktopEnvironment = Object.fromEntries(['CODEX_APP_TOOLS_PIPE_PATH', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID'].map(key => [key, process.env[key]]));
+  try {
+    for (const key of Object.keys(desktopEnvironment)) delete process.env[key];
+    await controller.dispose(); controller = new BotController(store, quiet);
+    assert.equal((await controller.invoke('session', payload)).threads.length, 2, 'desktop routing is restored after a clean daemon restart without another attach call');
+  } finally { for (const [key, value] of Object.entries(desktopEnvironment)) if (value === undefined) delete process.env[key]; else process.env[key] = value; }
   store.update({ desktopControl: false }); await assert.rejects(controller.invoke('session', payload), /已关闭/);
   assert.ok(!desktop.calls.some(call => /thread\/start|thread\/resume|turn\/interrupt/.test(call.method)), 'only the desktop app controls its existing threads');
   assert.ok(!desktop.calls.some(call => call.params?.tool === 'wait_threads'), 'background monitoring works after the calling desktop turn has completed');
@@ -219,7 +367,81 @@ test('Streaming delivery only confirms sent text and falls back when the final u
   }
 });
 
-test('Browser login checks initialize desktop CUA, preserve user tabs, enforce permissions and distinguish failure from signed out', { timeout: 10000 }, async t => {
+test('QQ replies render native file citations across streaming and static delivery, preserve Unicode and send only declared outputs', { timeout: 10000 }, async () => {
+  const { transform } = await import('esbuild');
+  const loadModule = async path => {
+    const { code } = await transform(await readFile(path, 'utf8'), { loader: 'ts', format: 'esm' });
+    return import('data:text/javascript;base64,' + Buffer.from(code).toString('base64'));
+  };
+  const { assistantText, fileCitations } = await loadModule('src/message-format.ts');
+  const { chunkMarkdownText } = await loadModule('src/transport/chunker.ts');
+  const citation = ':codex-file-citation{path="C:\\资料\\中文😀.pdf" purpose="source"}';
+  assert.deepEqual(fileCitations(citation), [{ path: 'C:\\资料\\中文😀.pdf', purpose: 'source' }]);
+  assert.equal(assistantText(citation, 'qq'), '（来源：中文😀.pdf）');
+  assert.equal(assistantText(citation, 'ui'), '[来源：中文😀.pdf](<C:\\资料\\中文😀.pdf>)');
+  assert.equal(fileCitations(':codex-file-citation{path="\\\\server\\共享\\原文.pdf" purpose="source"}')[0].path, '\\\\server\\共享\\原文.pdf');
+  for (let end = 1; end < citation.length; end++) {
+    assert.equal(assistantText(citation.slice(0, end), 'qq', true), '', 'an incomplete directive never leaks through a delta');
+  }
+  const code = '```text\n' + citation + '\n```\n`' + citation + '`';
+  assert.equal(assistantText(code, 'qq'), code, 'code examples remain literal'); assert.deepEqual(fileCitations(code), []);
+  assert.equal(assistantText('你好\uD83D', 'qq', true), '你好');
+  assert.equal(assistantText('你好😀', 'qq', true), '你好😀');
+  const long = '中'.repeat(99) + '😀'.repeat(200) + '尾';
+  const chunks = chunkMarkdownText(long, 100);
+  assert.equal(chunks.join(''), long); assert.ok(chunks.every(part => part.length <= 100 && part.isWellFormed()));
+
+  const directory = await temp();
+  const config = configSchema.parse({ appId: 'fixture-app', appSecret: 'fixture-secret', cwd: directory,
+    codexCommand: fixture, codexArgs: [directory], access: { c2cMode: 'open', groupMode: 'open' } });
+  const qq = new FakeQQ(), client = new CodexClient(config, quiet), bridge = new QQBridge(config, directory, qq, client, quiet);
+  await bridge.start();
+  try {
+    await bridge.handleMessage(message('citation-format-probe'));
+    await bridge.handleMessage(message('citation-format-probe', 'group', 'team'));
+    assert.equal(qq.streams.length, 1); assert.match(qq.streams[0].updates.at(-1), /已读完😀/);
+    assert.ok(qq.streams[0].updates.every(text => text.isWellFormed() && !text.includes('codex-file-citation')));
+    assert.equal(qq.messages.filter(item => item.target.scope === 'c2c').length, 0, 'a successful normalized stream needs no duplicate static reply');
+    assert.match(qq.messages.find(item => item.target.scope === 'group').text, /来源：来源😀.pdf/);
+    assert.ok(qq.messages.every(item => !item.text.includes('codex-file-citation') && !item.text.includes(directory)));
+    assert.equal(qq.files.length, 2); assert.ok(qq.files.every(file => file.fileName === '输出😀.txt'), 'source citations are never sent and repeated outputs are deduplicated');
+    const trace = requireTrace(directory);
+    assert.deepEqual(trace.find(item => item.environment).environment, { pythonUtf8: '1', pythonIoEncoding: 'utf-8' });
+    assert.ok(trace.find(item => item.launch).launch.includes('shell_environment_policy.set.PYTHONIOENCODING="utf-8"'));
+    assert.ok(trace.filter(item => item.method === 'turn/start').every(item => item.params.input.some(input => input.text?.includes('pypdf 或 pdfplumber'))));
+  } finally { await bridge.close(); }
+});
+
+test('Completed generated images reach QQ before the final answer, deduplicate explicit sends and retain opt-out and failure feedback', { timeout: 10000 }, async () => {
+  const directory = await temp(), config = configSchema.parse({ appId: 'fixture-app', appSecret: 'fixture-secret', cwd: directory,
+    codexCommand: fixture, codexArgs: [directory], access: { c2cMode: 'open', groupMode: 'open' } });
+  const qq = new FakeQQ(), client = new CodexClient(config, quiet), bridge = new QQBridge(config, directory, qq, client, quiet);
+  await bridge.start();
+  try {
+    const first = bridge.handleMessage(message('auto-image-probe hold-image'));
+    await waitFor(() => qq.files.length === 1 && bridge.broker.list().length === 1);
+    assert.ok(bridge.status().sessions.find(session => session.scope === 'c2c').busy, 'image delivery does not wait for model text or turn completion');
+    await bridge.handleMessage(message('1')); await first;
+    assert.equal(qq.files.length, 1, 'terminal payload does not resend the completed image');
+    await bridge.handleMessage(message('auto-image-probe explicit-send', 'group', 'team'));
+    assert.equal(qq.files.length, 2, 'automatic and explicit delivery share the same file queue and deduplication');
+    await bridge.handleMessage(message('auto-image-probe terminal-only'));
+    assert.equal(qq.files.length, 3, 'terminal-only generation results are delivered without a final text message');
+    await bridge.handleMessage(message('auto-image-probe failed-generation'));
+    assert.equal(qq.files.length, 3, 'failed generations are not delivered');
+    config.sendFile.sendPresentedFiles = false;
+    await bridge.handleMessage(message('auto-image-probe'));
+    assert.equal(qq.files.length, 3, 'the existing automatic delivery opt-out is respected');
+    config.sendFile.sendPresentedFiles = true;
+    qq.failNextFile = true;
+    await bridge.handleMessage(message('auto-image-probe'));
+    assert.equal(qq.files.length, 3);
+    assert.equal(qq.messages.filter(item => item.text.includes('图片已生成，但发送到 QQ 失败')).length, 1, 'failed delivery reports once, keeps the image, and does not claim it was sent');
+    assert.ok(bridge.status().sessions.every(session => !session.busy && session.queued === 0));
+  } finally { await bridge.close(); }
+});
+
+test('Browser page reads and login checks use desktop CUA, preserve tabs, route exact URLs and retain permission/error boundaries', { timeout: 10000 }, async t => {
   const directory = await temp();
   const runtime = join(process.env.CODEX_HOME, 'plugins/cache/openai-bundled/unified-computer-use/0.0.1');
   await mkdir(runtime, { recursive: true }); await mkdir(join(directory, 'codex-home'));
@@ -247,19 +469,86 @@ test('Browser login checks initialize desktop CUA, preserve user tabs, enforce p
   await mode({ error: 'Local browser use is disabled in Work settings' });
   const denied = await access.inspect('https://x.com/'); assert.equal(denied.state, 'unknown'); assert.match(denied.reason, /disabled/);
   const count = calls().length; assert.equal((await access.inspect('file:///private')).state, 'unknown'); assert.equal(calls().length, count);
+  const article = '- button "Account menu":\n- article "Latest post":\n  - text: 已登录网页正文 🐱\n  - link "Post":\n    - /url: /author/status/123\n' + '字🐱'.repeat(1000);
+  await mode({ url: 'https://x.com/author', snapshot: article });
+  const beforeRead = calls().length;
+  const page = await access.read('https://x.com/author', 1000);
+  assert.equal(page.status, 'ok'); assert.equal(page.login.state, 'signed_in'); assert.match(page.content, /已登录网页正文/);
+  assert.equal(page.truncated, true); assert.equal(Array.from(page.content).length, 1000); assert.ok(!page.content.endsWith('\uD83D'));
+  assert.ok(calls().slice(beforeRead).some(call => call.code.includes('createBrowserTab') && call.code.includes('https://x.com/author')), 'reading another path does not silently reuse the existing homepage');
+  assert.ok(calls().slice(beforeRead).some(call => call.code === 'await qqLoginTab.close();'), 'only the newly created read tab is closed');
+  const exactStart = calls().length;
+  await mode({ tabs: [{ id: 'exact-profile', url: 'https://x.com/author' }], url: 'https://x.com/author', snapshot: article });
+  assert.equal((await access.read('https://x.com/author')).status, 'ok');
+  assert.ok(!calls().slice(exactStart).some(call => call.code.includes('createBrowserTab') || call.code.includes('.close()')), 'an exact user tab is read without navigation or closure');
+  await mode({ tabs: [], url: 'https://x.com/author', snapshot: article });
+  assert.equal((await access.read('https://twitter.com/author')).status, 'ok', 'canonical Twitter redirects retain authenticated reading');
+  await mode({ tabs: [], url: 'https://www.bilibili.com/video/example', snapshot: '- heading "Video details"\n- text: 视频页面可见介绍' });
+  assert.equal((await access.read('https://bilibili.com/video/example')).status, 'ok', 'www canonical redirects retain the requested site');
+  const loading = '- button "Account menu":\n- progressbar "Loading posts by @author":';
+  await mode({ url: 'https://x.com/author', snapshots: [loading, '- region "Author posts":\n  - progressbar:', article] });
+  assert.match((await access.read('https://x.com/author')).content, /已登录网页正文/);
+  assert.ok(calls().some(call => call.code.includes('.waitFor(') && call.code.includes('Loading posts by @author')), 'wait for the observed content loader rather than returning navigation as an article');
+  assert.ok(calls().some(call => call.code.includes('"region"') && call.code.includes('Author posts')), 'handle profile-shell and timeline loading as distinct observed stages');
+  await mode({ url: 'https://x.com/author', snapshot: loading });
+  const pending = await access.read('https://x.com/author'); assert.equal(pending.status, 'unavailable'); assert.equal(pending.content, ''); assert.match(pending.reason, /仍在加载/);
+  await mode({ url: 'https://x.com/author', snapshot: '- button "Account menu":\n- text: Something went wrong. Try reloading.' });
+  const partial = await access.read('https://x.com/author'); assert.equal(partial.status, 'blocked'); assert.equal(partial.login.state, 'signed_in', 'timeline access errors do not erase visible account login evidence');
+  await mode({ url: 'https://x.com/author', snapshot: '- heading "Forbidden"\n403' });
+  const blocked = await access.read('https://x.com/author'); assert.equal(blocked.status, 'blocked'); assert.equal(blocked.login.state, 'unknown'); assert.equal(blocked.content, '');
+  await mode({ url: 'https://other.example/login', snapshot: article });
+  assert.equal((await access.read('https://x.com/author')).status, 'unavailable', 'unrelated redirects are not returned as target content');
+  await mode({ error: 'Local browser use is disabled in Work settings' });
+  assert.equal((await access.read('https://x.com/author')).status, 'unavailable');
+  const invalidStart = calls().length;
+  assert.equal((await access.read('file:///private')).status, 'unavailable');
+  assert.equal((await access.read('https://x.com/author', 0)).status, 'unavailable');
+  assert.equal(calls().length, invalidStart);
   await mode({ snapshot: '- button "Account menu":\n- link "Profile":\n  - /url: /fixture_user' });
   const config = configSchema.parse({ appId: 'browser-fixture', appSecret: 'fixture-secret', cwd: directory, codexCommand: fixture, codexArgs: [directory], sandbox: 'danger-full-access', access: { c2cMode: 'open' } });
   const qq = new FakeQQ(); const client = new CodexClient(config, quiet);
-  bridge = new QQBridge(config, directory, qq, client, quiet, undefined, (_target, url) => access.inspect(url));
+  bridge = new QQBridge(config, directory, qq, client, quiet, undefined, (_target, url, action, maxChars) => action === 'read' ? access.read(url, maxChars) : access.inspect(url));
   await bridge.start(); await bridge.handleMessage(message('browser-login-check'));
   const result = requireTrace(directory).find(item => item.browserLogin).browserLogin;
   assert.equal(result.success, true); assert.match(JSON.stringify(result.contentItems), /signed_in/);
   const turn = requireTrace(directory).find(item => item.method === 'turn/start');
   assert.ok(turn.params.input.some(item => item.text?.includes('调用 qqbot_browser')));
+  assert.ok(turn.params.input.some(item => item.text?.includes('action="read"') && item.text.includes('403')));
+  await mode({ url: 'https://x.com/author', snapshot: article });
+  await bridge.handleMessage(message('browser-read-check'));
+  const readResult = requireTrace(directory).find(item => item.browserRead).browserRead;
+  assert.equal(readResult.success, true); assert.match(JSON.stringify(readResult.contentItems), /已登录网页正文/);
+  const readPage = JSON.parse(readResult.contentItems[0].text);
+  assert.equal(readPage.status, 'ok'); assert.equal(Array.from(readPage.content).length, 1200);
   const store = new ConfigStore(directory); store.update(config); controller = new BotController(store, quiet);
   new SessionStore(directory).set('browser-fixture:c2c:alice', { threadId: 'retained-thread', sandbox: 'read-only' });
   await assert.rejects(controller.invoke('browser', { scope: 'c2c', target_id: 'alice', url: 'https://x.com/' }), /完全访问/);
+  await assert.rejects(controller.invoke('browser', { scope: 'c2c', target_id: 'alice', url: 'https://x.com/author', action: 'read' }), /完全访问/);
   store.update({ desktopControl: false }); await assert.rejects(controller.invoke('browser', { scope: 'c2c', target_id: 'alice', url: 'https://x.com/' }), /已关闭/);
+  const { desktopFixture } = await import('./fixtures/desktop-server.mjs');
+  const desktop = await desktopFixture(directory); t.after(() => desktop.close());
+  store.update({ desktopControl: true });
+  new SessionStore(directory).set('browser-fixture:c2c:alice', { threadId: 'retained-thread', sandbox: 'danger-full-access' });
+  await controller.invoke('desktopAttach', { pipePath: desktop.pipePath, threadId: desktop.owner,
+    browserEnvironment: Object.fromEntries(Object.keys(previous).map(key => [key, process.env[key]])) });
+  const binding = JSON.parse(await readFile(join(directory, 'desktop-attachment.json'), 'utf8'));
+  assert.equal(binding.threadId, desktop.owner); assert.equal(binding.browserEnvironment.BROWSER_USE_ACCESS_PIPE_PATH, 'fixture-pipe');
+  assert.ok(!JSON.stringify(controller.status()).includes('fixture-key'), 'persisted browser routing is never included in public status');
+  const routingEnvironment = Object.fromEntries(['CODEX_APP_TOOLS_PIPE_PATH', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID', ...Object.keys(previous)].map(key => [key, process.env[key]]));
+  try {
+    for (const key of Object.keys(routingEnvironment)) delete process.env[key];
+    await controller.dispose(); controller = new BotController(store, quiet);
+    await mode({ url: 'https://x.com/author', snapshot: article });
+    const restored = await controller.invoke('browser', { scope: 'c2c', target_id: 'alice', url: 'https://x.com/author', action: 'read', max_chars: 1200 });
+    assert.equal(restored.status, 'ok'); assert.match(restored.content, /已登录网页正文/);
+    assert.equal(calls().at(-1).meta.thread_id, desktop.owner, 'the restored browser still uses the verified desktop caller');
+    const authPath = join(directory, 'codex-home/auth.json'); const originalAuth = await readFile(authPath, 'utf8');
+    try {
+      const changed = JSON.parse(originalAuth); changed.tokens.account_id = 'different-account'; await writeFile(authPath, JSON.stringify(changed));
+      const rejected = await controller.invoke('browser', { scope: 'c2c', target_id: 'alice', url: 'https://x.com/author', action: 'read' });
+      assert.equal(rejected.status, 'unavailable'); assert.match(rejected.reason, /账号|身份/);
+    } finally { await writeFile(authPath, originalAuth); }
+  } finally { for (const [key, value] of Object.entries(routingEnvironment)) if (value === undefined) delete process.env[key]; else process.env[key] = value; }
 });
 
 test('QQ → real JSONL child process: isolation, streaming, approvals, questions, file delivery, cancel and resume', { timeout: 30000 }, async t => {
@@ -632,6 +921,17 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     assert.equal(completed.activities.find(item => item.id === command.id).detail, 'Get-Date\nfixture working\nfixture done\n');
     assert.doesNotMatch(JSON.stringify(completed), /must-not-display/);
     assert.ok(qq.messages.every(item => !item.text.includes('核对完成')) && qq.streams.every(item => item.updates.every(text => !text.includes('核对完成'))), 'reasoning summaries remain in the local UI rather than becoming QQ replies');
+    const beforeIdentity = requireTrace(directory).filter(item => item.method === 'turn/start').length;
+    const identityThreads = bridge.status().sessions.map(session => session.threadId);
+    await bridge.handleMessage(message('/bot-me', 'group', 'team', 'bob'));
+    assert.equal(qq.messages.at(-1).text, '你的 OpenID：bob\n本群 OpenID：team');
+    await bridge.handleMessage(message('/bot-me'));
+    assert.equal(qq.messages.at(-1).text, '你的 OpenID：alice');
+    const beforeDenied = qq.messages.length;
+    for (const command of ['/model fixture-model', '/preset coding', '/bot-me']) await bridge.handleMessage(message(command, 'group', 'team', 'mallory'));
+    assert.equal(qq.messages.length, beforeDenied, 'identity and administrative commands retain the configured whitelist gate');
+    assert.equal(requireTrace(directory).filter(item => item.method === 'turn/start').length, beforeIdentity, 'identity queries do not consume an AI turn');
+    assert.deepEqual(bridge.status().sessions.map(session => session.threadId), identityThreads);
   } finally { await bridge.close(); }
   const oldSessions = JSON.parse(await readFile(join(directory, 'sessions.json'), 'utf8'));
   oldSessions['fixture-app:group:history-team'] = { ...oldSessions['fixture-app:group:team'], threadId: 'existing-group-thread' };
@@ -1053,6 +1353,63 @@ test('Passive replies honor private/group windows and quotas without reviving ex
   assert.equal(resolveReplyTarget(memberTarget, memberLimiter, false).msgId, undefined, 'exhausted Alice replies must not be anchored to Bob messages');
 });
 
+test('Downloads retry one transient connection failure within one deadline, retain network causes and preserve media limits', { timeout: 10000 }, async () => {
+  const directory = await temp();
+  const formats = { gif: Buffer.from('47494638396101000100', 'hex'), jpg: Buffer.from('ffd8ffe000104a46494600', 'hex'), png: Buffer.from('89504e470d0a1a0a0000', 'hex'),
+    webp: Buffer.from('524946460000000057454250', 'hex'), bmp: Buffer.from('424d000000000000', 'hex'), unknown: Buffer.from([0xff]) };
+  const server = createServer((request, response) => {
+    if (request.url.startsWith('/format/')) { const format = request.url.split('/')[2].split('.')[0]; response.setHeader('content-type', 'image/png'); response.end(formats[format]); return; }
+    if (request.url === '/missing') { response.writeHead(404); response.end('missing'); return; }
+    if (request.url === '/large') { response.setHeader('content-length', 500); response.end(Buffer.alloc(500)); return; }
+    response.setHeader('content-type', 'image/png');
+    if (request.url === '/cut') { response.writeHead(200); response.write('partial'); setTimeout(() => response.destroy(), 10); return; }
+    response.end('download-fixture');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`, originalFetch = globalThis.fetch, attempts = new Map(), signals = new Map();
+  globalThis.fetch = async (input, options) => {
+    const url = new URL(input), key = url.pathname;
+    const count = (attempts.get(key) || 0) + 1; attempts.set(key, count);
+    const used = signals.get(key) || []; used.push(options.signal); signals.set(key, used);
+    if (['/transient', '/attachment'].includes(key) && count === 1 || key === '/offline') {
+      throw new TypeError('fetch failed', { cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }) });
+    }
+    if (key === '/certificate') throw new TypeError('fetch failed', { cause: Object.assign(new Error('certificate has expired'), { code: 'CERT_HAS_EXPIRED' }) });
+    return originalFetch(input, options);
+  };
+  try {
+    const file = await downloadFile(base + '/transient', directory, 1);
+    assert.equal(await readFile(file, 'utf8'), 'download-fixture'); assert.ok(file.endsWith('.png'));
+    assert.equal(attempts.get('/transient'), 2); assert.equal(signals.get('/transient')[0], signals.get('/transient')[1], 'retries share the total timeout');
+    const media = new MediaStore(directory, configSchema.parse({ cwd: directory, media: { maxMB: 1 } }));
+    let downloaded;
+    const input = await media.inputs([{ url: base + '/attachment', filename: '群聊图片😀.png', content_type: 'image/png', size: 16 }], directory, path => { downloaded = path; });
+    assert.equal(attempts.get('/attachment'), 2); assert.equal(await readFile(downloaded, 'utf8'), 'download-fixture');
+    assert.ok(input.some(part => part.type === 'localImage' && part.path === downloaded));
+    const kept = (await readdir(directory)).sort();
+    await assert.rejects(downloadFile(base + '/offline', directory, 1), /127\.0\.0\.1.*fetch failed.*ECONNRESET/);
+    assert.equal(attempts.get('/offline'), 2, 'a persistent network outage stops after one retry');
+    await assert.rejects(downloadFile(base + '/certificate', directory, 1), /CERT_HAS_EXPIRED/); assert.equal(attempts.get('/certificate'), 1);
+    await assert.rejects(downloadFile(base + '/missing', directory, 1), /HTTP 404/); assert.equal(attempts.get('/missing'), 1);
+    await assert.rejects(downloadFile(base + '/large', directory, 0.0001), /大小上限/);
+    await assert.rejects(downloadFile(base + '/cut', directory, 1), /127\.0\.0\.1.*UND_ERR_SOCKET/);
+    assert.deepEqual((await readdir(directory)).sort(), kept, 'failed transfers leave no partial files or extra successful downloads');
+    for (const [format, bytes] of Object.entries(formats)) {
+      const filename = format + '.png'; let actual;
+      const input = await media.inputs([{ url: base + '/format/' + filename, filename, content_type: format === 'gif' ? 'image' : 'image/png', size: bytes.length }], directory, path => { actual = path; });
+      assert.ok(actual.endsWith(format === 'unknown' ? '.png' : '.' + format));
+      assert.ok((await readFile(actual)).equals(bytes), 'format correction never re-encodes the original attachment');
+      assert.ok(input.some(part => part.type === 'localImage' && part.path === actual));
+      const downloaded = await downloadFile(base + '/format/' + filename, directory, 1);
+      assert.ok(downloaded.endsWith(format === 'unknown' ? '.png' : '.' + format));
+      assert.ok((await readFile(downloaded)).equals(bytes));
+    }
+    let jpeg;
+    await media.inputs([{ url: base + '/format/jpg.png', filename: 'original.jpeg', content_type: 'image/png', size: formats.jpg.length }], directory, path => { jpeg = path; });
+    assert.ok(jpeg.endsWith('original.jpeg'), 'an equivalent JPEG suffix stays unchanged');
+  } finally { globalThis.fetch = originalFetch; server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+});
+
 test('Tencent SDK uses actual HTTP/WebSocket QQ frames; media inputs and outgoing files obey size/path limits', { timeout: 15000 }, async () => {
   const directory = await temp(); const outside = await temp();
   await writeFile(join(directory, 'output.txt'), 'allowed');
@@ -1100,7 +1457,9 @@ test('Tencent SDK uses actual HTTP/WebSocket QQ frames; media inputs and outgoin
     }
     return originalFetch(input, options);
   };
-  const qq = new QQTransport(configSchema.parse({ cwd: directory, appId: 'fixture-app', appSecret: 'fixture-secret' }), quiet);
+  const qqConfig = configSchema.parse({ cwd: directory, appId: 'fixture-app', appSecret: 'fixture-secret' });
+  assert.equal(qqConfig.replyToEveryone, false, 'everyone replies default to off for existing configurations');
+  const qq = new QQTransport(qqConfig, quiet);
   let online = false, reconnects = 0;
   qq.onDisconnected = () => { online = false; };
   qq.onConnected = () => { online = true; reconnects++; };
@@ -1176,6 +1535,28 @@ test('Tencent SDK uses actual HTTP/WebSocket QQ frames; media inputs and outgoin
     event('C2C_MESSAGE_CREATE', { author: { user_openid: 'alice' }, content: 'message after reconnect', attachments: [] });
     await waitFor(() => messages.length === 7);
     assert.equal(messages.at(-1).text, 'message after reconnect');
+    event('GROUP_AT_MESSAGE_CREATE', { author: { member_openid: 'alice' }, group_openid: 'team', content: '<@all> everyone only', mentions: [{ scope: 'all', is_you: true }] });
+    event('GROUP_AT_MESSAGE_CREATE', { author: { member_openid: 'alice' }, group_openid: 'team', content: '<@all> <@!bot> also ask the bot' });
+    event('GROUP_MESSAGE_CREATE', { author: { member_openid: 'alice' }, group_openid: 'team', content: '<@all> structured direct mention', mentions: [{ scope: 'all' }, { is_you: true, id: 'bot' }] });
+    event('GROUP_AT_MESSAGE_CREATE', { author: { member_openid: 'alice' }, group_openid: 'team', content: 'structured everyone only', mentions: [{ scope: 'all' }] });
+    event('GROUP_AT_MESSAGE_CREATE', { author: { member_openid: 'alice' }, group_openid: 'team', content: '<@fixture-app> <@all> explicit application mention' });
+    await waitFor(() => messages.length === 12);
+    assert.deepEqual(messages.slice(-5).map(item => item.shouldAnswer), [false, true, true, false, true], 'everyone mentions stay in history without triggering a response unless the bot is also addressed');
+    const settings = new ConfigStore(directory);
+    settings.update({ replyToEveryone: true });
+    qqConfig.replyToEveryone = new ConfigStore(directory).read().replyToEveryone;
+    event('GROUP_AT_MESSAGE_CREATE', { author: { member_openid: 'alice' }, group_openid: 'team', content: '<@all> enabled everyone reply' });
+    event('GROUP_MESSAGE_CREATE', { author: { member_openid: 'alice' }, group_openid: 'team', content: 'structured everyone reply', mentions: [{ scope: 'all' }] });
+    event('GROUP_MESSAGE_CREATE', { author: { member_openid: 'alice' }, group_openid: 'team', content: 'ordinary group message' });
+    event('GROUP_AT_MESSAGE_CREATE', { author: { member_openid: 'alice' }, group_openid: 'team', content: 'ordinary direct bot mention' });
+    await waitFor(() => messages.length === 16);
+    assert.deepEqual(messages.slice(-4).map(item => item.shouldAnswer), [true, true, false, true], 'enabling the saved setting accepts both everyone formats without answering unmentioned messages');
+    settings.update({ replyToEveryone: false });
+    qqConfig.replyToEveryone = new ConfigStore(directory).read().replyToEveryone;
+    event('GROUP_MESSAGE_CREATE', { author: { member_openid: 'alice' }, group_openid: 'team', content: '<@all> disabled again' });
+    event('GROUP_AT_MESSAGE_CREATE', { author: { member_openid: 'alice' }, group_openid: 'team', content: '<@all> <@!bot> direct mention still works' });
+    await waitFor(() => messages.length === 18);
+    assert.deepEqual(messages.slice(-2).map(item => item.shouldAnswer), [false, true]);
     const song = join(directory, '原始音频.MP3'); await writeFile(song, 'mp3-fixture');
     const picture = join(directory, 'preview.png'); await writeFile(picture, 'picture-fixture');
     const nativeVoice = join(directory, 'native.silk'); await writeFile(nativeVoice, 'voice-fixture');
@@ -1231,15 +1612,18 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
       { id: 'history-agent-' + index, type: 'agentMessage', text: 'history answer ' + index, phase: 'final_answer' },
     ],
   })) }));
-  const transport = new StdioClientTransport({ command: process.execPath, args: [resolve('dist/cli.js'), 'mcp'], env: { ...process.env, QQBOT_DATA_DIR: directory }, stderr: 'pipe' });
+  const transport = new StdioClientTransport({ command: process.execPath, args: [resolve('dist/cli.js'), 'mcp'], env: { ...process.env, OPENAI_API_KEY: '', QQBOT_DATA_DIR: directory,
+    CODEX_APP_TOOLS_PIPE_PATH: 'fixture-control-pipe', CODEX_THREAD_ID: '', CODEX_SESSION_ID: '',
+    BROWSER_USE_ACCESS_EXECUTOR_ID: '["fixture-desktop"]', BROWSER_USE_ACCESS_PIPE_PATH: 'fixture-browser-pipe', BROWSER_USE_ACCESS_VERIFYING_IDENTITY: 'fixture-browser-key',
+  }, stderr: 'pipe' });
   const client = new Client({ name: 'qqbot-integration-test', version: '1.0.0' });
   await client.connect(transport);
   try {
     assert.equal(client.getServerVersion().name, 'codex-qqbot');
     assert.equal(client.getServerVersion().title, 'QQ Bot');
-    assert.equal(client.getServerVersion().version, '0.0.5');
+    assert.equal(client.getServerVersion().version, '0.0.6');
     const tools = (await client.listTools()).tools.map((tool) => tool.name);
-    assert.deepEqual(tools.sort(), ['qqbot_browser', 'qqbot_configure', 'qqbot_desktop', 'qqbot_models', 'qqbot_send_file', 'qqbot_send_message', 'qqbot_setup', 'qqbot_start', 'qqbot_status', 'qqbot_stop', 'qqbot_ui'].sort());
+    assert.deepEqual(tools.sort(), ['qqbot_browser', 'qqbot_configure', 'qqbot_desktop', 'qqbot_live', 'qqbot_models', 'qqbot_send_file', 'qqbot_send_message', 'qqbot_setup', 'qqbot_start', 'qqbot_status', 'qqbot_stop', 'qqbot_ui'].sort());
     const details = (await client.listTools()).tools;
     assert.ok(details.every(tool => tool.title?.includes('QQ Bot')), 'all user-facing tool names use QQ Bot');
     const entry = details.find((tool) => tool.name === 'qqbot_setup');
@@ -1249,8 +1633,26 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
     const resource = await client.readResource({ uri: entry._meta.ui.resourceUri });
     assert.equal(resource.contents[0].mimeType, 'text/html;profile=mcp-app');
     assert.match(resource.contents[0].text, /模型与预设/);
+    assert.match(resource.contents[0].text, /id="tab-live"/);
+    assert.match(resource.contents[0].text, /id="liveKeyInput" type="password"/);
+    const rejectedKey = await client.callTool({ name: 'qqbot_configure', arguments: { changes: { live: { apiKey: 'must-not-save' } } } });
+    assert.equal(rejectedKey.isError, true);
+    const liveSaved = await client.callTool({ name: 'qqbot_ui', arguments: { action: 'liveCredentials', payload: { apiKey: 'fixture-api-secret' } } });
+    assert.ok(!liveSaved.isError, JSON.stringify(liveSaved));
+    assert.equal(liveSaved.structuredContent.config.live.keyConfigured, true);
+    assert.ok(!JSON.stringify(liveSaved).includes('fixture-api-secret'));
+    await client.callTool({ name: 'qqbot_configure', arguments: { changes: { live: { enabled: true, voice: 'marin' } } } });
+    assert.ok(JSON.parse(await readFile(store.path, 'utf8')).live.apiKey === 'fixture-api-secret', 'ordinary form saves retain the hidden key');
+    const liveStatus = await client.callTool({ name: 'qqbot_live', arguments: { action: 'status' } });
+    assert.deepEqual(liveStatus.structuredContent.jobs, []);
     const status = await client.callTool({ name: 'qqbot_status', arguments: {} });
     assert.ok(!JSON.stringify(status).includes('super-secret-fixture'));
+    const boundStatus = await client.callTool({ name: 'qqbot_status', arguments: {}, _meta: { 'x-codex-turn-metadata': JSON.stringify({ thread_id: 'mcp-parent-thread' }) } });
+    assert.ok(!boundStatus.isError);
+    const routing = JSON.parse(await readFile(join(directory, 'desktop-attachment.json'), 'utf8'));
+    assert.equal(routing.threadId, 'mcp-parent-thread', 'ordinary status calls refresh the parent desktop binding from request metadata');
+    assert.equal(routing.browserEnvironment.BROWSER_USE_ACCESS_PIPE_PATH, 'fixture-browser-pipe');
+    assert.ok(!JSON.stringify(boundStatus).includes('fixture-browser-key'));
     const setup = await client.callTool({ name: 'qqbot_setup', arguments: {} });
     assert.equal(setup.isError, undefined, JSON.stringify(setup));
     const state = JSON.parse(setup.content[0].text);

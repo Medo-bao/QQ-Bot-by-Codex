@@ -1,5 +1,6 @@
 import { Marked } from 'marked';
 import DOMPurify from 'dompurify';
+import { assistantText } from '../message-format.ts';
 
 const escape = (text: string) => text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const local = (path: string) => /^(?:[a-z]:[\\/]|\/|file:|sandbox:)/i.test(path);
@@ -11,7 +12,7 @@ const markdown = new Marked({ gfm: true, breaks: true, renderer: {
 
 export function renderMarkdown(text: string): HTMLElement {
   const element = document.createElement('div'); element.className = 'message-text markdown';
-  element.innerHTML = DOMPurify.sanitize(markdown.parse(text, { async: false }), { USE_PROFILES: { html: true }, FORBID_ATTR: ['style', 'id'], FORBID_TAGS: ['img'] });
+  element.innerHTML = DOMPurify.sanitize(markdown.parse(assistantText(text, 'ui', true), { async: false }), { USE_PROFILES: { html: true }, FORBID_ATTR: ['style', 'id'], FORBID_TAGS: ['img'] });
   for (const link of element.querySelectorAll<HTMLAnchorElement>('a')) { link.target = '_blank'; link.rel = 'noreferrer noopener'; }
   for (const table of element.querySelectorAll('table')) { const wrap = document.createElement('div'); wrap.className = 'table-scroll'; table.replaceWith(wrap); wrap.append(table); }
   for (const pre of element.querySelectorAll('pre')) {

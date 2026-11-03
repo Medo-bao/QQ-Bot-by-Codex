@@ -41,6 +41,7 @@ export class QQTransport implements ChatTransport {
   private readonly bot: QQBot;
   private readonly limiters = { c2c: new ReplyLimiter(replyPolicy.c2c), group: new ReplyLimiter(replyPolicy.group) };
   private stopping = false;
+  private botUserId = '';
   private cancelConnect?: () => void;
   onDisconnected?: (reason: string) => void;
   onConnected?: () => void;
@@ -50,7 +51,7 @@ export class QQTransport implements ChatTransport {
       appId: config.appId,
       appSecret: config.appSecret,
       transport: 'websocket',
-      userAgent: 'codex-qqbot/0.0.5',
+      userAgent: 'codex-qqbot/0.0.6',
       logger,
       baseUrl: process.env.QQBOT_BASE_URL || 'https://api.bot.qq.com',
       tokenBaseUrl: process.env.QQBOT_TOKEN_BASE_URL || 'https://api.bot.qq.com',
@@ -59,9 +60,28 @@ export class QQTransport implements ChatTransport {
     this.bot.use(messageFilter({ skipSelfEcho: false }));
     this.bot.use(rateLimiter());
     this.bot.use(mentionGate({ requireMentionInGroup: config.requireMention, passthrough: true }));
+    this.bot.use(async (context, next) => {
+      const message = context.message;
+      if (message.kind === 'group') {
+        const ids = [...(message.content || '').matchAll(/<@!?([^>]+)>/g)].map(match => match[1]);
+        const mentions = message.mentions || [];
+        const self = (id?: string) => Boolean(id && (id === config.appId || id === this.botUserId));
+        const mentionsSelf = ids.some(self) || mentions.some(mention => mention.scope !== 'all' &&
+          (mention.is_you === true || self(mention.id) || self(mention.user_openid) || self(mention.member_openid)));
+        if (ids.includes('all') || mentions.some(mention => mention.scope === 'all')) {
+          const decision = context.state.mention as { shouldAnswer?: boolean } | undefined;
+          if (decision) decision.shouldAnswer = mentionsSelf || config.replyToEveryone;
+        }
+      }
+      await next();
+    });
     this.bot.use(contentSanitizer({ parseFaceTags: true }));
     this.bot.use(typingIndicator());
     this.bot.on('error', (error) => logger.error(`QQ: ${error instanceof Error ? error.message : error}`));
+    this.bot.on('ready', (data) => {
+      const id = (data as { user?: { id?: string } })?.user?.id;
+      if (typeof id === 'string') this.botUserId = id;
+    });
     this.bot.on('resumed', () => { if (!this.stopping) this.onConnected?.(); });
     this.bot.on('disconnected', (event) => {
       if (!this.stopping) {

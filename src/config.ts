@@ -1,8 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { z } from 'zod';
 import { normalizePermissions } from './permissions.ts';
+import { liveConfigSchema } from './gpt-live.ts';
 
 const accessMode = z.enum(['open', 'allowlist', 'disabled']);
 const presetSchema = z.object({
@@ -35,6 +37,7 @@ export const configSchema = z.object({
   networkAccess: z.boolean().default(true),
   webSearch: z.enum(['disabled', 'cached', 'indexed', 'live']).default('live'),
   requireMention: z.boolean().default(true),
+  replyToEveryone: z.boolean().default(false),
   streaming: z.boolean().default(true),
   textChunkLimit: z.number().int().min(100).max(4500).default(4500),
   sessionIdleTimeout: z.number().int().min(1000).default(1800000),
@@ -48,6 +51,7 @@ export const configSchema = z.object({
   directPrompt: z.string().default(''),
   showToolResults: z.boolean().default(false),
   debug: z.boolean().default(false),
+  live: liveConfigSchema.prefault({}),
   access: z.object({
     c2cMode: accessMode.default('allowlist'),
     c2cAllow: z.array(z.string()).default([]),
@@ -76,6 +80,8 @@ export const configSchema = z.object({
   }).prefault({}),
 });
 export type BotConfig = z.infer<typeof configSchema>;
+export type PublicBotConfig = Omit<BotConfig, 'appSecret' | 'live'> & { credentialsConfigured: boolean;
+  live: Omit<BotConfig['live'], 'apiKey'> & { keyConfigured: boolean; keyFromEnvironment: boolean } };
 
 export function dataDirectory(): string {
   return resolve(process.env.QQBOT_DATA_DIR ||
@@ -84,9 +90,17 @@ export function dataDirectory(): string {
 
 /** JSON writes preserve unrelated values and replace the file only after a complete write. */
 export function writeJson(path: string, value: unknown): void {
-  const temporary = `${path}.${process.pid}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temporary, path);
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  const content = `${JSON.stringify(value, null, 2)}\n`;
+  let created = false;
+  try {
+    const handle = openSync(temporary, 'wx', 0o600); created = true;
+    try { writeFileSync(handle, content, 'utf8'); } finally { closeSync(handle); }
+    renameSync(temporary, path);
+  } catch (error) {
+    if (created) try { unlinkSync(temporary); } catch { /* A completed rename already removed this writer's temporary file. */ }
+    throw error;
+  }
 }
 
 export class ConfigStore {
@@ -107,6 +121,7 @@ export class ConfigStore {
     config.appSecret = process.env.QQBOT_SECRET || config.appSecret;
     config.cwd = resolve(process.env.QQBOT_CWD || config.cwd);
     config.codexCommand = process.env.QQBOT_CODEX_COMMAND || config.codexCommand;
+    config.live.apiKey = process.env.OPENAI_API_KEY || config.live.apiKey;
     return config;
   }
 
@@ -115,7 +130,7 @@ export class ConfigStore {
     const merged = { ...raw, ...patch };
     delete merged.autoCompact;
     delete merged.autoCompactThreshold;
-    for (const key of ['access', 'media', 'vision', 'sendFile']) {
+    for (const key of ['access', 'media', 'vision', 'sendFile', 'live']) {
       if (patch[key] && typeof patch[key] === 'object') merged[key] = { ...raw[key], ...patch[key] as object };
     }
     const config = normalizePermissions(configSchema.parse(merged));
@@ -132,8 +147,10 @@ export class ConfigStore {
     return this.read();
   }
 
-  publicConfig(): Omit<BotConfig, 'appSecret'> & { credentialsConfigured: boolean } {
-    const { appSecret, ...config } = this.read();
-    return { ...config, credentialsConfigured: Boolean(config.appId && appSecret) };
+  publicConfig(): PublicBotConfig {
+    const { appSecret, live, ...config } = this.read();
+    const { apiKey, ...speech } = live;
+    return { ...config, credentialsConfigured: Boolean(config.appId && appSecret),
+      live: { ...speech, keyConfigured: Boolean(apiKey), keyFromEnvironment: Boolean(process.env.OPENAI_API_KEY) } };
   }
 }

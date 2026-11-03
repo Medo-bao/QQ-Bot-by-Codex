@@ -19,6 +19,7 @@ const notify = (method, params) => send({ method, params });
 const result = (id, value) => send({ id, result: value });
 const trace = (value) => appendFileSync(join(directory, 'protocol.jsonl'), JSON.stringify(value) + '\n');
 trace({ launch: process.argv.slice(2) });
+trace({ environment: { pythonUtf8: process.env.PYTHONUTF8, pythonIoEncoding: process.env.PYTHONIOENCODING } });
 const ask = (method, params) => new Promise((resolve) => { const id = ++sequence; waiting.set(id, resolve); send({ id, method, params }); });
 const rollout = threadId => join(process.env.CODEX_HOME, 'sessions', threadId + '.jsonl');
 function usage(threadId, turnId) {
@@ -44,6 +45,22 @@ async function execute(threadId, turnId, input) {
   const text = input.filter((item) => item.type === 'text' && !item.text.startsWith('[QQ Bot 本轮文件目录]\n') && !item.text.startsWith('[QQ Bot 群聊上下文：') && !item.text.startsWith('[QQ Bot 引用上下文：')).map((item) => item.text).join('\n');
   const clock = await ask('currentTime/read', {});
   trace({ clock });
+  if (text.includes('auto-image-probe')) {
+    const folder = join(process.env.CODEX_HOME, 'generated_images', threadId); mkdirSync(folder, { recursive: true });
+    const file = join(folder, turnId + '.png'); writeFileSync(file, 'generated output fixture');
+    const turn = histories[threadId].find(item => item.id === turnId);
+    const image = { id: 'auto-image-' + turnId, type: 'imageGeneration', status: text.includes('failed-generation') ? 'failed' : 'completed',
+      savedPath: file, ...(text.includes('failed-generation') ? { failure: { message: 'fixture generation failed' } } : {}) };
+    turn.items.push(image); saveHistory();
+    if (!text.includes('terminal-only')) notify('item/completed', { ...common, item: image });
+    if (text.includes('hold-image')) await ask('item/tool/requestUserInput', { ...common, itemId: 'image-hold', questions: [{ id: 'continue', question: '图像事件已完成，等待结束回合', isOther: false, isSecret: false, options: [{ label: '继续', description: '结束本轮' }] }] });
+    if (text.includes('explicit-send')) {
+      const sent = await ask('item/tool/call', { ...common, callId: 'explicit-auto-image', tool: 'qqbot_send_file', arguments: { file_path: file } });
+      trace({ autoImageExplicit: sent });
+    }
+    turn.status = 'completed'; saveHistory(); usage(threadId, turnId);
+    notify('turn/completed', { threadId, turn }); turns.delete(threadId); return;
+  }
   if (text.includes('native-auto-compact')) {
     const turn = histories[threadId].find(item => item.id === turnId);
     const item = { id: 'native-compact-' + turnId, type: 'contextCompaction' };
@@ -66,9 +83,20 @@ async function execute(threadId, turnId, input) {
     notify('item/completed', { ...common, item });
   }
   let generatedFile;
-  if (text.includes('browser-login-check')) {
-    const browser = await ask('item/tool/call', { ...common, callId: 'browser-login', tool: 'qqbot_browser', arguments: { url: 'https://x.com/' } });
-    trace({ browserLogin: browser });
+  if (text.includes('gpt-live-check')) {
+    const speech = await ask('item/tool/call', { ...common, callId: 'gpt-live-audio', tool: 'qqbot_live', arguments: {
+      action: 'generate', text: '你好，语音接口已接入。', send_to_qq: true, send_as: text.includes('voice') ? 'voice' : 'file',
+    } });
+    trace({ liveAudio: speech });
+    if (speech.success) generatedFile = JSON.parse(speech.contentItems[0].text).result.path;
+    const item = { id: 'live-' + turnId, type: 'dynamicToolCall', tool: 'qqbot_live', status: speech.success ? 'completed' : 'failed', ...speech };
+    histories[threadId].find(turn => turn.id === turnId).items.push(item); saveHistory(); notify('item/completed', { ...common, item });
+  }
+  if (text.includes('browser-login-check') || text.includes('browser-read-check')) {
+    const read = text.includes('browser-read-check');
+    const browser = await ask('item/tool/call', { ...common, callId: 'browser-login', tool: 'qqbot_browser', arguments: read
+      ? { url: 'https://x.com/author', action: 'read', max_chars: 1200 } : { url: 'https://x.com/' } });
+    trace(read ? { browserRead: browser } : { browserLogin: browser });
     const item = { id: 'browser-' + turnId, type: 'dynamicToolCall', tool: 'qqbot_browser', status: browser.success ? 'completed' : 'failed', ...browser };
     histories[threadId].find(turn => turn.id === turnId).items.push(item); saveHistory();
     notify('item/completed', { ...common, item });
@@ -191,9 +219,15 @@ async function execute(threadId, turnId, input) {
       histories[threadId].find(item => item.id === turnId).items.push(image); notify('item/completed', { ...common, item: image });
     }
   }
-  const answer = generatedFile ? `Generated image: ![preview](<${generatedFile}>)` : process.env.QQBOT_FIXTURE_UI === '1'
+  let citationAnswer;
+  if (text.includes('citation-format-probe')) {
+    const source = join(directory, '来源😀.pdf'), output = join(directory, '输出😀.txt');
+    writeFileSync(source, 'fixture source'); writeFileSync(output, 'fixture output');
+    citationAnswer = `已读完😀\n:codex-file-citation{path="${source}" purpose="source"}\n:codex-file-citation{path="${output}" purpose="output"}\n:codex-file-citation{path="${output}" purpose="output"}`;
+  }
+  const answer = citationAnswer || (generatedFile ? `Generated image: ![preview](<${generatedFile}>)` : process.env.QQBOT_FIXTURE_UI === '1'
     ? text.includes('优先级') ? '可以，先按 **紧急程度** 和预计耗时安排优先级。\n\n工作资料会放在 `E:\\QQ\\storage`。\n\n| 事项 | 安排 |\n| --- | --- |\n| 今天需要完成 | 优先处理 |\n| 可以延后 | 稍后安排 |\n\n```js\nconst status = "ready";\n```\n\n- 先确认必须完成的工作\n- 再留出休息时间' : text.includes('render-safety-check') ? '<img src=x onerror="window.__qqInjected=true"><script>window.__qqInjected=true</script>' : '可以。我会先整理今天的安排，再标出需要你确认的事项。'
-    : 'Codex fixture reply: ' + text.slice(0, 200);
+    : 'Codex fixture reply: ' + text.slice(0, 200));
   const turn = histories[threadId]?.find((item) => item.id === turnId);
   if (turn) { turn.items.push({ type: 'agentMessage', id: itemId, phase: 'final_answer', text: answer }); turn.status = 'completed'; saveHistory(); }
   notify('item/started', { ...common, item: { type: 'agentMessage', id: itemId, phase: 'final_answer', text: '' } });

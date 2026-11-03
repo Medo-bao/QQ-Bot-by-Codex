@@ -18,6 +18,9 @@
 !/tests/
 !/skills/
 !/assets/
+!/docs/
+/docs/*
+!/docs/UPSTREAM_PORTS.md
 /assets/*
 !/assets/icons/
 !/.agents/
