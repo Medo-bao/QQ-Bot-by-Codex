@@ -6,9 +6,10 @@ import { callService, ensureService } from './service.ts';
 import { uiDocument } from './ui-document.ts';
 import { fileSendModeSchema } from './media.ts';
 import { browserEnvironmentKeys } from './browser-access.ts';
+import { ttsProviders } from './speech-providers.ts';
 
 export async function startMcp(): Promise<void> {
-  const server = new McpServer({ name: 'codex-qqbot', title: 'QQ Bot', version: '0.0.6' });
+  const server = new McpServer({ name: 'codex-qqbot', title: 'QQ Bot', version: '0.0.7' });
   const textResult = (value: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
     ...(value && typeof value === 'object' && !Array.isArray(value) ? { structuredContent: value as Record<string, unknown> } : {}) });
   const attachDesktop = async (meta?: Record<string, unknown>) => {
@@ -74,12 +75,14 @@ export async function startMcp(): Promise<void> {
     server.registerTool('qqbot_configure', { title: 'QQ Bot 配置', description: 'Update QQ bridge settings. Use the local setup page for credentials. Model, prompt and permission changes apply to subsequent messages without interrupting active tasks. Connection changes require idle conversations before reconnecting.', inputSchema: {
       changes: z.record(z.string(), z.unknown()).describe('Configuration patch: cwd, modelProvider, model, effort, preset, presets, prompts, contextWindow (tokens; 0 keeps Codex defaults), streaming, access, media, vision, sendFile, timeouts, queue/history limits, sandbox, approvalPolicy, debug and Codex launch settings.'),
     } }, ({ changes }) => {
-      if ('appId' in changes || 'appSecret' in changes || changes.live && typeof changes.live === 'object' && 'apiKey' in changes.live) return Promise.resolve({ isError: true, ...textResult({ error: '凭据请在设置页填写。' }) });
+      const speech = changes.live as Record<string, unknown> | undefined;
+      const hasKey = (value: unknown) => value && typeof value === 'object' && 'apiKey' in value;
+      if ('appId' in changes || 'appSecret' in changes || hasKey(speech) || ttsProviders.some(provider => hasKey(speech?.[provider]))) return Promise.resolve({ isError: true, ...textResult({ error: '凭据请在设置页填写。' }) });
       return execute('configure', changes);
     });
     server.registerTool('qqbot_models', { title: 'QQ Bot 可用模型', description: 'List models and reasoning efforts available through the installed Codex login and configuration.', annotations: { readOnlyHint: true }, inputSchema: {} }, () => execute('models'));
     const destination = { scope: z.enum(['c2c', 'group']), target_id: z.string().min(1) };
-    server.registerTool('qqbot_live', { title: 'QQ Bot GPT-Live 语音', description: 'Use the configured GPT-Live API to generate a short speech clip or create a voice from a description, only when explicitly requested. generate returns a background job ID; poll status with the same scope/target and job_id. send_to_qq=true delivers the completed clip once to the selected existing QQ conversation; failed delivery can use retry_send without regenerating. Generated WAV and transcript are returned after finalization. API key must be entered in the settings UI. This is a bounded speech clip, not music synthesis or a continuous microphone call.', inputSchema: {
+    server.registerTool('qqbot_live', { title: 'QQ Bot 语音合成', description: 'Generate a WAV speech clip with the active provider only when requested. generate returns a job ID; poll status with the same scope/target and job_id. send_to_qq=true delivers the clip to the selected QQ conversation. retry_send retries delivery without regenerating. Local GPT-SoVITS uses the installed voice pack and needs no API key; omit voice and voice_id. Cloud services are configured in Settings. create_voice is available with OpenAI GPT-Live.', inputSchema: {
       action: z.enum(['generate', 'status', 'cancel', 'retry_send', 'create_voice']).default('status'),
       scope: destination.scope.optional(), target_id: destination.target_id.optional(),
       text: z.string().max(1500).optional(), voice: z.string().optional(), voice_id: z.string().optional(),

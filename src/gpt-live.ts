@@ -3,20 +3,51 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
+import { speechProviderInfo, speechProviders, type KeyedSpeechProvider, type SpeechProvider, type TtsProvider } from './speech-providers.ts';
+import { captureTts, speechSampleRate as rate, type SpeechDependencies } from './tts.ts';
+import { LocalSpeech, localSpeechStatus } from './sovits.ts';
+import { sovitsParameters, speechTextLimit, type SovitsParameter } from './sovits-settings.ts';
 
+const apiKeySchema = z.string().trim().max(512).regex(/^[^\r\n]*$/, 'API Key 不能包含换行。').default('');
+const providerSettings = (provider: TtsProvider) => z.object({
+  apiKey: apiKeySchema,
+  model: z.string().trim().min(1).max(128).default(speechProviderInfo[provider].model),
+  voice: z.string().trim().min(1).max(256).default(speechProviderInfo[provider].voice),
+});
+const region = z.enum(['china', 'international']).default('china');
+const sovitsNumber = (key: SovitsParameter) => {
+  const { min, max, value, step } = sovitsParameters[key];
+  const range = z.number().min(min).max(max);
+  return (step === 1 ? range.int() : range).default(value);
+};
 export const liveConfigSchema = z.object({
   enabled: z.boolean().default(false),
-  apiKey: z.string().trim().max(512).regex(/^[^\r\n]*$/, 'API Key 不能包含换行。').default(''),
-  model: z.string().trim().min(1).max(128).default('gpt-live-1'),
-  voice: z.string().trim().min(1).max(128).default('marin'),
+  provider: z.enum(speechProviders).default('openai'),
+  apiKey: apiKeySchema,
+  model: z.string().trim().min(1).max(128).default(speechProviderInfo.openai.model),
+  voice: z.string().trim().min(1).max(128).default(speechProviderInfo.openai.voice),
   customVoiceId: z.string().trim().max(256).default(''),
   instructions: z.string().max(6000).default('使用清晰、自然的中文发音。'),
   maxDurationSeconds: z.number().int().min(5).max(180).default(60),
   silenceMs: z.number().int().min(1000).max(10000).default(2500),
+  dashscope: providerSettings('dashscope').extend({
+    region, workspaceId: z.string().trim().max(80).regex(/^[a-z\d-]*$/i, '请输入有效的百炼 Workspace ID。').default(''),
+  }).prefault({}),
+  minimax: providerSettings('minimax').extend({ region }).prefault({}),
+  mimo: providerSettings('mimo').extend({ instructions: z.string().trim().max(2000).default('') }).prefault({}),
+  sovits: z.object({
+    temperature: sovitsNumber('temperature'),
+    topK: sovitsNumber('topK'),
+    topP: sovitsNumber('topP'),
+    speedFactor: sovitsNumber('speedFactor'),
+    maxChars: sovitsNumber('maxChars'),
+    idleMinutes: sovitsNumber('idleMinutes'),
+    autoSpeak: z.boolean().default(false),
+  }).prefault({}),
 });
 export type LiveConfig = z.infer<typeof liveConfigSchema>;
 export const liveGenerateSchema = z.object({
-  text: z.string().trim().min(1).max(1500),
+  text: z.string().trim().min(1).max(speechTextLimit),
   voice: z.string().trim().min(1).max(128).optional(),
   voice_id: z.string().trim().min(1).max(256).optional(),
 });
@@ -24,10 +55,12 @@ export const liveVoiceSchema = z.object({ name: z.string().trim().min(1).max(256
 type LiveInput = z.infer<typeof liveGenerateSchema>;
 type Progress = 'connecting' | 'generating' | 'finalizing';
 type LiveResult = { path: string; transcript: string; durationSeconds: number; sessionId: string; usage: unknown; stopReason: 'silence' | 'server'; finalized: true };
-export type LiveJob = { id: string; owner: string; status: Progress | 'completed' | 'failed' | 'cancelled'; startedAt: number; finishedAt?: number; result?: LiveResult; error?: string;
+export type LiveJob = { id: string; owner: string; provider: SpeechProvider; status: Progress | 'completed' | 'failed' | 'cancelled'; startedAt: number; finishedAt?: number; result?: LiveResult; error?: string;
   delivery?: 'sending' | 'sent' | 'failed'; deliveryError?: string; sendAs?: string };
-type Dependencies = { socket?: (url: string, key: string) => WebSocket; fetch?: typeof fetch };
-const rate = 24000;
+
+function speechProfile(config: LiveConfig, provider: KeyedSpeechProvider) {
+  return provider === 'openai' ? config : config[provider];
+}
 
 function failure(error: unknown, key: string): Error {
   let text = error instanceof Error ? error.message : String(error);
@@ -45,7 +78,7 @@ function apiFailure(status: number, message = ''): Error {
 }
 
 /** Capture a bounded Live speech clip. Live has no audio-done event: silence is an application policy. */
-async function capture(config: LiveConfig, input: LiveInput, signal: AbortSignal, progress: (state: Progress) => void, dependencies: Dependencies) {
+async function capture(config: LiveConfig, input: LiveInput, signal: AbortSignal, progress: (state: Progress) => void, dependencies: SpeechDependencies) {
   const key = config.apiKey;
   return new Promise<{ pcm: Buffer; transcript: string; sessionId: string; usage: unknown; stopReason: 'silence' | 'server' }>((resolve, reject) => {
     const socket = dependencies.socket?.('wss://api.openai.com/v1/live/sessions', key)
@@ -149,42 +182,58 @@ function wav(pcm: Buffer): Buffer {
 
 export class GptLive {
   private readonly jobs = new Map<string, { job: LiveJob; abort: AbortController; done: Promise<void>; delivery?: Promise<void> }>();
-  constructor(private readonly configuration: () => LiveConfig, private readonly dependencies: Dependencies = {}) {}
+  private readonly localSpeech = new LocalSpeech();
+  constructor(private readonly configuration: () => LiveConfig, private readonly dependencies: SpeechDependencies = {}) {}
 
   private config(): LiveConfig {
     const config = this.configuration();
-    if (!config.enabled) throw new Error('GPT-Live 尚未启用，请在「设置 → 语音与音色」中开启并保存。');
-    if (!config.apiKey) throw new Error('尚未配置 OpenAI API Key，请在「设置 → 语音与音色」中填写现有密钥。');
+    if (!config.enabled) throw new Error('语音合成尚未启用，请在「设置 → 语音与音色」中开启并保存。');
     return config;
   }
 
   start(owner: string, directory: string, params: unknown, signal?: AbortSignal): LiveJob {
     const config = this.config(), input = liveGenerateSchema.parse(params);
+    const provider = config.provider;
+    const key = provider === 'sovits' ? '' : speechProfile(config, provider).apiKey;
+    if (provider === 'sovits') {
+      if (!localSpeechStatus().available) throw new Error('GPT-SoVITS 本地安装未就绪，请在「语音与音色」中检查安装目录。');
+      if (input.voice || input.voice_id) throw new Error('GPT-SoVITS 使用已安装的本地音色包，请省略 voice 和 voice_id。');
+    } else if (!key) throw new Error(`尚未配置 ${speechProviderInfo[provider].label} 的 API Key，请在「设置 → 语音与音色」中填写。`);
     if ([...this.jobs.values()].some(entry => entry.job.owner === owner && !entry.job.finishedAt)) throw new Error('此会话已有语音正在生成，请等待完成或取消后重试。');
     for (const [id, entry] of this.jobs) if (this.jobs.size >= 30 && entry.job.finishedAt && !entry.delivery) this.jobs.delete(id);
-    const job: LiveJob = { id: randomUUID(), owner, status: 'connecting', startedAt: Date.now() };
+    const job: LiveJob = { id: randomUUID(), owner, provider, status: 'connecting', startedAt: Date.now() };
     const abort = new AbortController();
     const cancel = () => abort.abort(); signal?.addEventListener('abort', cancel, { once: true });
     if (signal?.aborted) abort.abort();
     const done = (async () => {
       let path: string | undefined;
       try {
-        const result = await capture(config, input, abort.signal, status => { job.status = status; }, this.dependencies);
+        const progress = (status: Progress) => { job.status = status; };
+        const { audio, ...result } = await this.capture(config, input, abort.signal, progress);
         if (abort.signal.aborted) throw new Error('语音生成已取消。');
         await mkdir(directory, { recursive: true });
-        path = join(directory, `gpt-live-${job.id}.wav`);
-        await writeFile(path, wav(result.pcm), { flag: 'wx', mode: 0o600 });
+        path = join(directory, `${provider === 'openai' ? 'gpt-live' : provider}-${job.id}.wav`);
+        await writeFile(path, audio, { flag: 'wx', mode: 0o600 });
         if (abort.signal.aborted) throw new Error('语音生成已取消。');
-        const { pcm, ...metadata } = result;
-        job.result = { ...metadata, path, durationSeconds: pcm.length / (rate * 2), finalized: true };
+        job.result = { ...result, path, finalized: true };
         job.status = 'completed';
       } catch (error) {
         if (path) await rm(path, { force: true }).catch(() => {});
-        job.status = abort.signal.aborted ? 'cancelled' : 'failed'; job.error = failure(error, config.apiKey).message;
+        job.status = abort.signal.aborted ? 'cancelled' : 'failed'; job.error = failure(error, key).message;
       } finally { job.finishedAt = Date.now(); signal?.removeEventListener('abort', cancel); }
     })();
     this.jobs.set(job.id, { job, abort, done });
     return structuredClone(job);
+  }
+
+  private async capture(config: LiveConfig, input: LiveInput, signal: AbortSignal, progress: (state: Progress) => void) {
+    const provider = config.provider;
+    if (provider === 'sovits') return this.localSpeech.capture(input.text, config.sovits, config.maxDurationSeconds, signal, progress);
+    const { pcm, ...metadata } = provider === 'openai'
+      ? await capture(config, input, signal, progress, this.dependencies)
+      : await captureTts({ ...config[provider], provider, text: input.text, voice: input.voice_id || input.voice || config[provider].voice,
+        maxDurationSeconds: config.maxDurationSeconds }, signal, progress, this.dependencies);
+    return { ...metadata, audio: wav(pcm), durationSeconds: pcm.length / (rate * 2) };
   }
 
   list(owner: string): LiveJob[] { return [...this.jobs.values()].filter(entry => entry.job.owner === owner).map(entry => structuredClone(entry.job)); }
@@ -195,6 +244,7 @@ export class GptLive {
   }
   async wait(owner: string, id: string): Promise<LiveJob> { this.get(owner, id); await this.jobs.get(id)!.done; return this.get(owner, id); }
   cancel(owner: string, id: string): LiveJob { const job = this.get(owner, id); if (!job.finishedAt) this.jobs.get(id)!.abort.abort(); return this.get(owner, id); }
+  setLocalIdleMinutes(minutes: number): void { this.localSpeech.setIdleMinutes(minutes); }
   async deliver(owner: string, id: string, send: (result: LiveResult) => Promise<void>, sendAs = 'file'): Promise<LiveJob> {
     this.get(owner, id);
     const entry = this.jobs.get(id)!;
@@ -204,7 +254,11 @@ export class GptLive {
       if (!entry.job.result || entry.abort.signal.aborted) return;
       entry.job.delivery = 'sending'; entry.job.sendAs = sendAs; delete entry.job.deliveryError;
       try { await send(entry.job.result); entry.job.delivery = 'sent'; }
-      catch (error) { entry.job.delivery = 'failed'; entry.job.deliveryError = failure(error, this.configuration().apiKey).message; }
+      catch (error) {
+        entry.job.delivery = 'failed';
+        const provider = entry.job.provider;
+        entry.job.deliveryError = failure(error, provider === 'sovits' ? '' : speechProfile(this.configuration(), provider).apiKey).message;
+      }
     })().finally(() => { entry.delivery = undefined; });
     await entry.delivery;
     return this.get(owner, id);
@@ -212,10 +266,13 @@ export class GptLive {
   async close(): Promise<void> {
     for (const entry of this.jobs.values()) if (!entry.job.finishedAt) entry.abort.abort();
     await Promise.all([...this.jobs.values()].map(async entry => { await entry.done; await entry.delivery; }));
+    await this.localSpeech.close();
   }
 
   async createVoice(params: unknown): Promise<{ id: string; name: string; prompt: string }> {
     const config = this.config(), input = liveVoiceSchema.parse(params);
+    if (config.provider !== 'openai') throw new Error('文字创建音色请切换到 OpenAI GPT-Live。');
+    if (!config.apiKey) throw new Error('尚未配置 OpenAI API Key，请在「设置 → 语音与音色」中填写。');
     try {
       const response = await (this.dependencies.fetch || fetch)('https://api.openai.com/v1/audio/voices', {
         method: 'POST', headers: { Authorization: `Bearer ${config.apiKey}`, 'Content-Type': 'application/json' },

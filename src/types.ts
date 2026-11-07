@@ -8,6 +8,16 @@ export type ChatScope = 'c2c' | 'group';
 export const fileSendModes = ['auto', 'file', 'voice'] as const;
 export type FileSendMode = typeof fileSendModes[number];
 
+export interface GroupMember { id: string; name?: string; }
+export interface GroupMemberPage { members: GroupMember[]; source: 'qq' | 'history'; nextCursor?: string; }
+export interface DirectMentions { memberIds?: readonly string[]; everyone?: boolean; }
+export const maxGroupMentions = 10;
+
+export function isGroupMemberId(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value)
+    && !['all', 'everyone', 'unknown', 'qqbot', 'qqbot-local-ui'].includes(value.toLowerCase());
+}
+
 /** QQ 回复目标 */
 export interface ReplyTarget {
   scope: ChatScope;

@@ -2,7 +2,7 @@
 
 在 QQ 私聊、群聊和 Codex 插件界面中使用本机 Codex，处理消息、执行任务并交付文件。
 
-**当前版本：0.0.6** · [English](README_EN.md) · [更新日志](CHANGELOG.md) · [下载源码](https://github.com/Medo-bao/QQ-Bot-by-Codex/releases/tag/v0.0.6)
+**当前版本：0.0.7** · [English](README_EN.md) · [更新日志](CHANGELOG.md) · [下载源码](https://github.com/Medo-bao/QQ-Bot-by-Codex/releases/tag/v0.0.7)
 
 QQ Bot 通过腾讯 QQ Bot SDK 连接 QQ 与本地 Codex App Server，复用本机的 Codex 登录、模型提供商和工具配置，无需安装 DSH。项目改造自 [tencent-connect/dsh-qqbot](https://github.com/tencent-connect/dsh-qqbot)，采用 MIT 许可证。
 
@@ -78,21 +78,31 @@ npm.cmd ci --ignore-scripts
 
 AI 发送工具 `qqbot_send_file` 提供相同的 `send_as` 选项。发送失败时显示具体原因，可在修正文件或设置后重试。
 
-### GPT-Live 语音与自定义音色
+### 语音合成与试听
 
-在 **设置 → 语音与音色** 填写现有 OpenAI API Key，开启 GPT-Live 并保存。密钥仅保存在本机配置中，页面与状态接口不回显；也支持服务器环境变量 `OPENAI_API_KEY`。GPT-Live 使用独立 API 授权与计费，Codex 的登录不会自动提供这项额度。
+打开 **设置 → 语音与音色**。点击已配置的服务，即可切换试听和 QQ 合成使用的供应商。第一次使用时，点击待配置的服务，填入 API Key 后点击 **保存设置**。各服务分别保存密钥、模型和音色。密钥也可从本机环境读取，状态接口只显示配置状态。
 
-- 默认模型为 `gpt-live-1`、音色为 `marin`。可填写其他受支持内置音色，或同一 API 项目中的自定义音色 ID；自定义 ID 优先。
-- “用描述创建音色”会调用官方音色接口，返回 ID 并填入设置草稿；点击保存后可生成音频试听。已经获得授权并创建的录音音色也可通过 ID 使用。
-- “生成与试听”生成 WAV、显示实际语音转录，并提供播放和下载。选择会话后可自动发送原始文件或 QQ 语音；发送失败可单独重试，无需再次生成。
-- 音频按机器人、会话与线程保存到既有资源目录的 `audio` 子目录；仅试听的文件放入该机器人的 `voice-previews` 目录。
-- QQ 会话可在用户要求语音时调用 `qqbot_live`，例如“用当前音色生成这段话，并按语音消息发送”。接口支持内置音色或 `voice_id` 覆盖，不改变 Codex 对话模型与角色。
+| 合成服务 | 默认模型 | 默认音色 | 密钥环境变量 |
+| --- | --- | --- | --- |
+| 阿里云百炼 CosyVoice | `cosyvoice-v3-flash` | `longanhuan` | `DASHSCOPE_API_KEY` |
+| MiniMax Speech | `speech-2.8-turbo` | `female-shaonv` | `MINIMAX_API_KEY` |
+| 小米 MiMo | `mimo-v2.5-tts` | `mimo_default` | `MIMO_API_KEY` |
+| OpenAI GPT-Live | `gpt-live-1` | `marin` | `OPENAI_API_KEY` |
+| GPT-SoVITS · 本地 | 本地音色包 | 已安装音色 | 无需密钥 |
 
-GPT-Live 是连续对话语音模型；本插件将它封装为有时长上限的短片段生成，不保证逐字朗读，也不用于歌曲生成。官方没有整段音频完成事件，插件按可配置的静音窗口结束片段，并等待 `session.closed` 确认；超时、取消或连接中断不会交付残缺结果。遇到长停顿被截断时可调高静音时长。任务异步执行，可查看进度和取消。
+百炼和 MiniMax 的接入地区须与密钥和音色一致。百炼可在高级设置填写 Workspace ID 使用专属域名，百炼和 MiniMax 可直接填入已有音色 ID。小米 MiMo 提供预设音色和可选的朗读风格。原有 GPT-Live 设置会自动沿用，仍可创建文字描述音色或使用已有自定义音色 ID。
 
-从 Codex 调用 MCP `qqbot_live` 时，`action: "generate"` 返回任务 ID，再用 `action: "status"` 和同一目标、`job_id` 获取结果；只有明确指定 `send_to_qq: true` 才发送。QQ 原生会话中的同名工具会等待生成完成，再返回文件与发送回执。`action: "create_voice"` 只创建音色，不自动改变全局设置。
+本机安装 GPT-SoVITS 后，可直接点击 **GPT-SoVITS · 本地** 切换。默认目录为 `E:\DSH\gpt-sovits`，其他安装可通过本机环境变量 `QQBOT_SOVITS_ROOT` 指定。它复用已安装的音色包与 DSH 的本地引擎，首次合成按需加载模型。设置页的时长上限适用于生成的音频，加载模型另外计时。
 
-接口依据：[OpenAI GPT-Live WebSocket](https://developers.openai.com/api/docs/guides/voice-websockets)、[自定义音色](https://developers.openai.com/api/docs/guides/custom-voices)。
+在本地服务设置中可调整温度、Top-k、Top-p、语速、单段字数和空闲卸载时间。保存后用于后续合成。空闲卸载适用于 QQ Bot 启动的引擎，设为 0 可保持常驻。开启 **自动朗读 QQ 回复** 后，每轮成功的文字回复之后会追加一条语音。同一轮已经发送语音时跳过自动朗读。
+
+在 **试听与发送** 输入文字，可播放和下载生成的 WAV。需要发送时，展开 **QQ 投递**，选择会话与投递方式。会话音频保存在对应线程的 `audio` 目录，仅试听的文件保存在 `voice-previews`。失败的投递可以单独重试。
+
+三家独立 TTS 直接合成输入文字，等待供应商确认完成后才交付 WAV。GPT-Live 按静音窗口结束片段，并等待 `session.closed`，朗读可能改写文字。两种方式都支持取消，超时或连接中断时保留错误状态。
+
+MCP `qqbot_live` 使用当前保存的供应商。用 `action: "generate"` 获取任务 ID，再用 `action: "status"` 查询同一目标下的 `job_id`。指定 `send_to_qq: true` 才会投递。云端服务可用 `voice` 或 `voice_id` 覆盖本次音色，GPT-SoVITS 使用已安装的音色包。`action: "create_voice"` 适用于 OpenAI GPT-Live。
+
+[百炼 CosyVoice](https://help.aliyun.com/zh/model-studio/cosyvoice-websocket-api/) · [MiniMax Speech](https://platform.minimax.io/docs/api-reference/speech-t2a-http) · [小米 MiMo](https://mimo.mi.com/docs/en-US/api/audio/tts-post) · [OpenAI GPT-Live](https://developers.openai.com/api/docs/guides/voice-websockets)
 
 ### 让其他项目的会话工作
 

@@ -5,6 +5,8 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { z } from 'zod';
 import { normalizePermissions } from './permissions.ts';
 import { liveConfigSchema } from './gpt-live.ts';
+import { speechProviderInfo, ttsProviders, type KeyedSpeechProvider, type TtsProvider } from './speech-providers.ts';
+import { localSpeechStatus } from './sovits.ts';
 
 const accessMode = z.enum(['open', 'allowlist', 'disabled']);
 const presetSchema = z.object({
@@ -80,8 +82,17 @@ export const configSchema = z.object({
   }).prefault({}),
 });
 export type BotConfig = z.infer<typeof configSchema>;
+type LiveConfig = BotConfig['live'];
+type KeyStatus = { keyConfigured: boolean; keyFromEnvironment: boolean };
 export type PublicBotConfig = Omit<BotConfig, 'appSecret' | 'live'> & { credentialsConfigured: boolean;
-  live: Omit<BotConfig['live'], 'apiKey'> & { keyConfigured: boolean; keyFromEnvironment: boolean } };
+  live: Omit<LiveConfig, 'apiKey' | 'sovits' | TtsProvider> & KeyStatus & {
+    [Provider in TtsProvider]: Omit<LiveConfig[Provider], 'apiKey'> & KeyStatus;
+  } & { sovits: LiveConfig['sovits'] & ReturnType<typeof localSpeechStatus> } };
+
+function publicSpeechProfile<Profile extends { apiKey: string }>(profile: Profile, provider: KeyedSpeechProvider) {
+  const { apiKey, ...settings } = profile;
+  return { ...settings, keyConfigured: Boolean(apiKey), keyFromEnvironment: Boolean(process.env[speechProviderInfo[provider].keyEnv]?.trim()) };
+}
 
 export function dataDirectory(): string {
   return resolve(process.env.QQBOT_DATA_DIR ||
@@ -121,7 +132,10 @@ export class ConfigStore {
     config.appSecret = process.env.QQBOT_SECRET || config.appSecret;
     config.cwd = resolve(process.env.QQBOT_CWD || config.cwd);
     config.codexCommand = process.env.QQBOT_CODEX_COMMAND || config.codexCommand;
-    config.live.apiKey = process.env.OPENAI_API_KEY || config.live.apiKey;
+    config.live.apiKey = process.env.OPENAI_API_KEY?.trim() || config.live.apiKey;
+    for (const provider of ttsProviders) {
+      config.live[provider].apiKey = process.env[speechProviderInfo[provider].keyEnv]?.trim() || config.live[provider].apiKey;
+    }
     return config;
   }
 
@@ -132,6 +146,14 @@ export class ConfigStore {
     delete merged.autoCompactThreshold;
     for (const key of ['access', 'media', 'vision', 'sendFile', 'live']) {
       if (patch[key] && typeof patch[key] === 'object') merged[key] = { ...raw[key], ...patch[key] as object };
+    }
+    const livePatch = patch.live as Partial<LiveConfig> | undefined;
+    if (livePatch && typeof livePatch === 'object') {
+      for (const provider of [...ttsProviders, 'sovits'] as const) {
+        if (livePatch[provider] && typeof livePatch[provider] === 'object') {
+          merged.live[provider] = { ...raw.live?.[provider], ...livePatch[provider] };
+        }
+      }
     }
     const config = normalizePermissions(configSchema.parse(merged));
     if (config.preset && !config.presets[config.preset]) throw new Error(`默认预设不存在：${config.preset}`);
@@ -149,8 +171,10 @@ export class ConfigStore {
 
   publicConfig(): PublicBotConfig {
     const { appSecret, live, ...config } = this.read();
-    const { apiKey, ...speech } = live;
+    const { dashscope, minimax, mimo, sovits, ...openai } = live;
     return { ...config, credentialsConfigured: Boolean(config.appId && appSecret),
-      live: { ...speech, keyConfigured: Boolean(apiKey), keyFromEnvironment: Boolean(process.env.OPENAI_API_KEY) } };
+      live: { ...publicSpeechProfile(openai, 'openai'), dashscope: publicSpeechProfile(dashscope, 'dashscope'),
+        minimax: publicSpeechProfile(minimax, 'minimax'), mimo: publicSpeechProfile(mimo, 'mimo'),
+        sovits: { ...sovits, ...localSpeechStatus() } } };
   }
 }

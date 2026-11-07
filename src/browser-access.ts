@@ -111,7 +111,7 @@ export class BrowserAccess {
     const server = this.runtime();
     const transport = new StdioClientTransport({ command: server.command, args: server.args || [],
       env: { ...process.env, ...server.env, ...this.environment, BROWSER_USE_ACCESS_EXECUTOR_ID: identity }, stderr: 'pipe' });
-    const client = new Client({ name: 'qqbot-browser', version: '0.0.6' });
+    const client = new Client({ name: 'qqbot-browser', version: '0.0.7' });
     // Runtime diagnostics stay local and must not echo browser credentials into QQ.
     transport.stderr?.on('data', () => {});
     try { await client.connect(transport); }

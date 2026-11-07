@@ -9,9 +9,10 @@ import type { ChatTransport, IncomingInteraction, IncomingMessage } from './qq-t
 import { SessionStore, sessionNameSchema, sessionSettingsSchema, sessionPermissions, type SessionSettings } from './session-store.ts';
 import { promptPolicyVersion } from './prompt-policy.ts';
 import { chunkMarkdownText } from './transport/chunker.ts';
+import { groupMention } from './transport/reply-target.ts';
 import { assistantText, fileCitations } from './message-format.ts';
 import { StreamingWriter } from './transport/streaming-writer.ts';
-import { fileSendModes, type FileSendMode, type Logger, type ReplyTarget } from './types.ts';
+import { fileSendModes, type DirectMentions, type FileSendMode, type GroupMemberPage, type Logger, type ReplyTarget } from './types.ts';
 import { describeImage } from './vision.ts';
 import { localMessagePrefix, qqMessagePrefix, storageMessagePrefix, sentFilePrefix, groupContextPrefix, referenceMessagePrefix, userMessage, conversationActivity, type ConversationMessage, type ConversationActivity } from './conversation.ts';
 import { ConversationStorage } from './storage.ts';
@@ -19,6 +20,8 @@ import { GroupContextStore, type GroupContextEntry } from './group-context.ts';
 import { MessageReferenceStore, type MessageReference, type ReferenceFile } from './message-reference.ts';
 import { contextUsage, type ContextUsage } from './context-usage.ts';
 import type { ThreadToolSpec } from './thread-tool-cache.ts';
+import type { LiveJob } from './gpt-live.ts';
+import { speechTextLimit } from './sovits-settings.ts';
 
 interface AgentMessage {
   text: string;
@@ -41,13 +44,16 @@ interface ActiveTurn {
   presentedImages?: Set<string>;
   importedFiles?: Map<string, Promise<string>>;
   fileDelivery?: Promise<void>;
+  replySpeech?: 'pending' | 'handled';
   timer: NodeJS.Timeout;
   cancelled?: boolean;
   interruptSent?: boolean;
   abort: AbortController;
   inputText: string;
 }
-class QQDeliveryError extends Error {}
+export class QQDeliveryError extends Error {
+  constructor(message: string, readonly remainingText?: string) { super(message); }
+}
 interface ContextOperation {
   kind: 'reset' | 'compact'; status: 'running' | 'completed' | 'cancelled' | 'failed';
   message: string; startedAt: number; finishedAt?: number;
@@ -88,9 +94,9 @@ export const dynamicTools = [
   { type: 'function', name: 'qqbot_send_file', description: 'Send an existing local file to the QQ user or group that requested this task. Set send_as=file to deliver the original downloadable file, or send_as=voice for a voice message. MP3 defaults to a file; ZIP wrapping is unnecessary.', inputSchema: fileParameters },
   { type: 'function', name: 'qqbot_ask_question', description: 'Ask the current QQ user a question and wait for their choice or free text. Set multiple=true to accept several numbered choices.', inputSchema: { type: 'object', properties: { question: { type: 'string' }, options: { type: 'array', items: { type: 'string' } }, multiple: { type: 'boolean' } }, required: ['question'], additionalProperties: false } },
   { type: 'function', name: 'qqbot_describe_image', description: 'Analyze a local image through the configured Codex vision model. Use when the user sends an image or asks about a screenshot.', inputSchema: { type: 'object', properties: { file_path: { type: 'string' }, prompt: { type: 'string' } }, required: ['file_path'], additionalProperties: false } },
-  { type: 'function', name: 'qqbot_live', description: 'Generate a short spoken audio clip with the configured GPT-Live API and voice ONLY when the human requests audio. action=generate waits for a finalized WAV clip; send_to_qq=true sends it once to the current QQ conversation (send_as=file or voice). Requires GPT-Live enabled, a configured API key and network access. action=create_voice creates a voice from a text description only when explicitly requested; returns a voice ID, without changing settings. No music generation or guarantee of verbatim speech. Never request API keys in QQ; use the local settings UI.', inputSchema: {
+  { type: 'function', name: 'qqbot_live', description: 'Generate a short spoken WAV clip with the active voice provider ONLY when the human requests audio. Pass the text to speak. action=generate waits for completion; send_to_qq=true sends it to the current QQ conversation (send_as=file or voice). For local GPT-SoVITS, omit voice and voice_id to use the installed voice pack. Cloud providers require credentials and network access. action=create_voice requires OpenAI GPT-Live and an explicit request.', inputSchema: {
     type: 'object', properties: { action: { type: 'string', enum: ['generate', 'status', 'cancel', 'create_voice'], default: 'generate' },
-      text: { type: 'string', maxLength: 1500 }, voice: { type: 'string' }, voice_id: { type: 'string' }, send_to_qq: { type: 'boolean', default: false },
+      text: { type: 'string', maxLength: speechTextLimit }, voice: { type: 'string' }, voice_id: { type: 'string' }, send_to_qq: { type: 'boolean', default: false },
       send_as: { type: 'string', enum: ['file', 'voice'], default: 'file' }, job_id: { type: 'string' }, name: { type: 'string' }, prompt: { type: 'string' } }, additionalProperties: false } },
   { type: 'function', name: 'qqbot_desktop', description: 'List and read existing Codex desktop project conversations, or dispatch a task to one ONLY when the current human asks that conversation to work. Use list/read to select the exact target, dispatch once, then jobs to check progress. Busy target conversations wait until idle. By default the completed result is automatically sent to this QQ conversation; do not send it again. Keeps the desktop conversation model, permissions and context. Requires full access. Never start a second Codex process to resume the desktop thread.', inputSchema: {
     type: 'object', properties: { action: { type: 'string', enum: ['list', 'read', 'dispatch', 'jobs', 'cancel', 'retry_delivery'] },
@@ -135,9 +141,9 @@ export class QQBridge {
     }
     client.onNotification((message) => this.notification(message));
     client.requestHandler = (message) => this.serverRequest(message);
-    client.onExit((error) => {
-      this.broker.close();
-      for (const peer of this.peers.values()) {
+    client.onExit((error, threads) => {
+      for (const peer of this.peers.values()) if (peer.threadId && threads.has(peer.threadId)) {
+        this.broker.cancelThread(peer.threadId);
         peer.loaded = false;
         peer.active?.fail(error);
       }
@@ -177,7 +183,7 @@ export class QQBridge {
       contextOperation: peer.contextOperation ? { ...peer.contextOperation } : undefined,
       contextUsage: peer.contextUsage?.threadId === peer.threadId ? peer.contextUsage : undefined,
       contextSettings: { contextWindow: peer.contextWindow ?? this.config.contextWindow },
-      busy: Boolean(peer.active), queued: peer.queued, loaded: peer.loaded, lastActive: peer.lastActive, storage: this.storage.paths(peer.target) })),
+      busy: Boolean(peer.active), readingReply: peer.active?.replySpeech === 'pending', queued: peer.queued, loaded: peer.loaded, lastActive: peer.lastActive, storage: this.storage.paths(peer.target) })),
       observedPeers: Object.fromEntries(this.observedPeers), pending: this.broker.list() };
   }
 
@@ -418,14 +424,36 @@ export class QQBridge {
     return this.allowed(event.target, event.senderId) && this.broker.interaction(event);
   }
 
-  async send(target: ReplyTarget, text: string): Promise<void> {
+  async groupMembers(target: ReplyTarget, cursor?: string): Promise<GroupMemberPage> {
+    if (target.scope !== 'group' || !this.peers.has(`${this.config.appId}:group:${target.targetId}`)) {
+      throw new Error('请先选择已有的 QQ 群聊。');
+    }
+    if (this.transport.groupMembers) {
+      try { return { ...await this.transport.groupMembers(target.targetId, cursor), source: 'qq' }; }
+      catch { /* QQ restricts the group roster API. The group archive still provides known senders. */ }
+    }
+    return { members: await this.groupContext.members(target), source: 'history' };
+  }
+
+  async send(target: ReplyTarget, text: string, selection: DirectMentions = {}): Promise<void> {
     text = assistantText(text, 'qq');
-    if (!text.trim()) return;
-    try { for (const chunk of chunkMarkdownText(text, this.config.textChunkLimit)) {
-      const receipt = await this.transport.sendMarkdown(target, chunk);
-      this.rememberSent(target, receipt, chunk);
-    } }
-    catch (error) { throw new QQDeliveryError(`QQ 消息发送失败：${error instanceof Error ? error.message : String(error)}`); }
+    const mentions = selection.everyone ? '<qqbot-at-everyone />' : (selection.memberIds || []).map(groupMention).join(' ');
+    if (!text.trim() && !mentions) return;
+    const limit = mentions ? Math.max(100, this.config.textChunkLimit - mentions.length - 1) : this.config.textChunkLimit;
+    let offset = 0;
+    for (const [index, chunk] of chunkMarkdownText(text.trim() ? text : '', limit).entries()) {
+      const content = index === 0 && mentions ? (chunk ? `${mentions}\n${chunk}` : mentions) : chunk;
+      const start = text.indexOf(chunk, offset);
+      let receipt: unknown;
+      try { receipt = await this.transport.sendMarkdown(target, content); }
+      catch (error) {
+        throw new QQDeliveryError(`QQ 消息发送失败：${error instanceof Error ? error.message : String(error)}`,
+          index > 0 ? text.slice(start) : undefined);
+      }
+      offset = start + chunk.length;
+      try { this.rememberSent(target, receipt, content); }
+      catch (error) { this.logger.warn(`已发送的 QQ 消息归档失败：${error instanceof Error ? error.message : String(error)}`); }
+    }
   }
 
   async sendFile(target: ReplyTarget, path: string, sendAs: FileSendMode = 'auto'): Promise<unknown> {
@@ -529,6 +557,7 @@ export class QQBridge {
         });
       }
     }
+    if (peer.threadId && peer.threadId !== result.thread.id) peer.previousThreadId = peer.threadId;
     if (peer.contextUsage?.threadId !== result.thread.id) peer.contextUsage = undefined;
     peer.threadId = result.thread.id;
     peer.promptPolicyVersion = promptPolicyVersion;
@@ -783,6 +812,7 @@ export class QQBridge {
             this.rememberGroupReply(peer, item.id, item.text);
           }
         }
+        if (turn.status === 'completed') await this.readReply(active, turn.items || []);
       });
       void active.chain.then(() => {
         if (turn.status === 'failed') active.fail(new Error(turn.error?.message || 'Codex 执行失败。'));
@@ -796,6 +826,28 @@ export class QQBridge {
   private enqueue(active: ActiveTurn, action: () => Promise<void>): void {
     active.chain = active.chain.then(action);
     void active.chain.catch(active.fail);
+  }
+
+  private autoSpeakEnabled(): boolean {
+    const { enabled, provider, sovits } = this.config.live;
+    return enabled && provider === 'sovits' && sovits.autoSpeak;
+  }
+
+  private async readReply(active: ActiveTurn, items: any[]): Promise<void> {
+    if (!this.liveAudio || !this.autoSpeakEnabled() || active.replySpeech || active.cancelled || active.abort.signal.aborted
+      || active.sentFiles.size >= this.config.sendFile.maxFiles) return;
+    const final = [...items].reverse().find(item => item.type === 'agentMessage' && item.phase !== 'commentary' && typeof item.text === 'string' && item.text.trim())
+      || [...active.messages.values()].reverse().find(item => item.delivered && item.phase !== 'commentary' && item.text.trim());
+    const text = final ? assistantText(final.text, 'qq').trim() : '';
+    if (!text || text.length > speechTextLimit) return;
+    active.replySpeech = 'pending';
+    try {
+      const job = await this.liveAudio(active.target, { action: 'generate', text }, active.abort.signal) as LiveJob;
+      if (job.status === 'failed') throw new Error(job.error || '语音生成失败。');
+      if (job.result && this.autoSpeakEnabled()) await this.deliverFile(active, job.result.path, 'voice');
+    } catch (error) {
+      if (!active.abort.signal.aborted) this.logger.warn(`自动朗读失败：${error instanceof Error ? error.message : error}`);
+    } finally { active.replySpeech = 'handled'; }
   }
 
   private async deliverLinks(active: ActiveTurn, text: string): Promise<void> {
@@ -833,12 +885,14 @@ export class QQBridge {
       if (active.abort.signal.aborted || active.cancelled) throw new Error('文件发送已取消。');
       const actual = await this.filePath(active.target, path, active.importedFiles ||= new Map());
       if (sendAs === undefined && [...active.sentFiles].some(key => key.endsWith(`\0${actual}`))) return actual;
-      const key = `${fileSendKind(actual, sendAs)}\0${actual}`;
+      const kind = fileSendKind(actual, sendAs);
+      const key = `${kind}\0${actual}`;
       if (!active.sentFiles.has(key)) {
         if (active.sentFiles.size >= this.config.sendFile.maxFiles) throw new Error('已达到单轮文件发送数量上限。');
         const receipt = await this.transport.sendFile(active.target, actual, basename(actual), sendAs);
         this.rememberSent(active.target, receipt, '', [this.sentFile(actual)]);
         active.sentFiles.add(key);
+        if (kind === 'voice') active.replySpeech = 'handled';
       }
       return actual;
     });
@@ -1009,7 +1063,7 @@ export class QQBridge {
       const transmission = message.sentAt && Number.isFinite(message.sentAt) ? `${Math.max(0, receivedAt - message.sentAt)} ms（按消息时间估算）` : '无消息时间';
       await this.send(message.target, `pong · QQ Bot\n传输耗时：${transmission}\n接收至处理：${Math.max(0, Date.now() - receivedAt)} ms`);
     }
-    else if (command === '/bot-version') await this.send(message.target, 'QQ Bot 0.0.6');
+    else if (command === '/bot-version') await this.send(message.target, 'QQ Bot 0.0.7');
     else if (command === '/bot-me') await this.send(message.target, `你的 OpenID：${message.senderId || '无法取得'}${message.target.scope === 'group' ? `\n本群 OpenID：${message.target.targetId}` : ''}`);
     else if (command === '/bot-help') await this.send(message.target, '以下指令可用于已获准访问的私聊与群聊：\n/new 新会话\n/compact 压缩历史\n/model 查看或切换模型\n/preset 查看或切换预设\n/effort 查看或切换推理强度\n/stop 中止任务\n/bot-me 查看你的 OpenID 与群 OpenID\n/bot-status 会话状态\n/bot-ping 连通检查\n/bot-version 版本\n/answer 请求编号 答案\n模型、预设和操作确认均遵循当前访问范围；白名单模式仅限名单内用户。');
     else if (command === '/answer') { await this.send(message.target, '未找到匹配的待答请求，或当前用户不是本轮发起者。'); }
@@ -1061,14 +1115,17 @@ export class QQBridge {
           return { success: true, contentItems: [{ type: 'inputText', text: `已发送 ${basename(path)}` },
             { type: 'inputText', text: sentFilePrefix + JSON.stringify({ path, kind: fileSendKind(path, mode) }) }] };
         } else if (params.tool === 'qqbot_live') {
-          if (!this.liveAudio) throw new Error('GPT-Live 接口不可用，请更新 QQ Bot 后台。');
+          if (!this.liveAudio) throw new Error('语音合成接口不可用，请更新 QQ Bot 后台。');
           const permissions = sessionPermissions(this.config, peer);
-          if (['generate', 'create_voice'].includes(args.action || 'generate') && !permissions.networkAccess && permissions.sandbox !== 'danger-full-access') throw new Error('本会话禁止联网，无法调用语音服务。');
-          const result: any = await this.liveAudio(active.target, { ...args, action: args.action || 'generate' }, active.abort.signal);
+          const action = args.action || 'generate';
+          const needsInternet = action === 'create_voice' || action === 'generate' && this.config.live.provider !== 'sovits';
+          if (needsInternet && !permissions.networkAccess && permissions.sandbox !== 'danger-full-access') throw new Error('本会话禁止联网，无法调用云端语音服务。');
+          const result: any = await this.liveAudio(active.target, { ...args, action }, active.abort.signal);
           if (result.status === 'failed' || result.status === 'cancelled') throw new Error(result.error || '语音生成未完成。');
           if (args.send_to_qq === true && result.result?.path) {
             const mode = fileSendModeSchema.parse(args.send_as || 'file');
             const path = await this.deliverFile(active, result.result.path, mode);
+            active.replySpeech = 'handled';
             return { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify({ ...result, sent: true, send_as: mode }) },
               { type: 'inputText', text: sentFilePrefix + JSON.stringify({ path, kind: fileSendKind(path, mode) }) }] };
           }

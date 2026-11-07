@@ -5,7 +5,7 @@ import { resolveReplyTarget, sendResolvedMarkdown } from './transport/reply-targ
 import { ReplyLimiter } from './transport/reply-limiter.ts';
 import { replyPolicy } from './transport/reply-policy.ts';
 import type { BotConfig } from './config.ts';
-import type { FileSendMode, Logger, RawAttachment, ReplyTarget } from './types.ts';
+import { isGroupMemberId, type FileSendMode, type GroupMemberPage, type Logger, type RawAttachment, type ReplyTarget } from './types.ts';
 import type { QQBotSender } from './transport/outbound-buffer.ts';
 import { fileSendKind } from './media.ts';
 import { referenceFromMessage, type MessageReference } from './message-reference.ts';
@@ -35,6 +35,7 @@ export interface ChatTransport extends QQBotSender {
   connect(onMessage: (message: IncomingMessage) => Promise<void>, onInteraction: (event: IncomingInteraction) => boolean): Promise<void>;
   close(): void;
   sendFile(target: ReplyTarget, path: string, fileName: string, sendAs?: FileSendMode): Promise<unknown>;
+  groupMembers?(groupId: string, cursor?: string): Promise<Omit<GroupMemberPage, 'source'>>;
 }
 
 export class QQTransport implements ChatTransport {
@@ -51,7 +52,7 @@ export class QQTransport implements ChatTransport {
       appId: config.appId,
       appSecret: config.appSecret,
       transport: 'websocket',
-      userAgent: 'codex-qqbot/0.0.6',
+      userAgent: 'codex-qqbot/0.0.7',
       logger,
       baseUrl: process.env.QQBOT_BASE_URL || 'https://api.bot.qq.com',
       tokenBaseUrl: process.env.QQBOT_TOKEN_BASE_URL || 'https://api.bot.qq.com',
@@ -146,6 +147,19 @@ export class QQTransport implements ChatTransport {
 
   sendMarkdown(target: ReplyTarget, text: string, opts?: { keyboard?: InlineKeyboard }): Promise<unknown> {
     return sendResolvedMarkdown(this.bot, resolveReplyTarget(target, this.limiters[target.scope], true), text, opts);
+  }
+
+  async groupMembers(groupId: string, cursor?: string): Promise<Omit<GroupMemberPage, 'source'>> {
+    const { appId, clientSecret } = this.bot.getCredentials();
+    const token = await this.bot.tokenManager.getAccessToken(appId, clientSecret);
+    const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+    const page = await this.bot.apiClient.request<{
+      members: Array<{ member_openid: string; username?: string; bot?: boolean }>;
+      next_cursor?: string;
+    }>(token, 'GET', `/v2/groups/${encodeURIComponent(groupId)}/members${query}`, undefined, { timeoutMs: 5000 });
+    const members = page.members.filter(member => !member.bot && isGroupMemberId(member.member_openid))
+      .map(member => ({ id: member.member_openid, name: member.username?.trim() || undefined }));
+    return { members, nextCursor: page.next_cursor || undefined };
   }
 
   openStream(target: ReplyTarget) {

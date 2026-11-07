@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.0.7 - 2026-11-07
+
+- Add Alibaba Cloud CosyVoice, MiniMax Speech, Xiaomi MiMo, and local GPT-SoVITS. Cloud services retain separate keys, models, and voices. Preview or download WAV clips, send them to QQ, and retry delivery independently.
+- Tune speed and sampling in local GPT-SoVITS, load it on demand, and unload it when idle. Optional automatic narration follows text replies and skips turns that already sent voice.
+- Mention individual members or everyone in the group direct-send dialog. Fall back to senders from group history when the QQ roster is unavailable, and retain unsent text after partial delivery.
+- Resume Codex threads with their saved model provider to fix qqbot-openai-http and openai mismatches. Explicit provider changes continue in a fork and preserve the original thread.
+- Show sent audio cards on voice-only replies in plugin conversations and preserve the association in the JSON archive.
+- Improve settings save, loading, and error feedback. Keep the Windows daemon running after the Codex client exits and reduce tool and reasoning overhead for image analysis.
+
 ## 0.0.6 - 2026-11-03
 
 - Restore the locally saved desktop/browser attachment after a QQ daemon restart and refresh it from parent-session status metadata; retain native account and browser permission checks.

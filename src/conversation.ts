@@ -92,7 +92,7 @@ export async function readConversation(client: CodexClient, threadId: string, cu
     for (const item of turn.items || []) {
       let path: string | undefined, image: boolean | undefined;
       if (item.type === 'imageGeneration' && typeof item.savedPath === 'string') { path = item.savedPath; image = true; }
-      else if (item.type === 'dynamicToolCall' && item.tool === 'qqbot_send_file' && item.success === true) {
+      else if (item.type === 'dynamicToolCall' && item.success === true && ['qqbot_send_file', 'qqbot_live'].includes(item.tool)) {
         const metadata = (item.contentItems || []).find((part: any) => part.type === 'inputText' && part.text?.startsWith(sentFilePrefix));
         if (metadata) {
           try {
@@ -100,7 +100,7 @@ export async function readConversation(client: CodexClient, threadId: string, cu
             if (typeof sent.path === 'string') { path = sent.path; image = sent.kind === 'image'; }
           } catch { /* Older tool results still resolve through their original arguments. */ }
         }
-        path ||= typeof item.arguments?.file_path === 'string' ? item.arguments.file_path : undefined;
+        if (!path && item.tool === 'qqbot_send_file' && typeof item.arguments?.file_path === 'string') path = item.arguments.file_path;
       }
       if (!path) continue;
       const local = localFilePath(path);

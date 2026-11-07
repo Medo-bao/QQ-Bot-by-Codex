@@ -2,7 +2,7 @@
 
 Use local Codex from QQ private chats, QQ groups and a desktop plugin interface to handle conversations, run tasks and deliver files.
 
-**Current version: 0.0.6** · [中文](README.md) · [Changelog](CHANGELOG_EN.md) · [Source release](https://github.com/Medo-bao/QQ-Bot-by-Codex/releases/tag/v0.0.6)
+**Current version: 0.0.7** · [中文](README.md) · [Changelog](CHANGELOG_EN.md) · [Source release](https://github.com/Medo-bao/QQ-Bot-by-Codex/releases/tag/v0.0.7)
 
 QQ Bot connects Tencent's QQ Bot SDK to a local Codex App Server and reuses your Codex login, model providers and tools. DSH is not required. Adapted from [tencent-connect/dsh-qqbot](https://github.com/tencent-connect/dsh-qqbot), under the MIT license.
 
@@ -10,13 +10,17 @@ Desktop/browser routing is saved in the local data directory and restored after 
 
 ## Features
 
-Optional **Settings → Voice and timbre** connects GPT-Live using an existing OpenAI project API key, separately from Codex login and billing. The password field stores the key locally without returning it in status responses; `OPENAI_API_KEY` is also supported. Enable the feature and save before generating clips.
+In **Settings → Voice and timbre**, select Alibaba Cloud CosyVoice, MiniMax Speech, Xiaomi MiMo, or OpenAI GPT-Live. Enter that provider’s API key and save. Each provider retains its own credentials, model and voice. Environment variables `DASHSCOPE_API_KEY`, `MINIMAX_API_KEY`, `MIMO_API_KEY` and `OPENAI_API_KEY` also work. Use the matching region for Alibaba Cloud and MiniMax.
 
-`qqbot_live` generates bounded WAV speech clips with built-in voices or a custom voice ID. The settings page can create a voice from a text description, play/download the generated clip, and optionally send it as an original file or a QQ voice message. Conversation clips stay in their archived thread's `audio` folder; standalone previews stay in the bot's `voice-previews` directory. Failed delivery can be retried without generating again. Codex continues to handle reasoning and tools.
+Choose **GPT-SoVITS · 本地** to use the installed voice pack and local engine shared with DSH. The default installation is `E:\DSH\gpt-sovits`. Set `QQBOT_SOVITS_ROOT` in the local environment for another installation. GPT-SoVITS starts on demand and needs no API key.
+
+Local speech settings include temperature, Top-k, Top-p, speed, segment length and idle unload. Set the idle time to 0 to keep an engine started by QQ Bot resident. Enable automatic reading to add one voice message after each successful QQ text reply. A turn that already delivered audio skips automatic reading.
+
+`qqbot_live` generates WAV clips with the saved provider. Cloud providers support per-request voice overrides, and GPT-SoVITS uses its installed pack. The settings page offers playback, download, and optional QQ delivery as a WAV file or voice message. Conversation clips go to their thread's `audio` folder. Standalone previews go to `voice-previews`. Failed delivery can be retried separately. Prompt-based voice creation is available with OpenAI GPT-Live.
 
 The MCP tool starts an asynchronous job: use `action: "generate"`, then poll `action: "status"` with the same destination and `job_id`. Sending requires explicit `send_to_qq: true`. The scoped QQ dynamic tool waits for generation and reports its send receipt. `action: "create_voice"` returns a voice ID without changing global settings.
 
-Live does not emit an audio-done event. Clips use a configurable silence window and require `session.closed` finalization; interrupted, timed-out and cancelled clips are not delivered. This is speech generation, without guaranteed verbatim wording, music synthesis or continuous microphone-call UI. See [OpenAI Live WebSockets](https://developers.openai.com/api/docs/guides/voice-websockets) and [custom voices](https://developers.openai.com/api/docs/guides/custom-voices).
+The three dedicated TTS adapters synthesize the supplied text and wait for provider completion before saving a WAV. GPT-Live uses a configurable silence window and requires `session.closed` to finalize. GPT-Live may paraphrase the input. [Alibaba Cloud](https://help.aliyun.com/en/model-studio/cosyvoice-websocket-api) · [MiniMax](https://platform.minimax.io/docs/api-reference/speech-t2a-http) · [Xiaomi MiMo](https://mimo.mi.com/docs/en-US/api/audio/tts-post) · [OpenAI](https://developers.openai.com/api/docs/guides/voice-websockets)
 
 | Feature | What it does |
 | --- | --- |

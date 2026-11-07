@@ -1,9 +1,9 @@
 import { startQrConnect } from '@tencent-connect/qqbot-connector';
 import { ConfigStore } from './config.ts';
 import { CodexClient, openAIHttpProvider } from './codex-client.ts';
-import { QQBridge } from './bridge.ts';
+import { QQBridge, QQDeliveryError } from './bridge.ts';
 import { QQTransport } from './qq-transport.ts';
-import type { Logger, ReplyTarget } from './types.ts';
+import { isGroupMemberId, maxGroupMentions, type DirectMentions, type Logger, type ReplyTarget } from './types.ts';
 import QRCode from 'qrcode';
 import { SessionStore, sessionNameSchema, sessionSettingsSchema, sessionPermissions } from './session-store.ts';
 import { readConversation } from './conversation.ts';
@@ -14,6 +14,7 @@ import { basename, extname } from 'node:path';
 import { DesktopTasks } from './desktop-tasks.ts';
 import { BrowserAccess, browserEnvironmentKeys } from './browser-access.ts';
 import { GptLive } from './gpt-live.ts';
+import { keyedSpeechProviders, speechProviderInfo } from './speech-providers.ts';
 import { DesktopAttachmentStore } from './desktop-attachment.ts';
 
 export class BotController {
@@ -99,6 +100,7 @@ export class BotController {
       throw new Error('此设置需要重新连接 QQ，请等待当前任务与排队消息处理完成后保存，或先中止任务。');
     }
     this.store.update(patch);
+    this.liveAudio.setLocalIdleMinutes(config.live.sovits.idleMinutes);
     if (!bridge && contextChanged) {
       const sessions = new SessionStore(this.store.directory);
       for (const [key, saved] of sessions.entries()) if (key.startsWith(`${config.appId}:`) && saved.contextWindow == null && saved.contextUsage) {
@@ -146,9 +148,9 @@ export class BotController {
     return this.status();
   }
 
-  async send(target: ReplyTarget, text: string): Promise<unknown> {
+  async send(target: ReplyTarget, text: string, mentions?: DirectMentions): Promise<unknown> {
     if (!this.bridge || !this.connected) throw new Error('QQ 连接尚未启动。');
-    await this.bridge.send(target, text); return { sent: true };
+    await this.bridge.send(target, text, mentions); return { sent: true };
   }
 
   async sendFile(target: ReplyTarget, path: string, sendAs?: unknown): Promise<unknown> {
@@ -177,10 +179,12 @@ export class BotController {
   async login(): Promise<unknown> { return (await this.controls()).call('account/login/start', { type: 'chatgpt' }); }
 
   async dispose(): Promise<void> {
-    await this.liveAudio.close();
     await this.browserAccess.dispose();
     this.desktopTasks.close();
-    this.cancelBinding(); await this.stop(); await this.controlClient?.close(); this.controlClient = undefined;
+    this.cancelBinding();
+    await this.stop();
+    await this.liveAudio.close();
+    await this.controlClient?.close(); this.controlClient = undefined;
   }
 
   async catalog(): Promise<unknown> {
@@ -299,7 +303,8 @@ export class BotController {
     }
     const owner = `${config.appId}:${target ? `${target.scope}:${target.targetId}` : 'voice-preview'}`;
     const operation = params.action || 'status';
-    if (['generate', 'create_voice', 'retry_send'].includes(operation)) {
+    const needsInternet = operation === 'create_voice' || operation === 'retry_send' || operation === 'generate' && config.live.provider !== 'sovits';
+    if (needsInternet) {
       const saved = target ? new SessionStore(this.store.directory).get(`${config.appId}:${target.scope}:${target.targetId}`) : undefined;
       const permissions = sessionPermissions(config, saved || {});
       if (!permissions.networkAccess && permissions.sandbox !== 'danger-full-access') throw new Error('当前会话禁止联网，无法调用语音服务；请在会话设置中调整。');
@@ -331,7 +336,7 @@ export class BotController {
         if (params.send_to_qq) void deliver(job.id);
         return wait ? this.liveAudio.wait(owner, job.id) : job;
       }
-      default: throw new Error('未知 GPT-Live 操作。');
+      default: throw new Error('未知语音操作。');
     }
   }
 
@@ -340,10 +345,14 @@ export class BotController {
       case 'status': return this.status();
       case 'live': return this.live(params);
       case 'liveCredentials': {
-        if (process.env.OPENAI_API_KEY) throw new Error('当前使用环境变量 OPENAI_API_KEY，请在本机环境中修改或移除后重试。');
+        if (params.provider === 'sovits') throw new Error('GPT-SoVITS 在本机运行，无需 API Key。');
+        const provider = keyedSpeechProviders.find(value => value === (params.provider ?? 'openai'));
+        if (!provider) throw new Error('未知语音供应商。');
+        const variable = speechProviderInfo[provider].keyEnv;
+        if (process.env[variable]?.trim()) throw new Error(`当前使用环境变量 ${variable}，请在本机环境中修改或移除。`);
         if (params.clear !== true && (typeof params.apiKey !== 'string' || !params.apiKey.trim())) throw new Error('请输入现有 API Key。');
-        await this.configure({ live: { apiKey: params.clear === true ? '' : params.apiKey.trim() } });
-        return this.status();
+        const apiKey = params.clear === true ? '' : params.apiKey.trim();
+        return this.configure({ live: provider === 'openai' ? { apiKey } : { [provider]: { apiKey } } });
       }
       case 'desktopAttach': {
         const desktop = this.desktopAttachment.update(params);
@@ -375,7 +384,11 @@ export class BotController {
         return { dataUrl: await QRCode.toDataURL(this.binding.qrUrl, { width: 360, margin: 2 }) };
       }
       case 'session':
-        if ((params.scope !== 'c2c' && params.scope !== 'group') || !params.target_id) throw new Error('需要有效的会话目标。');
+        if ((params.scope !== 'c2c' && params.scope !== 'group') || typeof params.target_id !== 'string' || !params.target_id) throw new Error('需要有效的会话目标。');
+        if (params.action === 'groupMembers') {
+          if (!this.bridge || !this.connected) throw new Error('QQ 连接尚未启动。');
+          return this.bridge.groupMembers({ scope: params.scope, targetId: params.target_id }, typeof params.cursor === 'string' ? params.cursor : undefined);
+        }
         if (params.action === 'desktop') return this.desktop(params.scope, params.target_id, { ...params, action: params.operation });
         if (params.action === 'preview') {
           if (typeof params.file_path !== 'string') throw new Error('需要有效的图片路径。');
@@ -397,8 +410,20 @@ export class BotController {
           return this.sendFile({ scope: params.scope, targetId: params.target_id }, params.file_path, params.send_as);
         }
         if (params.action === 'send') {
-          if (typeof params.text !== 'string' || !params.text.trim()) throw new Error('请输入要发送的消息。');
-          return this.send({ scope: params.scope, targetId: params.target_id }, params.text);
+          const members = params.mention_ids === undefined ? [] : params.mention_ids;
+          const everyone = params.mention_everyone === undefined ? false : params.mention_everyone;
+          if (!Array.isArray(members) || members.length > maxGroupMentions || !members.every(isGroupMemberId)) throw new Error('请选择有效的群成员。');
+          if (typeof everyone !== 'boolean' || everyone && members.length) throw new Error('请选择 @全体成员或指定成员。');
+          if ((everyone || members.length) && params.scope !== 'group') throw new Error('只有群聊支持 @成员。');
+          if (typeof params.text !== 'string' || (!params.text.trim() && !everyone && !members.length)) throw new Error('请输入要发送的消息或选择要 @ 的成员。');
+          try {
+            return await this.send({ scope: params.scope, targetId: params.target_id }, params.text, { memberIds: [...new Set<string>(members)], everyone });
+          } catch (error) {
+            if (error instanceof QQDeliveryError && error.remainingText !== undefined) {
+              return { sent: false, error: error.message, remaining_text: error.remainingText };
+            }
+            throw error;
+          }
         }
         if (params.action === 'chat') {
           if (!this.bridge || !this.connected) throw new Error('请先启动 QQ 连接。');

@@ -225,7 +225,8 @@ async function execute(threadId, turnId, input) {
     writeFileSync(source, 'fixture source'); writeFileSync(output, 'fixture output');
     citationAnswer = `已读完😀\n:codex-file-citation{path="${source}" purpose="source"}\n:codex-file-citation{path="${output}" purpose="output"}\n:codex-file-citation{path="${output}" purpose="output"}`;
   }
-  const answer = citationAnswer || (generatedFile ? `Generated image: ![preview](<${generatedFile}>)` : process.env.QQBOT_FIXTURE_UI === '1'
+  const answer = citationAnswer || (generatedFile && text.includes('audio-only') ? '' : text.includes('auto-speak-check') ? '这是最终回复。'
+    : generatedFile ? `Generated image: ![preview](<${generatedFile}>)` : process.env.QQBOT_FIXTURE_UI === '1'
     ? text.includes('优先级') ? '可以，先按 **紧急程度** 和预计耗时安排优先级。\n\n工作资料会放在 `E:\\QQ\\storage`。\n\n| 事项 | 安排 |\n| --- | --- |\n| 今天需要完成 | 优先处理 |\n| 可以延后 | 稍后安排 |\n\n```js\nconst status = "ready";\n```\n\n- 先确认必须完成的工作\n- 再留出休息时间' : text.includes('render-safety-check') ? '<img src=x onerror="window.__qqInjected=true"><script>window.__qqInjected=true</script>' : '可以。我会先整理今天的安排，再标出需要你确认的事项。'
     : 'Codex fixture reply: ' + text.slice(0, 200));
   const turn = histories[threadId]?.find((item) => item.id === turnId);
@@ -242,6 +243,7 @@ async function execute(threadId, turnId, input) {
   turns.delete(threadId);
   usage(threadId, turnId);
   notify('turn/completed', { threadId, turn: { id: turnId, status: 'completed', items: [] } });
+  if (text.includes('auto-speak-check')) notify('turn/completed', { threadId, turn: { id: turnId, status: 'completed', items: [] } });
 }
 
 createInterface({ input: process.stdin }).on('line', (line) => {

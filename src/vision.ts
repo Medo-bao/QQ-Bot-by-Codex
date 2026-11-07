@@ -37,13 +37,24 @@ export async function describeImage(config: BotConfig, logger: Logger, path: str
   try {
     if (signal?.aborted) throw new Error('图片分析已取消。');
     await client.start();
+    const { config: nativeConfig } = await client.call('config/read', { includeLayers: false });
+    const disabledMcpServers = Object.fromEntries(Object.keys(nativeConfig?.mcp_servers ?? {})
+      .map((name) => [`mcp_servers.${name}.enabled`, false]));
     const result = await client.call('thread/start', { cwd: config.cwd, ephemeral: true, sandbox: 'read-only', approvalPolicy: 'never',
       ...((config.vision.model || config.model) ? { model: config.vision.model || config.model } : {}),
       ...((config.vision.provider || config.modelProvider) ? { modelProvider: config.vision.provider || config.modelProvider } : {}),
-      developerInstructions: 'Analyze the supplied image. Do not use tools or inspect unrelated files.' });
+      config: { ...disabledMcpServers, 'features.apps': false, 'features.plugins': false, web_search: 'disabled' },
+      developerInstructions: 'Answer directly from the supplied image. Do not use tools or inspect unrelated files.' });
     threadId = result.thread.id;
-    await client.call('turn/start', { threadId, input: [{ type: 'text', text: prompt || config.vision.defaultPrompt }, { type: 'localImage', path }] });
+    const { data: models } = await client.call('model/list', { includeHidden: true });
+    const model = result.model || config.vision.model || config.model;
+    const selected = models.find((entry: any) => model ? entry.model === model : entry.isDefault);
+    const effort = selected?.supportedReasoningEfforts?.some((entry: any) => entry.reasoningEffort === 'low')
+      ? 'low' : selected?.defaultReasoningEffort;
+    await client.call('turn/start', { threadId, ...(effort ? { effort } : {}),
+      input: [{ type: 'text', text: prompt || config.vision.defaultPrompt }, { type: 'localImage', path }] });
     await complete;
+    if (!output.trim()) throw new Error('视觉理解未返回图片描述。');
     return output.slice(0, config.vision.maxOutputChars);
   } finally { clearTimeout(timer); signal?.removeEventListener('abort', aborted); await dispose(); }
 }

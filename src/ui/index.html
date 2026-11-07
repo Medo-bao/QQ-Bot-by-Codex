@@ -25,7 +25,7 @@
 <button data-tab="models" aria-selected="false"><span>模型与预设</span><small>模型提供商、技能与会话预设</small></button>
 <button data-tab="prompts" aria-selected="false"><span>回复与提示词</span><small>流式输出与个性化提示词</small></button>
 <button data-tab="media" aria-selected="false"><span>图片与文件</span><small>图片理解、附件与交付文件</small></button>
-<button data-tab="live" aria-selected="false"><span>语音与音色</span><small>GPT-Live 调用、试听与 QQ 语音</small></button>
+<button data-tab="live" aria-selected="false"><span>语音与音色</span><small>合成服务、试听与 QQ 语音</small></button>
 <button data-tab="runtime" aria-selected="false"><span>运行设置</span><small>队列、超时与本机数据</small></button>
 </nav></div>
 <div id="collectionSummary" class="collection-summary">QQ Bot</div>
@@ -37,26 +37,146 @@
 <p id="error" role="alert"></p><p id="feedback" role="status"></p>
 <section class="tab" id="tab-connection" hidden><h2>连接 QQ 与 Codex</h2><p>绑定机器人，选择本机工作目录，然后从 QQ 发起任务。</p><div class="section"><div class="connection-grid"><div><h3>QQ Bot</h3><p id="bindingStatus">读取绑定状态</p><div class="row"><button class="primary" id="bind">手机 QQ 扫码</button><button id="cancelBind">取消扫码</button><button class="danger" id="unbind">解绑</button></div><p><a id="qrLink" target="_blank" rel="noreferrer"></a></p><p id="qrStatus" class="notice" role="status" hidden></p><details><summary>使用 AppID / AppSecret 手动绑定</summary><form id="credentials"><label class="field"><span>AppID</span><input name="appId" required autocomplete="off"></label><label class="field"><span>AppSecret</span><input name="appSecret" required type="password" autocomplete="new-password"></label><button type="submit">保存凭据并连接</button></form></details></div><img id="qr" alt="使用手机 QQ 扫码绑定 QQ Bot"></div><div class="notice">凭据保存在本机，页面不会回显 AppSecret。首次连接后，消息来源会显示在「访问范围」中。</div></div><div class="section"><h3>本机 Codex</h3><p id="accountStatus">正在读取登录状态</p><div class="row"><button id="login">登录 Codex</button><button id="refreshAccount">刷新状态</button><a id="loginLink" target="_blank" rel="noreferrer">继续 Codex 登录</a></div></div><div class="section"><h3>工作位置</h3><div id="connectionFields" class="fields"></div></div></section>
 <section class="tab" id="tab-access" hidden><h2>访问范围</h2><p>允许哪些用户和群使用本机 Codex。</p><div id="accessFields" class="fields"></div><div class="notice">群聊任务的发起者也需要被允许。群聊默认只响应 @机器人的消息。</div><div class="section"><h3>最近消息来源</h3><p>向机器人发送消息后，可以在这里添加用户或群。</p><div id="peers"></div></div></section>
-<section class="tab" id="tab-models" hidden><h2>模型与预设</h2><p>留空使用 Codex 的默认设置。预设用于组合模型、提示词、技能和会话配置。</p><div id="modelFields" class="fields"></div><button id="refreshModels">刷新可用模型与技能</button><p id="catalogInfo"></p><datalist id="models"></datalist><datalist id="providers"></datalist><div class="section"><div class="card-head"><h3>会话预设</h3><button id="addPreset">添加预设</button></div><div class="row"><input id="newPresetId" aria-label="新预设 ID" placeholder="新预设 ID，例如 coding" style="max-width:260px"></div><div id="presets"></div><p class="notice">切换预设后，新会话生效。在 QQ 中使用 /preset 查看并切换，再发送 /new。</p></div></section>
+<section class="tab" id="tab-models" hidden><h2>模型与预设</h2><p>留空使用 Codex 的默认设置。预设用于组合模型、提示词、技能和会话配置。</p><div id="modelFields" class="fields"></div><button id="refreshModels">刷新可用模型与技能</button><p id="catalogInfo" role="status"></p><datalist id="models"></datalist><datalist id="providers"></datalist><div class="section"><div class="card-head"><h3>会话预设</h3><button id="addPreset">添加预设</button></div><div class="row"><input id="newPresetId" aria-label="新预设 ID" placeholder="新预设 ID，例如 coding" style="max-width:260px"></div><div id="presets"></div><p class="notice">切换预设后，新会话生效。在 QQ 中使用 /preset 查看并切换，再发送 /new。</p></div></section>
 <section class="tab" id="tab-prompts" hidden><h2>回复与提示词</h2><p>设置 QQ Bot 的默认回复方式与提示词。可在「会话」中为每个私聊或群聊单独设置角色与额外提示词。</p><div class="notice">QQ Bot 不自动注入 Codex 的全局个性化指令、AGENTS 指令或记忆。</div><div id="promptFields" class="fields"></div></section>
 <section class="tab" id="tab-media" hidden><h2>图片与文件</h2><p>处理收到的图片和附件，并把交付文件发送回 QQ。</p><div id="mediaFields" class="fields"></div></section>
 <section class="tab" id="tab-live" hidden>
-<h2>语音与音色</h2><p>使用 GPT-Live 生成短语音，保存为 WAV，并按需发送到 QQ。现有 Codex 继续处理任务。</p>
-<p id="liveConfigurationStatus" class="notice" role="status"></p>
-<div class="section"><h3>OpenAI API Key</h3><form id="liveKeyForm" class="row"><label class="field"><span>现有密钥</span><input id="liveKeyInput" type="password" autocomplete="new-password" spellcheck="false" maxlength="512" placeholder="填写现有 API Key，保存后不回显" required></label><button id="saveLiveKey" type="submit">保存密钥</button><button id="removeLiveKey" class="danger" type="button">移除本机密钥</button></form><p id="liveKeyMessage" class="notice" role="status"></p><p class="notice">密钥仅保存在本机运行配置中，也可读取 OPENAI_API_KEY 环境变量；不会传给 QQ 或写入会话提示词。API 按调用单独计费。</p></div>
-<div class="section"><h3>语音生成设置</h3><div id="liveFields" class="fields"></div><p class="notice">修改后点击「保存设置」生效。GPT-Live 是对话语音模型，朗读可能改写文字，不用于生成歌曲。它没有整段音频完成事件，插件按静音窗口结束片段，并等待会话结束确认；超时或中断不会发送残缺音频。</p></div>
-<div class="section"><h3>生成与试听</h3><form id="liveGenerateForm"><label class="field"><span>朗读文字</span><textarea id="liveText" rows="4" maxlength="1500" required placeholder="输入想说的话，或一段简短的配音文案"></textarea></label><div class="fields"><label class="field"><span>归档与接收会话</span><select id="liveTarget"><option value="">仅试听，保存到机器人试听目录</option></select></label><label class="field"><span>QQ 发送方式</span><select id="liveSendAs"><option value="file">原始 WAV 文件</option><option value="voice">QQ 语音消息</option></select></label></div><label class="field toggle"><span>生成成功后发送到所选 QQ 会话</span><input id="liveSendToQQ" type="checkbox"></label><div class="row"><button id="generateLiveAudio" class="primary" type="submit">生成语音</button><button id="cancelLiveAudio" type="button" hidden>取消生成</button><button id="retryLiveDelivery" type="button" hidden>重试发送</button></div></form><p id="liveProgress" class="notice" role="status" aria-live="polite"></p><p id="liveError" role="alert"></p><audio id="livePlayer" controls preload="metadata" hidden></audio><p><a id="liveDownload" hidden>下载 WAV 音频</a></p><p id="liveTranscript"></p><p id="liveOutputPath" class="mono"></p></div>
-<div class="section"><h3>用描述创建音色</h3><p>描述期望的成年声音特征。创建后点击「保存设置」，再生成语音试听；也可在上方填入已有自定义音色 ID。</p><form id="liveVoiceForm"><label class="field"><span>音色名称</span><input id="liveVoiceName" maxlength="256" autocomplete="off" required></label><label class="field"><span>音色描述</span><textarea id="liveVoicePrompt" rows="3" maxlength="2000" required placeholder="例如：成年女性声线，温柔清亮，语速舒缓，发音清晰"></textarea></label><button id="createLiveVoice" type="submit">创建音色并填入设置</button></form><p id="liveVoiceMessage" class="notice" role="status"></p></div>
+<div class="speech-heading">
+<h2>语音与音色</h2>
+<p>输入要朗读的文字，生成后可试听、下载或发到 QQ。</p>
+</div>
+<section class="speech-service" aria-labelledby="speechServiceTitle">
+<div class="speech-section-heading"><h3 id="speechServiceTitle">合成服务</h3><span id="liveConfigurationStatus" role="status">正在读取设置…</span></div>
+<div id="liveQuickProviders" class="speech-providers" role="group" aria-label="快捷切换合成服务"></div>
+<p id="liveProviderFeedback" class="speech-message" role="status"></p>
+<details id="liveSettings" class="speech-disclosure">
+<summary><span>服务设置</span><span id="liveSettingsState" class="speech-summary-state"></span></summary>
+<form id="liveSettingsForm">
+<fieldset id="liveSettingsControls">
+<label class="field"><span>合成服务</span><select id="liveProvider"><option value="">关闭语音合成</option></select></label>
+<div id="liveProviderFields" hidden>
+<div id="liveLocalProfile" hidden>
+<div class="field speech-local-voice">
+<span>本地音色包</span><strong id="liveLocalVoice"></strong>
+<small id="liveLocalDirectory"></small>
+<small id="liveLocalHint"></small>
+</div>
+<section class="speech-tuning" aria-labelledby="liveSovitsTitle">
+<div class="speech-section-heading"><h3 id="liveSovitsTitle">合成参数</h3></div>
+<p class="speech-tuning-note">保存后应用到下一次合成。空闲卸载适用于由 QQ Bot 启动的引擎。</p>
+<div id="liveSovitsParameters" class="fields speech-sliders"></div>
+<label class="field toggle speech-auto-read">
+  <span>自动朗读 QQ 回复</span><input id="liveSovitsAutoSpeak" type="checkbox" aria-describedby="liveSovitsAutoSpeakHint">
+  <small id="liveSovitsAutoSpeakHint">开启后，每轮完成的 QQ 回复会追加一条语音。超出合成上限时发送文字回复。</small>
+</label>
+</section>
+</div>
+<div id="liveCloudProfile">
+<div class="fields speech-profile">
+<label class="field"><span>音色</span><select id="liveVoicePreset"></select><small id="liveVoiceNote" hidden>自定义音色优先。可在高级设置更换或清空。</small></label>
+<label id="liveRegionField" class="field"><span>接入地区</span><select id="liveRegion"></select></label>
+<label id="liveVoiceField" class="field wide" hidden><span>音色名称或 ID</span><input id="liveVoice" maxlength="256" autocomplete="off" required></label>
+</div>
+<div class="speech-key">
+<label class="field"><span>API Key</span><input id="liveKeyInput" type="password" autocomplete="new-password" spellcheck="false" maxlength="512"></label>
+<button id="removeLiveKey" type="button" hidden>清除密钥</button>
+</div>
+</div>
+<details id="liveAdvanced" class="speech-details">
+<summary>高级设置</summary>
+<div class="fields">
+<label id="liveModelField" class="field"><span>合成模型</span><input id="liveModel" maxlength="128" autocomplete="off" required></label>
+<label class="field"><span>时长上限（秒）</span><input id="liveDuration" type="number" min="5" max="180" required></label>
+<label id="liveWorkspaceField" class="field wide"><span>百炼 Workspace ID</span><input id="liveWorkspace" maxlength="80" pattern="[a-zA-Z0-9\-]*" autocomplete="off"><small>选填。填写后使用对应地区的专属接入域名。</small></label>
+<label id="liveCustomVoiceField" class="field"><span>自定义音色 ID</span><input id="liveCustomVoice" maxlength="256" autocomplete="off"><small>填写后优先使用此音色。</small></label>
+<label id="liveSilenceField" class="field"><span>静音结束阈值（毫秒）</span><input id="liveSilence" type="number" min="1000" max="10000"></label>
+<label id="liveInstructionsField" class="field wide"><span>朗读风格</span><textarea id="liveInstructions" rows="2" placeholder="选填，例如语速舒缓，语气轻松"></textarea></label>
+</div>
+</details>
+</div>
+<div class="speech-actions"><button id="saveLiveSettings" class="primary" type="submit" disabled>保存设置</button><button id="discardLiveSettings" type="button" hidden>取消修改</button><p id="liveSettingsMessage" role="status"></p></div>
+</fieldset>
+</form>
+<details id="liveVoiceDesign" class="speech-details" hidden>
+<summary>用描述创建 OpenAI 音色</summary>
+<form id="liveVoiceForm">
+<label class="field"><span>音色名称</span><input id="liveVoiceName" maxlength="256" autocomplete="off" required></label>
+<label class="field"><span>音色描述</span><textarea id="liveVoicePrompt" rows="2" maxlength="2000" required placeholder="例如：成年女性声线，温柔清亮，发音清晰"></textarea></label>
+<button id="createLiveVoice" type="submit">创建并填入设置</button>
+</form><p id="liveVoiceMessage" class="notice" role="status"></p>
+</details>
+</details>
+</section>
+<section class="speech-preview" aria-labelledby="speechPreviewTitle">
+<div class="speech-section-heading"><h3 id="speechPreviewTitle">试听与发送</h3></div>
+<form id="liveGenerateForm">
+<div class="speech-editor">
+<div class="speech-editor-heading"><label for="liveText">朗读文字</label><button id="liveUseSample" type="button">填入示例</button></div>
+<textarea id="liveText" rows="4" maxlength="1500" required placeholder="输入要朗读的文字…" aria-describedby="liveTextCount"></textarea>
+<span id="liveTextCount" class="speech-count">0 / 1500</span>
+</div>
+<details id="liveDelivery" class="speech-disclosure">
+<summary><span>QQ 投递</span><span id="liveDestinationStatus" class="speech-summary-state">仅试听</span></summary>
+<div class="fields speech-destination">
+<label class="field"><span>会话</span><select id="liveTarget"><option value="">仅试听</option></select></label>
+<label id="liveDeliveryField" class="field" hidden><span>投递方式</span><select id="liveSendAs"><option value="">仅归档</option><option value="file">发送 WAV 文件</option><option value="voice">发送 QQ 语音</option></select></label>
+</div>
+</details>
+<div class="speech-actions">
+<button id="generateLiveAudio" class="primary" type="submit" aria-keyshortcuts="Control+Enter Meta+Enter" disabled>生成语音</button>
+<button id="cancelLiveAudio" type="button" hidden>取消生成</button><button id="retryLiveDelivery" type="button" hidden>重试发送</button>
+<p id="liveGenerateHint"></p><p id="liveProgress" role="status" aria-live="polite"></p>
+</div>
+</form>
+<p id="liveError" class="speech-error" role="alert"></p>
+<div id="liveResult" class="speech-result" hidden>
+<div class="speech-section-heading"><h3>生成结果</h3><button id="liveDownload" class="speech-download" type="button" disabled>下载 WAV</button></div>
+<audio id="livePlayer" controls preload="metadata" aria-label="试听生成的语音"></audio>
+<div id="liveInlinePlayer" class="speech-player" aria-label="试听生成的语音" role="group" hidden>
+  <button id="livePlay" type="button" disabled>播放</button>
+  <input id="liveSeek" type="range" min="0" max="0" step="0.01" value="0" aria-label="播放进度" disabled>
+  <output id="liveTime" aria-live="off">0:00.0 / 0:00.0</output>
+</div>
+<div class="speech-actions">
+  <p id="livePreviewStatus" role="status"></p><button id="liveRetryPreview" type="button" hidden>重试试听</button>
+  <p id="liveDownloadStatus" role="status"></p>
+</div>
+<details class="speech-details"><summary>音频详情</summary><p id="liveTranscript"></p><p id="liveOutputPath" class="mono"></p></details>
+</div>
+</section>
 </section>
 <section class="tab" id="tab-runtime" hidden><h2>运行设置</h2><p>控制任务时间、队列、审批方式和资源使用。</p><div id="globalPermissions"></div><details><summary>自定义权限</summary><div id="permissionFields" class="fields"></div></details><div id="runtimeFields" class="fields"></div><details><summary>高级 Codex 启动配置</summary><div id="advancedFields" class="fields"></div></details><div class="section"><h3>本机数据</h3><p>运行配置</p><p id="dataLocation" class="mono"></p><p>会话与资源</p><p id="archiveLocation" class="mono"></p><p class="notice">停止连接会中止当前任务。共享后台持续接收 QQ 消息；退出后台后可通过插件重新启动。</p><button class="danger" id="shutdown">退出后台服务</button></div></section>
 <section class="tab" id="tab-sessions" aria-label="会话窗口" hidden><div id="sessions"></div></section>
 
 </div>
-<footer id="detailFooter" class="detail-footer" hidden><span id="saveStatus">设置保存在本机</span><div class="row"><button id="reload">重新读取</button><button id="save" class="primary">保存设置</button></div></footer>
+<footer id="detailFooter" class="detail-footer" hidden><span id="saveStatus" role="status">设置保存在本机</span><div class="row"><button id="reload">重新读取</button><button id="save" class="primary" disabled>保存设置</button></div></footer>
 </main>
 </div></div>
 <dialog id="sessionSettingsDialog" aria-labelledby="sessionSettingsTitle"><header class="dialog-header"><div><h2 id="sessionSettingsTitle">会话设置</h2><p id="sessionSettingsPeer"></p></div><button id="closeSessionSettings" class="icon-button" aria-label="关闭会话设置">×</button></header><div class="dialog-body"><section class="session-settings-summary" aria-label="当前会话详细信息"><h3>当前会话</h3><p id="chatState"></p><p id="contextUsageDetails"></p><p id="chatPermissions"></p><p id="chatStorage" class="mono"></p></section><div id="sessionSettingsBody"></div></div></dialog>
 <dialog id="renameSessionDialog" aria-labelledby="renameSessionTitle" class="rename-dialog"><header class="dialog-header"><div><h2 id="renameSessionTitle">重命名会话</h2><p id="renameSessionPeer"></p></div><button id="closeRenameSession" class="icon-button" aria-label="关闭重命名">×</button></header><form id="renameSessionForm" class="dialog-body"><label class="field"><span>会话名称</span><input id="sessionNameInput" maxlength="80" autocomplete="off" placeholder="输入会话名称"></label><p class="notice">留空使用默认名称。</p><p id="renameSessionError" role="alert"></p><div class="row rename-actions"><button id="cancelRenameSession" type="button">取消</button><button id="saveSessionName" class="primary" type="submit">保存名称</button></div></form></dialog>
-<dialog id="directMessageDialog" aria-labelledby="directMessageTitle" class="compose-dialog"><header class="dialog-header"><div><h2 id="directMessageTitle">通过机器人发送</h2><p>直接以 QQ Bot 身份发送文字、图片或文件，不调用 AI。</p></div><button id="closeDirectMessage" class="icon-button" aria-label="关闭直接发送">×</button></header><form id="directMessageForm" class="dialog-body"><label class="field"><span>接收会话</span><select id="directMessageTarget" required></select></label><label class="field"><span>消息内容（可选）</span><textarea id="directMessageText" rows="5" placeholder="输入文字，或添加下方文件直接发送"></textarea></label><div class="direct-attachments"><button id="addDirectFiles" type="button">＋ 添加文件</button><input id="directFileInput" type="file" multiple hidden aria-label="选择要发送的图片或文件"><small id="directFileLimit"></small></div><div id="directFileList" class="direct-file-list" aria-label="待发送文件"></div><p id="directMessageProgress" class="notice" role="status"></p><p id="directMessageError" role="alert"></p><div class="dialog-actions"><span class="notice">Ctrl+Enter 发送</span><div class="row"><button id="cancelDirectMessage" type="button">取消</button><button id="sendDirectMessage" class="primary" type="submit">发送到 QQ</button></div></div></form></dialog>
+<dialog id="directMessageDialog" aria-labelledby="directMessageTitle" class="compose-dialog">
+  <header class="dialog-header"><div><h2 id="directMessageTitle">通过机器人发送</h2><p>直接以 QQ Bot 身份发送文字、图片或文件，不调用 AI。</p></div><button id="closeDirectMessage" class="icon-button" aria-label="关闭直接发送">×</button></header>
+  <form id="directMessageForm" class="dialog-body">
+    <label class="field"><span>接收会话</span><select id="directMessageTarget" required></select></label>
+    <label class="field"><span>消息内容（可选）</span><textarea id="directMessageText" rows="5" placeholder="输入文字，或添加下方文件直接发送"></textarea></label>
+    <div id="directMentions" hidden>
+      <div class="direct-mention-row">
+        <button id="pickDirectMembers" type="button" aria-expanded="false" aria-controls="directMemberPicker">@成员</button>
+        <button id="mentionDirectEveryone" type="button" aria-pressed="false" aria-describedby="directEveryoneNote">@全体成员</button>
+        <div id="directMentionChips" class="direct-mention-chips" aria-label="已选成员"></div>
+      </div>
+      <small id="directEveryoneNote" class="notice" hidden>需群管理员权限 · 每群每天 1 次</small>
+      <div id="directMemberPicker" class="direct-member-picker" hidden>
+        <input id="directMemberSearch" type="search" aria-label="搜索群成员" placeholder="搜索昵称或成员 OpenID" autocomplete="off">
+        <div id="directMemberResults" class="direct-member-results" role="group" aria-label="可选群成员"></div>
+        <div class="direct-mention-row"><small id="directMemberStatus" role="status"></small><button id="moreDirectMembers" type="button" hidden>加载更多成员</button></div>
+      </div>
+    </div>
+    <div class="direct-attachments"><button id="addDirectFiles" type="button">＋ 添加文件</button><input id="directFileInput" type="file" multiple hidden aria-label="选择要发送的图片或文件"><small id="directFileLimit"></small></div>
+    <div id="directFileList" class="direct-file-list" aria-label="待发送文件"></div>
+    <p id="directMessageProgress" class="notice" role="status"></p><p id="directMessageError" role="alert"></p>
+    <div class="dialog-actions"><span class="notice">Ctrl+Enter 发送</span><div class="row"><button id="cancelDirectMessage" type="button">取消</button><button id="sendDirectMessage" class="primary" type="submit">发送到 QQ</button></div></div>
+  </form>
+</dialog>
 <dialog id="desktopSessionsDialog" aria-labelledby="desktopSessionsTitle" class="desktop-dialog"><header class="dialog-header"><div><h2 id="desktopSessionsTitle">Codex 项目会话</h2><p id="desktopSource"></p></div><button id="closeDesktopSessions" class="icon-button" aria-label="关闭项目会话">×</button></header><div class="dialog-body desktop-body"><p class="notice">在原会话中继续工作，保留其模型、权限和上下文。目标忙碌时等待空闲；任务执行所需的确认在 Codex 中处理。</p><p id="desktopError" role="alert"></p><div class="desktop-layout"><aside class="desktop-picker"><input id="desktopSearch" type="search" aria-label="搜索项目或会话" placeholder="搜索项目或会话"><select id="desktopProject" aria-label="筛选项目"><option value="">全部项目</option></select><select id="desktopThreadList" size="9" aria-label="Codex 会话"></select><div class="row"><button id="desktopReload" type="button">刷新会话</button><button id="desktopMore" type="button" hidden>加载更多</button></div><small id="desktopListStatus"></small></aside><section class="desktop-detail"><h3 id="desktopTargetTitle">选择一项会话</h3><p id="desktopTargetInfo" class="notice"></p><a id="desktopOpenTarget" hidden>在 Codex 中打开</a><div id="desktopHistory" class="desktop-history" aria-label="桌面会话最近消息"></div><form id="desktopTaskForm"><label class="field"><span>下达任务</span><textarea id="desktopPrompt" rows="4" maxlength="32000" placeholder="希望选中会话完成的任务"></textarea></label><label class="desktop-notify"><input id="desktopNotify" type="checkbox" checked>完成后将文字结果回传到当前 QQ 会话</label><div class="dialog-actions"><span id="desktopDispatchStatus" class="notice" role="status"></span><button id="desktopDispatch" class="primary" type="submit" disabled>派发任务</button></div></form></section></div><section class="section"><div class="card-head"><h3>当前 QQ 会话的派发任务</h3><button id="desktopRefreshJobs" type="button">刷新进度</button></div><div id="desktopJobs" aria-live="polite"></div></section></div></dialog>
 <script>window.__QQBOT_MODE__="__MODE__";</script><script>__APP_SCRIPT__</script></body></html>

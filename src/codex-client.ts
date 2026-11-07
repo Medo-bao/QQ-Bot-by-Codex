@@ -46,13 +46,16 @@ export class CodexClient {
   private starting?: Promise<void>;
   private pending = new Map<number | string, { resolve: (result: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
   private notificationHandlers = new Set<(message: RpcMessage) => void>();
-  private exitHandlers = new Set<(error: Error) => void>();
+  private exitHandlers = new Set<(error: Error, threads: ReadonlySet<string>) => void>();
+  private providerConnections = new Map<string, CodexClient>();
+  private threadConnections = new Map<string, CodexClient>();
   requestHandler?: (message: RpcMessage) => Promise<unknown>;
   private closing = false;
   private runtimeHome?: string;
   private defaultModelProvider = 'openai';
 
-  constructor(private readonly config: Pick<BotConfig, 'codexCommand' | 'codexArgs' | 'cwd' | 'responsesTransport'>, private readonly logger: Logger) {}
+  constructor(private readonly config: Pick<BotConfig, 'codexCommand' | 'codexArgs' | 'cwd' | 'responsesTransport'>,
+    private readonly logger: Logger, private readonly startupProvider?: string) {}
 
   generatedImageDirectory(threadId: string): string | undefined {
     return this.runtimeHome ? join(this.runtimeHome, 'generated_images', threadId) : undefined;
@@ -60,7 +63,7 @@ export class CodexClient {
 
   async refreshThreadTools(threadId: string, tools: readonly ThreadToolSpec[], options: { created?: boolean } = {}): Promise<boolean> {
     if (!this.runtimeHome) throw new Error('Codex App Server 尚未启动。');
-    return refreshThreadTools(this, this.runtimeHome, threadId, tools, options);
+    return refreshThreadTools(this.threadConnections.get(threadId) || this, this.runtimeHome, threadId, tools, options);
   }
 
   async readContextUsage(threadId: string): Promise<ContextUsage | undefined> {
@@ -90,7 +93,7 @@ export class CodexClient {
     return () => this.notificationHandlers.delete(handler);
   }
 
-  onExit(handler: (error: Error) => void): () => void {
+  onExit(handler: (error: Error, threads: ReadonlySet<string>) => void): () => void {
     this.exitHandlers.add(handler);
     return () => this.exitHandlers.delete(handler);
   }
@@ -107,7 +110,9 @@ export class CodexClient {
     this.runtimeHome = botCodexHome();
     // Plugin MCP discovery happens at server startup, before per-thread config applies.
     const child = spawn(executable.command, [...executable.prefix, 'app-server', ...this.config.codexArgs,
-      ...(this.config.responsesTransport !== 'auto' ? ['-c', `model_providers.${openAIHttpProvider}={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=false}`] : []),
+      ...(this.config.responsesTransport !== 'auto' || this.startupProvider === openAIHttpProvider
+        ? ['-c', `model_providers.${openAIHttpProvider}={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=false}`] : []),
+      ...(this.startupProvider ? ['-c', `model_provider=${JSON.stringify(this.startupProvider)}`] : []),
       '-c', 'plugins.codex-qqbot@qqbot-local.enabled=false',
       '-c', 'notify=[]',
       '-c', 'shell_environment_policy.set.PYTHONUTF8="1"',
@@ -141,7 +146,7 @@ export class CodexClient {
       }
     });
     await this.call('initialize', {
-      clientInfo: { name: 'codex_qqbot', title: 'QQ Bot', version: '0.0.6' },
+      clientInfo: { name: 'codex_qqbot', title: 'QQ Bot', version: '0.0.7' },
       capabilities: { experimentalApi: true },
     });
     this.notify('initialized', {});
@@ -149,12 +154,49 @@ export class CodexClient {
     this.defaultModelProvider = settings.config?.model_provider || 'openai';
   }
 
-  call(method: string, params: Record<string, unknown> = {}, timeoutMs = 60000): Promise<any> {
-    if (this.closing || !this.child || this.child.killed || !this.child.stdin.writable) return Promise.reject(new Error('Codex App Server 未启动或已关闭。'));
-    if (method === 'thread/start' || method === 'thread/resume') {
-      const provider = params.modelProvider || this.defaultModelProvider;
-      params = isolateThreadInstructions({ ...params, modelProvider: provider === 'openai' && this.config.responsesTransport !== 'auto' ? openAIHttpProvider : provider });
+  async call(method: string, params: Record<string, unknown> = {}, timeoutMs = 60000): Promise<any> {
+    const threadId = typeof params.threadId === 'string' ? params.threadId : undefined;
+    const owner = threadId ? this.threadConnections.get(threadId) : undefined;
+    if (method !== 'thread/start' && method !== 'thread/resume') return (owner || this).request(method, params, timeoutMs);
+
+    const selected = typeof params.modelProvider === 'string' ? params.modelProvider : '';
+    const requested = selected || this.defaultModelProvider;
+    let provider = requested === 'openai' && this.config.responsesTransport !== 'auto' ? openAIHttpProvider : requested;
+    if (method === 'thread/resume' && threadId) {
+      // Newer Codex validates the stored provider against the process configuration
+      // before applying resume overrides. Read the stored provider without resuming.
+      const saved = owner?.startupProvider || (await (owner || this).request('thread/read', { threadId, includeTurns: false }, timeoutMs)).thread?.modelProvider;
+      if (typeof saved === 'string' && saved) {
+        const logicalProvider = (value: string) => value === openAIHttpProvider ? 'openai' : value;
+        // An explicit provider change continues in a fork, keeping the old thread intact.
+        if (selected && logicalProvider(saved) !== logicalProvider(provider)) method = 'thread/fork';
+        else provider = saved;
+      }
     }
+    const connection = await this.connectionFor(provider);
+    const result = await connection.request(method, isolateThreadInstructions({ ...params, modelProvider: provider }), timeoutMs);
+    if (typeof result.thread?.id === 'string') this.threadConnections.set(result.thread.id, connection);
+    return result;
+  }
+
+  private async connectionFor(provider: string): Promise<CodexClient> {
+    if (this.closing) throw new Error('Codex App Server 已关闭。');
+    if (provider === this.defaultModelProvider) return this;
+    let connection = this.providerConnections.get(provider);
+    if (!connection) {
+      const client = new CodexClient(this.config, this.logger, provider);
+      client.requestHandler = (message) => this.handleRequest(message);
+      client.onNotification((message) => this.emitNotification(message));
+      client.onExit((error) => this.emitExit(error, client));
+      this.providerConnections.set(provider, client);
+      connection = client;
+    }
+    await connection.start();
+    return connection;
+  }
+
+  private request(method: string, params: Record<string, unknown>, timeoutMs: number): Promise<any> {
+    if (this.closing || !this.child || this.child.killed || !this.child.stdin.writable) return Promise.reject(new Error('Codex App Server 未启动或已关闭。'));
     const id = ++this.sequence;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -180,17 +222,23 @@ export class CodexClient {
       this.pending.delete(message.id);
       if (message.error) pending.reject(new Error(`${message.error.message} (${message.error.code})`));
       else pending.resolve(message.result);
-    } else if (message.method) {
-      for (const handler of this.notificationHandlers) handler(message);
-    }
+    } else if (message.method) this.emitNotification(message);
+  }
+
+  private emitNotification(message: RpcMessage): void {
+    for (const handler of this.notificationHandlers) handler(message);
+  }
+
+  private async handleRequest(message: RpcMessage): Promise<unknown> {
+    if (!this.requestHandler) throw new Error(`没有请求处理器: ${message.method}`);
+    return this.requestHandler(message);
   }
 
   private async answer(message: RpcMessage): Promise<void> {
     const child = this.child;
     let response: RpcMessage;
     try {
-      if (!this.requestHandler) throw new Error(`没有请求处理器: ${message.method}`);
-      response = { id: message.id, result: await this.requestHandler(message) };
+      response = { id: message.id, result: await this.handleRequest(message) };
     } catch (error) {
       response = { id: message.id, error: { code: -32603, message: error instanceof Error ? error.message : String(error) } };
     }
@@ -200,11 +248,28 @@ export class CodexClient {
   private failed(error: Error): void {
     for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(error); }
     this.pending.clear();
-    if (!this.closing) for (const handler of this.exitHandlers) handler(error);
+    this.emitExit(error, this);
+  }
+
+  private emitExit(error: Error, connection: CodexClient): void {
+    if (this.closing) return;
+    const threads = new Set<string>();
+    for (const [id, owner] of this.threadConnections) if (owner === connection) {
+      threads.add(id);
+      this.threadConnections.delete(id);
+    }
+    for (const handler of this.exitHandlers) handler(error, threads);
   }
 
   async close(): Promise<void> {
     this.closing = true;
+    const connections = [...this.providerConnections.values()];
+    this.providerConnections.clear();
+    this.threadConnections.clear();
+    await Promise.all([this.closeProcess(), ...connections.map(connection => connection.close())]);
+  }
+
+  private async closeProcess(): Promise<void> {
     const child = this.child;
     if (!child) return;
     const done = new Promise<void>((resolve) => child.once('exit', () => resolve()));

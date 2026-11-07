@@ -2,19 +2,27 @@ import { App } from '@modelcontextprotocol/ext-apps';
 import { renderMarkdown } from './markdown.ts';
 import { assistantText } from '../message-format.ts';
 import { renderBindingQr } from './binding-qr.ts';
-import { bindLiveUi, refreshLiveUi } from './live.ts';
+import { bindLiveUi, hasLiveSettingsChanges, refreshLiveUi } from './live.ts';
+import { showFeedback, showModuleBadge, type FeedbackTone } from './feedback.ts';
 import { permissionPicker, closePermissionMenus } from './permissions.ts';
+import { bindDirectMentions } from './direct-mentions.ts';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const mode = (window as any).__QQBOT_MODE__ as 'mcp' | 'http';
 let app: App | undefined;
 let state: any;
 let draft: any;
+let savedDraft: any;
 let dirty = false;
 let lastQr: string | undefined;
 let busy = false;
+let pendingAction = '';
 let draftRevision = 0;
 let savingGlobal = false;
+let readingSettings = false;
+const changedModules = new Map<string, string[]>();
+let submittedModules = new Set<string>();
+let saveFeedback: { text: string; tone: FeedbackTone } | undefined;
 let refreshFlight: Promise<void> | undefined;
 let refreshAgain = false;
 let connectionError: string | undefined;
@@ -89,15 +97,6 @@ const fields: Record<string, Field[]> = {
     { path: 'sendFile.maxFiles', label: '单轮最多发送文件数', kind: 'number' },
     { path: 'sendFile.extraRoots', label: '额外允许发送的目录', kind: 'lines', wide: true, help: '工作目录和媒体目录已自动允许；每行一个绝对目录。' },
   ],
-  liveFields: [
-    { path: 'live.enabled', label: '启用 GPT-Live 语音生成', kind: 'boolean', wide: true },
-    { path: 'live.model', label: 'GPT-Live 模型', help: '默认 gpt-live-1；需要当前 API 项目具有访问权限。' },
-    { path: 'live.voice', label: '内置音色', help: '默认 marin；填写官方支持的内置音色名称。' },
-    { path: 'live.customVoiceId', label: '自定义音色 ID', wide: true, help: '填写后优先使用此音色；留空使用上方内置音色。' },
-    { path: 'live.instructions', label: '发音与风格提示', kind: 'textarea', wide: true, help: '控制发音、语速和表达方式；不会修改 Codex 会话的角色提示词。' },
-    { path: 'live.maxDurationSeconds', label: '单次生成时长上限（秒）', kind: 'number', min: 5, max: 180 },
-    { path: 'live.silenceMs', label: '结束片段的静音时长（毫秒）', kind: 'number', min: 1000, max: 10000, help: '默认 2500；朗读中停顿较长时可调高。' },
-  ],
   permissionFields: [
     { path: 'approvalPolicy', label: '操作确认方式', kind: 'select', options: ['on-request', 'untrusted', 'never'] },
     { path: 'sandbox', label: '执行范围', kind: 'select', options: ['workspace-write', 'read-only', 'danger-full-access'] },
@@ -121,6 +120,21 @@ const fields: Record<string, Field[]> = {
 const labels: Record<string, string> = { '': '跟随默认', http: 'HTTP 流式（稳定优先）', auto: '由 Codex 自动选择', enabled: '允许', live: '实时搜索', cached: '缓存搜索', indexed: '索引搜索', allowlist: '仅白名单', open: '开放', disabled: '关闭', 'on-request': '由 Codex 请求确认', untrusted: '不可信操作需要确认', never: '不请求确认', user: '由我批准', auto_review: 'Codex 自动审核', 'workspace-write': '可写工作目录', 'read-only': '只读', 'danger-full-access': '完全访问' };
 const get = (object: any, path: string): any => path.split('.').reduce((value, key) => value?.[key], object);
 const set = (object: any, path: string, value: any) => { const keys = path.split('.'); const final = keys.pop()!; const owner = keys.reduce((value, key) => value[key] ||= {}, object); owner[final] = value; };
+const settingPaths = new Map<string, string[]>();
+for (const [container, specs] of Object.entries(fields)) {
+  const module = $(container).closest<HTMLElement>('.tab')!.id.slice(4);
+  settingPaths.set(module, [...(settingPaths.get(module) || []), ...specs.map(spec => spec.path)]);
+}
+settingPaths.get('models')!.push('presets');
+const connectionActions = {
+  start: ['启动', '连接中…', 'QQ Bot 已连接'],
+  stop: ['停止', '正在停止…', 'QQ 连接已停止'],
+  bind: ['手机 QQ 扫码', '正在获取二维码…', ''],
+  cancelBind: ['取消扫码', '正在取消…', '已取消扫码'],
+  unbind: ['解绑', '正在解绑…', '已解除绑定'],
+  login: ['登录 Codex', '正在请求登录…', ''],
+  shutdown: ['退出后台服务', '正在退出…', '后台已退出'],
+} as const;
 
 async function api(action: string, payload: any = {}): Promise<any> {
   if (mode === 'mcp') {
@@ -136,19 +150,73 @@ async function api(action: string, payload: any = {}): Promise<any> {
   return value;
 }
 
-function markDirty(): void { dirty = true; draftRevision++; globalPermissionPicker?.refresh(); $('saveStatus').textContent = '有尚未保存的设置'; $('feedback').textContent = ''; updateHeader(); }
+function updateChanges(): void {
+  changedModules.clear();
+  for (const [module, paths] of settingPaths) {
+    const changed = paths.filter(path => {
+      const value = get(draft, path), previous = get(savedDraft, path);
+      if (path === 'effort' && !value && !previous) return false;
+      return JSON.stringify(value) !== JSON.stringify(previous);
+    });
+    if (changed.length || $(`tab-${module}`).querySelector('[data-field]:invalid')) changedModules.set(module, changed);
+  }
+  dirty = changedModules.size > 0;
+}
+
+function markDirty(): void {
+  draftRevision++;
+  saveFeedback = undefined;
+  if (!savingGlobal) submittedModules.clear();
+  updateChanges();
+  globalPermissionPicker?.refresh();
+  updateHeader();
+}
 
 const sessionKey = (session: any): string => `${session.scope}:${session.peerId}`;
 const sessionIdentity = (session: any): string => `${session.scope === 'group' ? '群聊' : '私聊'} · ${session.peerId}`;
 const sessionTitle = (session: any): string => session.name || sessionIdentity(session);
+const directMentions = bindDirectMentions((target_id, cursor) => api('session', {
+  action: 'groupMembers', scope: 'group', target_id, cursor,
+}), updateDirectSend);
 
 function updateHeader(): void {
   const button = $<HTMLButtonElement>('headerAction');
-  button.disabled = savingGlobal || view === 'settings' && !dirty;
+  const working = savingGlobal || readingSettings || busy;
+  button.hidden = view === 'settings' && selectedSetting === 'live';
+  button.disabled = working || view === 'settings' && (!dirty || exited);
   button.textContent = view === 'settings' ? savingGlobal ? '保存中…' : '保存' : state?.config.credentialsConfigured ? '刷新' : '＋ 绑定';
-  $<HTMLButtonElement>('save').disabled = savingGlobal || !dirty;
-  $('save').textContent = savingGlobal ? '保存中…' : '保存';
-  $<HTMLButtonElement>('reload').disabled = savingGlobal;
+  const save = $<HTMLButtonElement>('save'), reload = $<HTMLButtonElement>('reload');
+  save.disabled = working || !dirty || exited;
+  save.textContent = savingGlobal ? '保存中…' : '保存设置';
+  save.setAttribute('aria-busy', String(savingGlobal));
+  reload.disabled = working || exited;
+  reload.textContent = readingSettings ? '读取中…' : dirty ? '放弃修改' : '重新读取';
+  reload.setAttribute('aria-busy', String(readingSettings));
+  const status = savingGlobal ? { text: '正在保存设置…', tone: 'pending' as const }
+    : readingSettings ? { text: '正在读取设置…', tone: 'pending' as const }
+      : saveFeedback || (dirty ? { text: `${changedModules.size} 项设置有未保存的修改`, tone: 'pending' as const }
+        : { text: '设置保存在本机', tone: 'info' as const });
+  showFeedback($('saveStatus'), status.text, status.tone);
+  for (const module of settingPaths.keys()) {
+    if (savingGlobal && submittedModules.has(module)) showModuleBadge(module, '保存中', 'pending');
+    else if (saveFeedback?.tone === 'error' && submittedModules.has(module)) showModuleBadge(module, '保存失败', 'error');
+    else if (changedModules.has(module)) showModuleBadge(module, '未保存', 'pending');
+    else if (saveFeedback?.tone === 'success' && submittedModules.has(module)) showModuleBadge(module, '已保存', 'success');
+    else showModuleBadge(module, '');
+  }
+  const phase = state?.binding?.phase;
+  const ready = state?.config.credentialsConfigured;
+  const unavailable: Record<string, boolean> = {
+    start: !ready || Boolean(state?.connected), stop: !state?.running,
+    bind: phase === 'starting' || phase === 'saving',
+    cancelBind: !['starting', 'waiting', 'saving'].includes(phase), unbind: !ready,
+  };
+  for (const [name, [label, pending]] of Object.entries(connectionActions)) {
+    const control = $<HTMLButtonElement>(name);
+    control.disabled = working || exited || Boolean(unavailable[name]);
+    control.textContent = pendingAction === name ? pending : name === 'bind' && phase === 'waiting' ? '刷新二维码' : label;
+    control.setAttribute('aria-busy', String(pendingAction === name));
+  }
   $('collectionSummary').textContent = view === 'settings' ? '7 项设置' : `1 个机器人 · ${state?.sessions?.length || 0} 个会话`;
 }
 
@@ -157,7 +225,7 @@ function showDetail(tab?: string): void {
   document.querySelectorAll<HTMLElement>('.tab').forEach((section) => { section.hidden = section.id !== `tab-${tab}`; });
   $('emptyDetail').hidden = Boolean(tab);
   $('detailContent').hidden = !tab;
-  $('detailFooter').hidden = !tab || tab === 'sessions';
+  $('detailFooter').hidden = !tab || tab === 'sessions' || tab === 'live';
   $('sessionTopbar').hidden = tab !== 'sessions';
   document.body.dataset.detailOpen = String(Boolean(tab));
   document.body.dataset.sessionOpen = String(tab === 'sessions');
@@ -184,6 +252,7 @@ function selectSetting(tab: string): void {
   showDetail(tab);
   document.querySelectorAll<HTMLButtonElement>('[data-tab]').forEach((button) => button.setAttribute('aria-selected', String(button.dataset.tab === tab)));
   $('detailContent').scrollTop = 0;
+  updateHeader();
 }
 
 function listRow(title: string, subtitle: string, meta: string, selected: boolean, active: boolean, clicked: () => void): HTMLButtonElement {
@@ -217,7 +286,8 @@ function renderCollection(): void {
   if (view === 'sessions' && query) $('collectionSummary').textContent = `${matches} 个匹配会话`;
   let count = 0;
   document.querySelectorAll<HTMLButtonElement>('#settingsNavigation [data-tab]').forEach((button) => {
-    button.hidden = !button.textContent?.toLowerCase().includes(query); if (!button.hidden) count++;
+    const text = [...button.children].filter(child => !child.classList.contains('settings-module-state')).map(child => child.textContent).join(' ');
+    button.hidden = !text.toLowerCase().includes(query); if (!button.hidden) count++;
   });
   if (view === 'settings') $('collectionSummary').textContent = `${count} 项设置`;
 }
@@ -289,14 +359,27 @@ function empty(container: HTMLElement, text: string): void { const element = doc
 
 async function action(name: string, payload: any = {}, success?: string): Promise<any> {
   if (busy) return;
-  busy = true; $('error').textContent = ''; $('feedback').textContent = '';
-  try { const result = await api(name, payload); if (success) $('feedback').textContent = success; if (name === 'shutdown') exited = true; else { exited = false; await refresh(true); } return result; }
-  catch (error) { $('error').textContent = error instanceof Error ? error.message : String(error); }
-  finally { busy = false; }
+  busy = true;
+  pendingAction = name;
+  const labels = connectionActions[name as keyof typeof connectionActions];
+  $('error').textContent = '';
+  showFeedback($('feedback'), labels?.[1] || '', 'pending');
+  updateHeader();
+  try {
+    const result = await api(name, payload);
+    showFeedback($('feedback'), success || labels?.[2] || '', 'success');
+    if (name === 'shutdown') exited = true;
+    else { exited = false; await refresh(true); }
+    return result;
+  } catch (error) {
+    showFeedback($('feedback'), '');
+    $('error').textContent = error instanceof Error ? error.message : String(error);
+  } finally { busy = false; pendingAction = ''; updateHeader(); }
 }
 
 function renderPeers(): void {
   $('peers').replaceChildren();
+  const allowedBy = (mode: string, list: string[], id: string) => mode === 'open' || mode === 'allowlist' && list.includes(id);
   for (const [target, value] of Object.entries(state.observedPeers || {})) {
     const info = value as any;
     const card = document.createElement('div'); card.className = 'peer-card';
@@ -307,11 +390,19 @@ function renderPeers(): void {
       : !groupId && access.c2cMode === 'disabled' ? '私聊访问已关闭' : '发起人不在允许列表';
     const text = document.createElement('p'); text.textContent = `${target} · 用户 ${info.senderId} · ${reason}`; text.className = 'mono'; card.append(text);
     const allow = document.createElement('button'); allow.textContent = '允许此用户';
-    allow.onclick = () => { draft.access.c2cAllow = [...new Set([...draft.access.c2cAllow, info.senderId])]; if (draft.access.c2cMode === 'disabled') draft.access.c2cMode = 'allowlist'; renderForm(); markDirty(); };
+    if (allowedBy(draft.access.c2cMode, draft.access.c2cAllow, info.senderId)) {
+      allow.disabled = true;
+      allow.textContent = allowedBy(access.c2cMode, access.c2cAllow, info.senderId) ? '已允许' : '待保存';
+    }
+    allow.onclick = () => { draft.access.c2cAllow = [...new Set([...draft.access.c2cAllow, info.senderId])]; if (draft.access.c2cMode === 'disabled') draft.access.c2cMode = 'allowlist'; renderForm(); markDirty(); renderPeers(); };
     card.append(allow);
     if (target.startsWith('group:')) {
       const group = document.createElement('button'); group.textContent = '允许此群';
-      group.onclick = () => { draft.access.groupAllow = [...new Set([...draft.access.groupAllow, target.slice(6)])]; draft.access.groupMode = 'allowlist'; renderForm(); markDirty(); };
+      if (allowedBy(draft.access.groupMode, draft.access.groupAllow, groupId)) {
+        group.disabled = true;
+        group.textContent = allowedBy(access.groupMode, access.groupAllow, groupId) ? '已允许' : '待保存';
+      }
+      group.onclick = () => { draft.access.groupAllow = [...new Set([...draft.access.groupAllow, groupId])]; draft.access.groupMode = 'allowlist'; renderForm(); markDirty(); renderPeers(); };
       card.append(group);
     }
     $('peers').append(card);
@@ -329,7 +420,7 @@ function renderSessions(botMatches?: boolean): number {
     const key = sessionKey(session);
     const title = sessionTitle(session);
     if (showAll || `${title} ${sessionIdentity(session)} ${effectiveModel(session)} ${session.activePreset || ''}`.toLowerCase().includes(query)) {
-      const row = listRow(title, `${sessionIdentity(session)} · ${effectiveModel(session)}`, session.busy ? '回复中' : session.queued ? '排队中' : '', key === selectedSession, session.busy, () => {
+      const row = listRow(title, `${sessionIdentity(session)} · ${effectiveModel(session)}`, session.readingReply ? '语音生成中' : session.busy ? '回复中' : session.queued ? '排队中' : '', key === selectedSession, session.busy, () => {
         selectedRobot = false; selectedSession = key; showDetail('sessions'); renderCollection();
       });
       row.dataset.sessionKey = key; $('sessionList').append(row); matches++;
@@ -422,7 +513,7 @@ function renderChat(session: any): void {
   const custom = ['model', 'modelProvider', 'effort', 'preset', 'cwd', 'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'webSearch'].some((name) => values[name] && values[name] !== '(Codex default)') || values.prompt != null || values.contextWindow != null;
   const operation = contextRequests.get(key) || session.contextOperation;
   const progress = operation?.status === 'running' ? operation.kind === 'compact' ? '正在压缩历史' : '正在重置上下文' : undefined;
-  $('chatState').textContent = `${progress || (session.busy ? 'AI 正在回复' : session.queued ? '正在准备会话' : '已就绪')} · ${effectiveModel(session)} · ${custom ? '独立设置' : '跟随全局设置'}`;
+  $('chatState').textContent = `${session.readingReply ? '正在生成回复语音' : progress || (session.busy ? 'AI 正在回复' : session.queued ? '正在准备会话' : '已就绪')} · ${effectiveModel(session)} · ${custom ? '独立设置' : '跟随全局设置'}`;
   const waiting = state.pending?.some((item: any) => item.target.scope === session.scope && item.target.targetId === session.peerId);
   const taskStatus = progress || (waiting ? '等待回答' : session.busy ? `回复中${session.queued > 1 ? ` · 排队 ${session.queued - 1}` : ''}` : session.queued ? `排队 ${session.queued}` : '');
   $('chatTaskStatus').textContent = taskStatus; $('chatTaskStatus').hidden = !taskStatus;
@@ -667,7 +758,7 @@ const fileSize = (bytes: number): string => bytes < 1024 * 1024 ? `${Math.ceil(b
 function updateDirectSend(): void {
   const key = $('directMessageDialog').dataset.draft!;
   $<HTMLButtonElement>('sendDirectMessage').disabled = !state.connected || directSending ||
-    (!$<HTMLTextAreaElement>('directMessageText').value.trim() && !directFileDrafts.get(key)?.length);
+    (!$<HTMLTextAreaElement>('directMessageText').value.trim() && !directFileDrafts.get(key)?.length && !directMentions.hasSelection());
 }
 
 function renderDirectFiles(): void {
@@ -713,6 +804,17 @@ async function uploadDirectFile(session: any, entry: DirectFile): Promise<string
   return entry.path;
 }
 
+function selectDirectTarget(): void {
+  const key = $<HTMLSelectElement>('directMessageTarget').value;
+  const session = state.sessions.find((item: any) => sessionKey(item) === key);
+  const draftKey = `${state.config.appId}:${key}`;
+  $('directMessageDialog').dataset.draft = draftKey;
+  directMentions.setTarget(draftKey, session?.scope === 'group' ? session.peerId : undefined);
+  $<HTMLTextAreaElement>('directMessageText').value = directMessageDrafts.get(draftKey) || '';
+  $('directMessageError').textContent = ''; $('directMessageProgress').textContent = '';
+  renderDirectFiles();
+}
+
 function openDirectMessage(key: string): void {
   if (directSending || !state.connected) return;
   const dialog = $<HTMLDialogElement>('directMessageDialog');
@@ -723,10 +825,7 @@ function openDirectMessage(key: string): void {
     return option;
   }));
   target.value = key;
-  dialog.dataset.draft = `${state.config.appId}:${key}`;
-  $<HTMLTextAreaElement>('directMessageText').value = directMessageDrafts.get(dialog.dataset.draft) || '';
-  $('directMessageError').textContent = '';
-  $('directMessageProgress').textContent = ''; renderDirectFiles();
+  selectDirectTarget();
   dialog.showModal(); $<HTMLTextAreaElement>('directMessageText').focus();
 }
 
@@ -1023,11 +1122,19 @@ function refresh(fresh = false): Promise<void> {
   return refreshFlight;
 }
 
-async function readStatus(): Promise<void> {
+function adoptSettings(config: any): void {
+  draft = structuredClone(config);
+  delete draft.credentialsConfigured;
+  savedDraft = structuredClone(draft);
+  renderForm();
+  updateChanges();
+}
+
+async function readStatus(discardAt?: number): Promise<boolean> {
   try {
     state = await api('status');
     const latestConfig = structuredClone(state.config); delete latestConfig.credentialsConfigured;
-    if (!draft || !dirty && JSON.stringify(draft) !== JSON.stringify(latestConfig)) { draft = latestConfig; renderForm(); }
+    if (!draft || discardAt === draftRevision || !dirty && JSON.stringify(draft) !== JSON.stringify(latestConfig)) adoptSettings(latestConfig);
     $('connectionStatus').textContent = state.connected ? 'QQ Bot 已连接' : state.running ? '连接中' : '连接未启动';
     $('connectionStatus').dataset.connected = String(Boolean(state.connected));
     const phase = state.binding || { phase: 'idle' };
@@ -1046,29 +1153,54 @@ async function readStatus(): Promise<void> {
     else if (connectionError && $('error').textContent === connectionError) $('error').textContent = '';
     connectionError = state.error;
     renderPeers(); updateHeader(); renderCollection();
-  } catch (error) { $('error').textContent = error instanceof Error ? error.message : String(error); }
+    return true;
+  } catch (error) {
+    connectionError = error instanceof Error ? error.message : String(error);
+    $('error').textContent = connectionError;
+    return false;
+  }
 }
 
 async function account(): Promise<void> {
-  try { const value = await api('account'); $('accountStatus').textContent = value.authenticated ? `已登录 · ${value.type}${value.plan ? ' · ' + value.plan : ''}` : 'Codex 尚未登录，或当前提供商使用独立凭据。'; }
-  catch (error) { $('accountStatus').textContent = `无法读取 Codex：${error instanceof Error ? error.message : error}`; }
+  const control = $<HTMLButtonElement>('refreshAccount');
+  if (control.disabled) return;
+  control.disabled = true; control.textContent = '刷新中…'; control.setAttribute('aria-busy', 'true');
+  $('accountStatus').setAttribute('role', 'status');
+  showFeedback($('accountStatus'), '正在读取登录状态…', 'pending');
+  try {
+    const value = await api('account');
+    showFeedback($('accountStatus'), value.authenticated ? `已登录 · ${value.type}${value.plan ? ' · ' + value.plan : ''}`
+      : 'Codex 尚未登录，或当前提供商使用独立凭据。', value.authenticated ? 'success' : 'info');
+  } catch (error) { showFeedback($('accountStatus'), `无法读取 Codex：${error instanceof Error ? error.message : error}`, 'error'); }
+  finally { control.disabled = false; control.textContent = '刷新状态'; control.setAttribute('aria-busy', 'false'); }
 }
 
 async function catalog(): Promise<void> {
+  const control = $<HTMLButtonElement>('refreshModels');
+  if (control.disabled) return;
+  control.disabled = true; control.textContent = '刷新中…'; control.setAttribute('aria-busy', 'true');
+  showFeedback($('catalogInfo'), '正在读取模型与技能…', 'pending');
   try {
     const [models, catalog] = await Promise.all([api('models'), api('catalog')]);
     for (const [id, values] of [['models', models.data.map((item: any) => item.model || item.id)], ['providers', catalog.providers.map((item: any) => item.id)]] as Array<[string, string[]]>) {
       $(id).replaceChildren(...values.map((value) => { const option = document.createElement('option'); option.value = value; return option; }));
     }
-    $('catalogInfo').textContent = `${models.data.length} 个模型 · ${catalog.skills.length} 个可用技能${catalog.skills.length ? '：' + catalog.skills.map((skill: any) => skill.name).join('、') : ''}`;
-  } catch (error) { $('catalogInfo').textContent = `读取失败：${error instanceof Error ? error.message : error}`; }
+    showFeedback($('catalogInfo'), `${models.data.length} 个模型 · ${catalog.skills.length} 个可用技能${catalog.skills.length ? '：' + catalog.skills.map((skill: any) => skill.name).join('、') : ''}`, 'success');
+  } catch (error) { showFeedback($('catalogInfo'), `读取失败：${error instanceof Error ? error.message : error}`, 'error'); }
+  finally { control.disabled = false; control.textContent = '刷新可用模型与技能'; control.setAttribute('aria-busy', 'false'); }
 }
 
 function bindEvents(): void {
-  bindLiveUi(api, () => state, (id) => {
-    draft.live.customVoiceId = id;
-    renderForm(); markDirty();
-  });
+  const host = app;
+  bindLiveUi(api, () => state, host && (async ({ blob, base64, name }) => {
+    // The desktop host saves a structured-cloned Blob; the embedded resource is the MCP format.
+    const params = { blob, name, contents: [{
+      type: 'resource' as const,
+      resource: { uri: `file:///${encodeURIComponent(name)}`, mimeType: blob.type, blob: base64 },
+    }] };
+    const result = await host.downloadFile(params);
+    if (result.isError) throw new Error('下载未完成，请重试。');
+  }));
   const desktopDialog = $<HTMLDialogElement>('desktopSessionsDialog');
   const desktopPrompt = $<HTMLTextAreaElement>('desktopPrompt');
   const desktopSend = $<HTMLButtonElement>('desktopDispatch');
@@ -1135,9 +1267,7 @@ function bindEvents(): void {
   directForm.ondrop = event => { const files = [...(event.dataTransfer?.files || [])]; if (files.length) { event.preventDefault(); directForm.classList.remove('file-drag-over'); addFiles(files); } };
   directTarget.onchange = () => {
     directMessageDrafts.set(directDialog.dataset.draft!, directText.value);
-    directDialog.dataset.draft = `${state.config.appId}:${directTarget.value}`;
-    directText.value = directMessageDrafts.get(directDialog.dataset.draft) || '';
-    $('directMessageError').textContent = ''; $('directMessageProgress').textContent = ''; renderDirectFiles();
+    selectDirectTarget();
   };
   directText.oninput = () => { directMessageDrafts.set(directDialog.dataset.draft!, directText.value); updateDirectSend(); };
   directText.onkeydown = event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.isComposing) { event.preventDefault(); if (!directSend.disabled) $<HTMLFormElement>('directMessageForm').requestSubmit(); } };
@@ -1145,20 +1275,31 @@ function bindEvents(): void {
     event.preventDefault(); if (directSending) return;
     const session = state.sessions.find((item: any) => sessionKey(item) === directTarget.value);
     const files = [...(directFileDrafts.get(directDialog.dataset.draft!) || [])];
-    if (!session || (!directText.value.trim() && !files.length)) return;
+    const mentions = directMentions.value();
+    const hasMentions = mentions.everyone || mentions.memberIds.length > 0;
+    if (!session || (!directText.value.trim() && !files.length && !hasMentions)) return;
     const draftKey = directDialog.dataset.draft!, text = directText.value;
     directSending = true; directSend.disabled = true; directTarget.disabled = true; directText.disabled = true;
+    directMentions.setSending(true);
     const open = document.getElementById('openDirectMessage') as HTMLButtonElement | null; if (open) open.disabled = true;
     for (const id of ['closeDirectMessage', 'cancelDirectMessage']) $<HTMLButtonElement>(id).disabled = true;
     renderDirectFiles();
     $('directMessageError').textContent = ''; directSend.textContent = '发送中…';
     let sent = 0;
     try {
-      if (text.trim()) {
-        $('directMessageProgress').textContent = '正在发送文字…';
-        const result = await api('session', { action: 'send', scope: session.scope, target_id: session.peerId, text });
-        if (!result.sent) throw new Error('消息未能发送。');
-        sent++; directMessageDrafts.delete(draftKey); directText.value = '';
+      if (text.trim() || hasMentions) {
+        $('directMessageProgress').textContent = '正在发送消息…';
+        const result = await api('session', { action: 'send', scope: session.scope, target_id: session.peerId,
+          text, mention_ids: mentions.memberIds, mention_everyone: mentions.everyone });
+        if (!result.sent) {
+          if (typeof result.remaining_text === 'string') {
+            sent++;
+            directText.value = result.remaining_text; directMessageDrafts.set(draftKey, result.remaining_text);
+            directMentions.clear();
+          }
+          throw new Error(result.error || '消息未能发送。');
+        }
+        sent++; directMessageDrafts.delete(draftKey); directText.value = ''; directMentions.clear();
       }
       for (const [index, entry] of files.entries()) {
         try {
@@ -1179,6 +1320,7 @@ function bindEvents(): void {
       $('directMessageError').textContent = message; $('feedback').textContent = `直接发送失败：${message}`; await refresh();
     } finally {
       directSending = false; directTarget.disabled = false; directText.disabled = false; directSend.textContent = '发送到 QQ';
+      directMentions.setSending(false);
       for (const id of ['closeDirectMessage', 'cancelDirectMessage']) $<HTMLButtonElement>(id).disabled = false;
       renderDirectFiles(); const open = document.getElementById('openDirectMessage') as HTMLButtonElement | null; if (open) open.disabled = !state.connected;
     }
@@ -1234,26 +1376,60 @@ function bindEvents(): void {
   };
   for (const name of ['start', 'stop', 'bind', 'cancelBind', 'unbind']) $(name).onclick = () => { void action(name); };
   $('save').onclick = async () => {
-    if (savingGlobal || !dirty) return;
+    if (savingGlobal || readingSettings || busy || !dirty) return;
     const invalid = document.querySelector<HTMLInputElement>('.tab [data-field]:invalid');
     if (invalid) {
       const tab = invalid.closest<HTMLElement>('.tab');
-      if (tab) document.querySelector<HTMLButtonElement>(`[data-tab="${tab.id.slice(4)}"]`)?.click();
+      if (tab) {
+        const module = tab.id.slice(4);
+        submittedModules = new Set([module]);
+        saveFeedback = { text: '请检查标出的设置项', tone: 'error' };
+        selectSetting(module);
+      }
+      for (let details = invalid.closest('details'); details; details = details.parentElement?.closest('details') || null) details.open = true;
       invalid.reportValidity(); return;
     }
-    const patch = structuredClone(draft); delete patch.appId;
-    if (!patch.effort) patch.effort = null;
+    const patch: Record<string, unknown> = {};
+    const paths = [...changedModules.values()].flat();
+    for (const path of paths) {
+      const value = get(draft, path);
+      set(patch, path, path === 'effort' && !value ? null : structuredClone(value));
+    }
+    submittedModules = new Set(changedModules.keys());
+    saveFeedback = undefined;
     const submitted = draftRevision; savingGlobal = true; updateHeader();
     try {
-      const result = await action('configure', patch, '设置已保存');
-      if (result && submitted === draftRevision) { dirty = false; $('saveStatus').textContent = '设置已保存'; }
-      else if (result) { $('saveStatus').textContent = '仍有修改尚未保存'; $('feedback').textContent = '已保存提交的设置，之后的修改仍保留在编辑器中。'; }
+      const result = await action('configure', patch);
+      if (!result) { saveFeedback = { text: '保存失败，修改已保留', tone: 'error' }; return; }
+      if (submitted === draftRevision) adoptSettings(result.config);
+      else {
+        for (const path of paths) set(savedDraft, path, structuredClone(get(result.config, path)));
+        updateChanges();
+      }
+      saveFeedback = { text: dirty ? '已保存提交的设置，还有修改待保存' : '设置已保存', tone: 'success' };
+      renderPeers();
     } finally { savingGlobal = false; updateHeader(); }
   };
-  $('reload').onclick = async () => { draft = undefined; dirty = false; await refresh(); $('saveStatus').textContent = '已重新读取设置'; updateHeader(); };
+  $('reload').onclick = async () => {
+    if (savingGlobal || readingSettings || busy) return;
+    readingSettings = true; updateHeader();
+    const submitted = draftRevision, discard = dirty;
+    await refreshFlight;
+    const loaded = await readStatus(submitted);
+    submittedModules.clear();
+    saveFeedback = loaded ? { text: dirty ? '已重新读取，新的修改仍待保存' : discard ? '已放弃修改' : '已重新读取设置', tone: 'success' }
+      : { text: '读取失败，请重试', tone: 'error' };
+    readingSettings = false; updateHeader();
+  };
   $('refreshModels').onclick = () => { void catalog(); };
   $('refreshAccount').onclick = () => { void account(); };
-  $('login').onclick = async () => { const result = await action('login'); if (result?.authUrl) { const link = $<HTMLAnchorElement>('loginLink'); link.href = result.authUrl; link.style.display = 'inline'; } };
+  $('login').onclick = async () => {
+    const result = await action('login');
+    if (result?.authUrl) {
+      const link = $<HTMLAnchorElement>('loginLink'); link.href = result.authUrl; link.style.display = 'inline';
+      showFeedback($('accountStatus'), '请打开登录链接完成授权，再刷新状态。', 'info');
+    }
+  };
   $('shutdown').onclick = async () => { const result = await action('shutdown'); if (result) { $('connectionStatus').textContent = '后台已退出'; $('feedback').textContent = '可从插件入口重新启动。'; } };
   $('addPreset').onclick = () => {
     const input = $<HTMLInputElement>('newPresetId'); const id = input.value.trim();
@@ -1265,20 +1441,25 @@ function bindEvents(): void {
   $('credentials').onsubmit = async (event) => {
     event.preventDefault(); const form = event.currentTarget as HTMLFormElement;
     const id = form.elements.namedItem('appId') as HTMLInputElement; const secret = form.elements.namedItem('appSecret') as HTMLInputElement;
-    await action('credentials', { appId: id.value, appSecret: secret.value }); secret.value = '';
+    const button = form.querySelector<HTMLButtonElement>('button[type="submit"]')!;
+    if (button.disabled || busy) return;
+    button.disabled = true; button.textContent = '正在保存并连接…'; button.setAttribute('aria-busy', 'true');
+    try {
+      if (await action('credentials', { appId: id.value, appSecret: secret.value }, '凭据已保存，QQ Bot 已连接')) secret.value = '';
+    } finally { button.disabled = false; button.textContent = '保存凭据并连接'; button.setAttribute('aria-busy', 'false'); }
   };
-  window.addEventListener('beforeunload', (event) => { if (dirty || dirtySessions.size) { event.preventDefault(); event.returnValue = ''; } });
+  window.addEventListener('beforeunload', (event) => { if (dirty || dirtySessions.size || hasLiveSettingsChanges()) { event.preventDefault(); event.returnValue = ''; } });
 }
 
 async function main(): Promise<void> {
   document.body.dataset.transport = mode;
   if (mode === 'mcp') {
-    app = new App({ name: 'codex-qqbot-settings', title: 'QQ Bot', version: '0.0.6' }, {});
+    app = new App({ name: 'codex-qqbot-settings', title: 'QQ Bot', version: '0.0.7' }, {});
     app.onhostcontextchanged = (context) => { if (context.theme) document.body.dataset.theme = context.theme; };
     await app.connect();
     const theme = app.getHostContext()?.theme; if (theme) document.body.dataset.theme = theme;
   } else history.replaceState(null, '', location.pathname);
   bindEvents(); await refresh(); void account(); void catalog();
-  setInterval(() => { if (!exited && document.visibilityState !== 'hidden' && !busy) { void refresh(); void refreshDesktopJobs(); } }, 3000);
+  setInterval(() => { if (!exited && document.visibilityState !== 'hidden' && !busy && !readingSettings) { void refresh(); void refreshDesktopJobs(); } }, 3000);
 }
 void main().catch((error) => { $('error').textContent = error.message; });

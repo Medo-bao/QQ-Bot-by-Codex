@@ -43,16 +43,29 @@ export async function ensureService(directory = dataDirectory()): Promise<void> 
   new ConfigStore(directory);
   const cli = fileURLToPath(new URL('./cli.js', import.meta.url));
   const environment = { ...process.env, QQBOT_DATA_DIR: directory };
-  // ShellExecute (Start-Process) detaches from Windows shim job objects such as Volta's.
-  // Node's detached flag alone does not escape those jobs.
+  const windows = process.platform === 'win32';
   const quote = (value: string) => `'${value.replace(/'/g, "''")}'`;
-  const child = process.platform === 'win32'
+  // Let Windows start the daemon outside the Codex MCP client's process tree.
+  // Detached console and Unicode environment flags keep it hidden and preserve settings.
+  const child = windows
     ? spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-      `Start-Process -FilePath ${quote(process.execPath)} -ArgumentList @(${quote(`"${cli}"`)}, 'daemon') -WindowStyle Hidden`],
+      `$ErrorActionPreference = 'Stop'
+      $environment = [string[]]@(Get-ChildItem Env: | ForEach-Object { $_.Name + '=' + $_.Value })
+      $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{
+        ShowWindow = [uint16]0; CreateFlags = [uint32](0x400 -bor 0x8); EnvironmentVariables = $environment
+      }
+      $result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+        CommandLine = ${quote(`"${process.execPath}" "${cli}" daemon`)}
+        CurrentDirectory = ${quote(process.cwd())}; ProcessStartupInformation = $startup
+      }
+      exit $result.ReturnValue`],
       { windowsHide: true, stdio: 'ignore', env: environment })
     : spawn(process.execPath, [cli, 'daemon'], { detached: true, windowsHide: true, stdio: 'ignore', env: environment });
   let spawnError: Error | undefined;
   child.on('error', (error) => { spawnError = error; });
+  if (windows) child.on('exit', (code) => {
+    if (code) spawnError = new Error(`Windows 未能启动 QQ 后台服务（错误码 ${code}）。`);
+  });
   child.unref();
   for (let i = 0; i < 80; i++) {
     if (spawnError) throw spawnError;
@@ -104,7 +117,8 @@ export async function startService(logger: Logger, directory = dataDirectory()):
       let request: ServiceRequest;
       try { request = JSON.parse(buffer.slice(0, buffer.indexOf('\n'))); } catch { void respond(); return; }
       if (['status', 'setup', 'models', 'browser', 'live'].includes(request.method) || request.method === 'desktop' && ['list', 'read', 'jobs'].includes(request.params?.action) ||
-        request.method === 'session' && request.params?.action === 'desktop' && ['list', 'read', 'jobs'].includes(request.params.operation)) void respond();
+        request.method === 'session' && (request.params?.action === 'groupMembers' ||
+          request.params?.action === 'desktop' && ['list', 'read', 'jobs'].includes(request.params.operation))) void respond();
       else { mutation = mutation.then(respond); }
     });
   });

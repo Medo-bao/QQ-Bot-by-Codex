@@ -43,6 +43,11 @@ export function resolveReplyTarget(
   return { ...target, msgId: undefined, eventId: undefined };
 }
 
+export function groupMention(memberId: string): string {
+  const id = memberId.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return `<qqbot-at-user id="${id}" />`;
+}
+
 /**
  * 发送 markdown：区分 msg_id 与 event_id。
  * 带 eventId 时通过 bot.send 的 extra 填 event_id（SDK sendMarkdown 不支持）；
@@ -55,8 +60,7 @@ export function sendResolvedMarkdown(
   opts?: { keyboard?: InlineKeyboard },
 ): Promise<unknown> {
   if (target.scope === 'group' && target.replyUserId) {
-    const id = target.replyUserId.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    const mention = `<qqbot-at-user id="${id}" />`;
+    const mention = groupMention(target.replyUserId);
     if (!content.startsWith(mention)) content = `${mention}\n${content}`;
   }
   if (target.eventId) {

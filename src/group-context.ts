@@ -1,9 +1,10 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, createReadStream, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { createInterface } from 'node:readline';
 import { writeJson } from './config.ts';
 import type { ConversationMessage } from './conversation.ts';
 import type { ConversationStorage } from './storage.ts';
-import type { ReplyTarget } from './types.ts';
+import { isGroupMemberId, type GroupMember, type ReplyTarget } from './types.ts';
 
 export interface GroupContextEntry {
   id: string; role: 'user' | 'assistant'; senderId: string; senderName?: string; text: string;
@@ -61,6 +62,32 @@ export class GroupContextStore {
     return index < 0 ? [] : state.entries.filter((entry, position) => position < index || entry.role === 'assistant').slice(-limit);
   }
   get(target: ReplyTarget, id: string): GroupContextEntry | undefined { return this.state(target).entries.find(entry => entry.id === id); }
+
+  async members(target: ReplyTarget): Promise<GroupMember[]> {
+    const members = new Map<string, GroupMember>();
+    const remember = (entry: GroupContextEntry) => {
+      if (entry.role !== 'user' || !isGroupMemberId(entry.senderId)) return;
+      const id = entry.senderId;
+      const name = entry.senderName?.trim();
+      const latestName = name && name !== id ? name : members.get(id)?.name;
+      members.delete(id);
+      members.set(id, { id, name: latestName });
+    };
+    // Context resets leave the group archive intact, so the picker can still find earlier senders.
+    const input = createReadStream(this.archivePath(target), { encoding: 'utf8' });
+    const lines = createInterface({ input, crlfDelay: Infinity });
+    try {
+      for await (const line of lines) {
+        if (!line.includes('"role":"user"')) continue;
+        let entry: GroupContextEntry;
+        try { entry = JSON.parse(line); } catch { continue; }
+        remember(entry);
+      }
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    finally { lines.close(); input.destroy(); }
+    for (const entry of this.state(target).entries) remember(entry);
+    return [...members.values()].reverse();
+  }
   bind(target: ReplyTarget, threadId: string): void {
     const state = this.state(target);
     if (state.threadId && state.threadId !== threadId) this.clear(target);

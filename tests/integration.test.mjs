@@ -7,7 +7,7 @@ import { join, resolve } from 'node:path';
 import { createServer } from 'node:http';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { WebSocketServer } from 'ws';
+import WebSocket, { WebSocketServer } from 'ws';
 import { liveFixture } from './fixtures/live-server.mjs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
@@ -99,21 +99,188 @@ test('GPT-Live finalizes WAV clips, keeps tail audio, isolates jobs and handles 
   } finally { await live.close(); await peer.close(); }
 });
 
+test('TTS providers use isolated credentials and finalize complete WAVs', { timeout: 10000 }, async () => {
+  const directory = await temp();
+  const store = new ConfigStore(directory);
+  const config = store.update({ live: {
+    enabled: true, provider: 'dashscope', apiKey: 'fixture-openai',
+    dashscope: { apiKey: 'fixture-dashscope', region: 'international', workspaceId: 'llm-test' },
+    minimax: { apiKey: 'fixture-minimax' }, mimo: { apiKey: 'fixture-mimo', instructions: '语气轻松' },
+  } }).live;
+  store.update({ live: { minimax: { voice: 'female-tianmei' } } });
+  assert.equal(store.read().live.minimax.apiKey, 'fixture-minimax');
+  const publicConfig = store.publicConfig().live;
+  assert.ok(['dashscope', 'minimax', 'mimo'].every(provider => publicConfig[provider].keyConfigured));
+  assert.doesNotMatch(JSON.stringify(publicConfig), /fixture-|apiKey/);
+
+  const pcm = Buffer.from([0x34, 0x12, 0x78, 0x56]);
+  const commands = [], requests = [];
+  const server = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+  await new Promise((resolve, reject) => server.once('listening', resolve).once('error', reject));
+  server.on('connection', (ws, request) => {
+    ws.on('message', raw => {
+      const command = JSON.parse(raw);
+      const { action, task_id } = command.header;
+      commands.push({ command, authorization: request.headers.authorization });
+      const event = name => ws.send(JSON.stringify({ header: { task_id, event: name } }));
+      if (action === 'run-task') event('task-started');
+      if (action === 'finish-task') { ws.send(pcm.subarray(0, 2)); ws.send(pcm.subarray(2)); event('task-finished'); }
+    });
+  });
+  const live = new GptLive(() => config, {
+    socket(url, key) {
+      assert.equal(url, 'wss://llm-test.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/inference');
+      return new WebSocket(`ws://127.0.0.1:${server.address().port}`, { headers: { Authorization: `Bearer ${key}` } });
+    },
+    async fetch(url, options) {
+      const body = JSON.parse(options.body);
+      requests.push({ url, headers: options.headers, body });
+      const lines = url.includes('minimaxi.com')
+        ? [{ trace_id: 'minimax-id', data: { status: 1, audio: pcm.toString('hex') } }, { data: { status: 2 }, base_resp: { status_code: 0 } }]
+        : [{ id: 'mimo-id', choices: [{ delta: { audio: { data: pcm.toString('base64') } } }] },
+          ...(body.messages.at(-1).content === '断开' ? [] : [{ choices: [{ finish_reason: 'stop' }] }, '[DONE]'])];
+      if (body.messages?.at(-1).content === '取消') {
+        return new Promise((_, reject) => options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true }));
+      }
+      const bytes = Buffer.from(lines.map(line => `data: ${line === '[DONE]' ? line : JSON.stringify(line)}\r\n\r\n`).join(''));
+      return new Response(new ReadableStream({ start(stream) {
+        stream.enqueue(bytes.subarray(0, 9)); stream.enqueue(bytes.subarray(9)); stream.close();
+      } }), { headers: { 'Content-Type': 'text/event-stream' } });
+    },
+  });
+  try {
+    for (const provider of ['dashscope', 'minimax', 'mimo']) {
+      config.provider = provider;
+      const job = live.start('speech-test', directory, { text: '原文。', voice_id: provider === 'mimo' ? '茉莉' : 'voice-fixture' });
+      const result = await live.wait(job.owner, job.id);
+      assert.equal(result.status, 'completed', result.error);
+      assert.equal(result.provider, provider);
+      assert.equal(result.result.transcript, '');
+      const wav = await readFile(result.result.path);
+      assert.equal(wav.readUInt32LE(24), 24000);
+      assert.deepEqual(wav.subarray(44), pcm);
+    }
+    assert.deepEqual(commands.map(item => item.command.header.action), ['run-task', 'continue-task', 'finish-task']);
+    assert.ok(commands.every(item => item.command.header.task_id === commands[0].command.header.task_id && item.authorization === 'Bearer fixture-dashscope'));
+    assert.equal(commands[0].command.payload.parameters.voice, 'voice-fixture');
+    assert.equal(commands[1].command.payload.input.text, '原文。');
+    assert.equal(requests[0].headers.Authorization, 'Bearer fixture-minimax');
+    assert.equal(requests[0].body.text, '原文。');
+    assert.equal(requests[0].body.voice_setting.voice_id, 'voice-fixture');
+    assert.equal(requests[1].headers['api-key'], 'fixture-mimo');
+    assert.equal(requests[1].body.audio.voice, '茉莉');
+    assert.deepEqual(requests[1].body.messages, [{ role: 'user', content: '语气轻松' }, { role: 'assistant', content: '原文。' }]);
+    const truncated = live.start('speech-test', directory, { text: '断开' });
+    assert.match((await live.wait(truncated.owner, truncated.id)).error, /未收到供应商的完成信号/);
+    const cancelled = live.start('speech-test', directory, { text: '取消' });
+    live.cancel(cancelled.owner, cancelled.id);
+    assert.equal((await live.wait(cancelled.owner, cancelled.id)).status, 'cancelled');
+    assert.equal((await readdir(directory)).filter(file => file.endsWith('.wav')).length, 3);
+  } finally {
+    await live.close();
+    for (const socket of server.clients) socket.terminate();
+    await new Promise(resolve => server.close(resolve));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('GPT-SoVITS selects the installed local voice and uses the normal preview and delivery job', async () => {
+  const directory = await temp();
+  const previous = process.env.QQBOT_SOVITS_ROOT;
+  const store = new ConfigStore(directory);
+  const live = new GptLive(() => store.read().live);
+  try {
+    process.env.QQBOT_SOVITS_ROOT = directory;
+    store.update({ live: { enabled: true, provider: 'sovits', maxDurationSeconds: 5, sovits: { temperature: 0.8, idleMinutes: 4 } } });
+    store.update({ live: { sovits: { topK: 15, topP: 0.85, speedFactor: 1.2, maxChars: 65 } } });
+    assert.throws(() => live.start('local', directory, { text: '你好。' }), /安装未就绪/);
+    const runtime = join(directory, 'runtime');
+    const pack = join(runtime, 'voices', 'firefly');
+    const entry = join(directory, 'packages', 'sovits-runtime', 'src');
+    await Promise.all([mkdir(pack, { recursive: true }), mkdir(entry, { recursive: true }), mkdir(join(runtime, 'venv', 'Scripts'), { recursive: true })]);
+    await Promise.all([
+      writeFile(join(pack, 'voice.json'), JSON.stringify({ name: '本地测试音色' })),
+      writeFile(join(runtime, 'venv', 'Scripts', 'python.exe'), ''),
+      writeFile(join(directory, 'package.json'), '{"type":"module"}'),
+      writeFile(join(entry, 'index.js'), `
+        export function createRuntime(options) {
+          if (!options.installDir.endsWith('runtime')) throw new Error('wrong installation');
+          if (options.idleUnloadMs !== 240000) throw new Error('wrong startup idle setting');
+          const engine = { idleUnloadMs: options.idleUnloadMs, touched: false, touch() { this.touched = true; } };
+          return { engine, async renderPreview(text, { signal, onReady, maxDurationMs, maxChars, params }) {
+            onReady();
+            if (maxDurationMs !== 5000) throw new Error('wrong audio limit');
+            if (maxChars !== 65 || params.temperature !== 0.8 || params.topK !== 15 || params.topP !== 0.85 || params.speedFactor !== 1.2) {
+              throw new Error('local synthesis settings did not reach the engine');
+            }
+            signal.throwIfAborted();
+            if (text === '超限') {
+              if (engine.idleUnloadMs !== 0 || !engine.touched) throw new Error('idle timer was not cancelled');
+              throw Object.assign(new Error('limit'), { code: 'audio-too-long' });
+            }
+            const wav = Buffer.alloc(44 + 9600);
+            wav.write('RIFF'); wav.writeUInt32LE(wav.length - 8, 4); wav.write('WAVEfmt ', 8);
+            wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
+            wav.writeUInt32LE(48000, 24); wav.writeUInt32LE(96000, 28); wav.writeUInt16LE(2, 32);
+            wav.writeUInt16LE(16, 34); wav.write('data', 36); wav.writeUInt32LE(9600, 40);
+            return { wav, durationMs: 100 };
+          }, async stop() {} };
+        }
+      `),
+    ]);
+    assert.deepEqual(store.publicConfig().live.sovits, {
+      directory, available: true, voice: '本地测试音色', temperature: 0.8, topK: 15, topP: 0.85, speedFactor: 1.2,
+      maxChars: 65, idleMinutes: 4, autoSpeak: false,
+    });
+    assert.throws(() => live.start('local', directory, { text: '你好。', voice_id: 'cloud-voice' }), /音色包/);
+    const job = live.start('local', directory, { text: '你好。' });
+    const complete = await live.wait(job.owner, job.id);
+    assert.equal(complete.status, 'completed', complete.error);
+    assert.equal(complete.provider, 'sovits');
+    assert.equal(complete.result.durationSeconds, 0.1);
+    const wav = await readFile(complete.result.path);
+    assert.equal(wav.readUInt32LE(24), 48000);
+    assert.equal(wav.readUInt32LE(40), 9600);
+    const sent = await live.deliver(job.owner, job.id, result => assert.deepEqual(readFileSync(result.path), wav), 'voice');
+    assert.equal(sent.delivery, 'sent');
+    store.update({ live: { sovits: { idleMinutes: 0 } } });
+    live.setLocalIdleMinutes(0);
+    const over = live.start('local', directory, { text: '超限' });
+    assert.match((await live.wait(over.owner, over.id)).error, /时长上限/);
+    assert.equal((await readdir(directory)).filter(file => file.endsWith('.wav')).length, 1);
+  } finally {
+    await live.close();
+    if (previous === undefined) delete process.env.QQBOT_SOVITS_ROOT; else process.env.QQBOT_SOVITS_ROOT = previous;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('GPT-Live uses the real QQ dynamic-tool round trip, archives per thread, sends once and honors network restrictions', { timeout: 15000 }, async () => {
   const directory = await temp(), peer = await liveFixture();
   const config = configSchema.parse({ appId: 'live-bot', cwd: directory, codexCommand: fixture, codexArgs: [directory],
     access: { c2cMode: 'open', groupMode: 'open' }, live: { enabled: true, apiKey: 'fixture-api-secret', silenceMs: 1000 } });
+  const store = new ConfigStore(directory);
+  store.update(config);
+  const controller = new BotController(store, quiet);
   const live = new GptLive(() => config.live, { socket: (url, key) => peer.socket(url, key) });
   const qq = new FakeQQ(), client = new CodexClient(config, quiet);
+  const localReads = [];
   let bridge;
   bridge = new QQBridge(config, directory, qq, client, quiet, undefined, undefined, async (target, params, signal) => {
     const session = bridge.status().sessions.find(item => item.scope === target.scope && item.peerId === target.targetId);
     const output = bridge.storage.audioDirectory(target, session.threadId);
+    if (config.live.provider === 'sovits') {
+      localReads.push({ text: params.text, precedingReply: qq.messages.at(-1)?.text });
+      const path = join(output, `fixture-local-${localReads.length}.wav`);
+      await writeFile(path, await readFile(qq.files[0].path));
+      return { status: 'completed', result: { path } };
+    }
     const job = live.start(`${target.scope}:${target.targetId}`, output, params, signal);
     return live.wait(job.owner, job.id);
   });
   try {
     await bridge.start();
+    controller.bridge = bridge;
     await bridge.handleMessage(message('gpt-live-check voice', 'group', 'team', 'alice'));
     await waitFor(() => requireTrace(directory).some(item => item.liveAudio));
     await waitFor(() => bridge.status().sessions.every(item => !item.busy && !item.queued));
@@ -124,6 +291,10 @@ test('GPT-Live uses the real QQ dynamic-tool round trip, archives per thread, se
     assert.equal(qq.files.length, 1, 'the final file link does not resend an already delivered clip');
     assert.equal(qq.files[0].sendAs, 'voice');
     assert.ok(qq.files[0].path.startsWith(bridge.storage.paths({ scope: 'group', targetId: 'team' }).directory));
+    const firstHistory = await controller.conversation('group', 'team');
+    const firstReply = firstHistory.messages.find(item => item.role === 'assistant');
+    assert.ok(firstReply?.text);
+    assert.deepEqual(firstReply.files?.map(file => file.path), [await realpath(qq.files[0].path)], 'the sent clip is attached to its reply');
     assert.match(qq.files[0].path, /audio[\\/]gpt-live-/);
     const start = requireTrace(directory).find(item => item.method === 'thread/start');
     assert.ok(start.params.dynamicTools.some(tool => tool.name === 'qqbot_live'));
@@ -136,6 +307,31 @@ test('GPT-Live uses the real QQ dynamic-tool round trip, archives per thread, se
     assert.equal(denied.success, false); assert.match(denied.contentItems[0].text, /禁止联网/);
     assert.equal(peer.requests.length, 1); assert.equal(qq.files.length, 1);
     assert.equal(bridge.status().sessions[0].threadId, session.threadId);
+
+    config.live.provider = 'sovits';
+    const idle = () => waitFor(() => bridge.status().sessions.every(item => !item.busy && !item.queued));
+    await bridge.handleMessage(message('默认仅回复文字', 'group', 'team', 'alice'));
+    await idle();
+    assert.equal(localReads.length, 0);
+    config.live.sovits.autoSpeak = true;
+    await bridge.handleMessage(message('auto-speak-check 最终回复', 'group', 'team', 'alice'));
+    await idle();
+    assert.deepEqual(localReads.map(entry => entry.text), ['这是最终回复。']);
+    assert.ok(localReads[0].precedingReply.includes('这是最终回复。'), 'text is already delivered before synthesis');
+    assert.equal(qq.files.length, 2, 'duplicate turn completion does not resend voice');
+    assert.equal(qq.files.at(-1).sendAs, 'voice');
+    await bridge.handleMessage(message('gpt-live-check file audio-only', 'group', 'team', 'alice'));
+    await idle();
+    assert.equal(localReads.length, 2, 'only the explicit local audio request ran this turn');
+    assert.equal(qq.files.length, 3);
+    assert.equal(qq.files.at(-1).sendAs, 'file');
+    const history = await controller.conversation('group', 'team');
+    const reply = history.messages.at(-1);
+    assert.equal(reply.role, 'assistant');
+    assert.equal(reply.text, '');
+    assert.deepEqual(reply.files.map(({ path, image }) => ({ path, image })), [
+      { path: await realpath(qq.files.at(-1).path), image: false },
+    ], 'a clip-only reply has its own file card');
   } finally { await bridge.close(); await live.close(); await peer.close(); }
 });
 
@@ -1417,6 +1613,8 @@ test('Tencent SDK uses actual HTTP/WebSocket QQ frames; media inputs and outgoin
   const config = configSchema.parse({ cwd: directory, media: { maxMB: 0.0001 } });
   const media = new MediaStore(directory, config);
   const requests = [];
+  let rosterAllowed = true;
+  let rejectBroadcastTail = false;
   let base;
   const http = createServer(async (request, response) => {
     if (request.url === '/image' || request.url === '/large') { response.end(request.url === '/large' ? Buffer.alloc(500) : Buffer.from('image-data')); return; }
@@ -1425,7 +1623,18 @@ test('Tencent SDK uses actual HTTP/WebSocket QQ frames; media inputs and outgoin
     response.setHeader('content-type', 'application/json');
     if (request.url === '/app/getAppAccessToken') response.end(JSON.stringify({ access_token: 'fixture-qq-token', expires_in: '7200' }));
     else if (request.url === '/gateway') response.end(JSON.stringify({ url: base.replace('http:', 'ws:') + '/ws' }));
+    else if (request.url.startsWith('/v2/groups/team/members')) {
+      if (!rosterAllowed) { response.writeHead(403).end(JSON.stringify({ code: 11253, message: 'fixture roster unavailable' })); return; }
+      const second = request.url === '/v2/groups/team/members?cursor=next%2F%2B';
+      response.end(JSON.stringify({ members: second ? [{ member_openid: 'bob', username: 'Bob' }] :
+        [{ member_openid: 'alice', username: 'Alice' }, { member_openid: 'bot', bot: true }],
+        next_cursor: second ? '' : 'next/+' }));
+    }
     else if (request.url.endsWith('/files')) response.end(JSON.stringify({ file_uuid: 'fixture-file', file_info: 'fixture-file-info', ttl: 3600 }));
+    else if (rejectBroadcastTail && requests.at(-1).body.markdown?.content === '乙'.repeat(100)) {
+      rejectBroadcastTail = false;
+      response.writeHead(403).end(JSON.stringify({ code: 22009, message: 'fixture tail rejected' }));
+    }
     else response.end(JSON.stringify({ id: 'response-' + requests.length, timestamp: new Date().toISOString() }));
   });
   const sockets = new WebSocketServer({ server: http });
@@ -1457,7 +1666,7 @@ test('Tencent SDK uses actual HTTP/WebSocket QQ frames; media inputs and outgoin
     }
     return originalFetch(input, options);
   };
-  const qqConfig = configSchema.parse({ cwd: directory, appId: 'fixture-app', appSecret: 'fixture-secret' });
+  const qqConfig = configSchema.parse({ cwd: directory, appId: 'fixture-app', appSecret: 'fixture-secret', access: { c2cMode: 'open', groupMode: 'open' } });
   assert.equal(qqConfig.replyToEveryone, false, 'everyone replies default to off for existing configurations');
   const qq = new QQTransport(qqConfig, quiet);
   let online = false, reconnects = 0;
@@ -1486,6 +1695,49 @@ test('Tencent SDK uses actual HTTP/WebSocket QQ frames; media inputs and outgoin
     await qq.sendMarkdown(messages[3].target, 'second group SDK reply');
     assert.ok(requests.some((request) => request.path === '/v2/groups/team/messages' && request.body.markdown?.content === '<qqbot-at-user id="alice" />\ngroup SDK reply' && request.body.msg_id === messages[2].target.msgId));
     assert.ok(requests.some((request) => request.path === '/v2/groups/team/messages' && request.body.markdown?.content === '<qqbot-at-user id="bob" />\nsecond group SDK reply' && request.body.msg_id === messages[3].target.msgId));
+    const localStore = new ConfigStore(directory);
+    localStore.update(qqConfig);
+    new SessionStore(directory).set('fixture-app:group:team', { name: 'Fixture group' });
+    const bridge = new QQBridge(qqConfig, directory, qq, new CodexClient(qqConfig, quiet), quiet);
+    const controller = new BotController(localStore, quiet);
+    controller.bridge = bridge; controller.connected = true;
+    for (const input of messages.slice(1, 4)) await bridge.handleMessage({ ...input, shouldAnswer: false });
+    const group = { scope: 'group', target_id: 'team' };
+    const members = await controller.invoke('session', { ...group, action: 'groupMembers' });
+    assert.deepEqual(members, { source: 'qq', members: [{ id: 'alice', name: 'Alice' }], nextCursor: 'next/+' });
+    const next = await controller.invoke('session', { ...group, action: 'groupMembers', cursor: members.nextCursor });
+    assert.deepEqual(next.members, [{ id: 'bob', name: 'Bob' }]);
+    rosterAllowed = false;
+    assert.deepEqual(await controller.invoke('session', { ...group, action: 'groupMembers' }), {
+      source: 'history', members: [{ id: 'bob', name: 'Bob' }, { id: 'alice', name: 'Alice' }],
+    });
+    const direct = (text, mention_ids, target = group) => controller.invoke('session', { ...target, action: 'send', text, mention_ids });
+    assert.deepEqual(await direct('direct text', ['bob', 'alice', 'bob']), { sent: true });
+    const sent = requests.at(-1);
+    assert.equal(sent.path, '/v2/groups/team/messages');
+    assert.equal(sent.body.markdown.content, '<qqbot-at-user id="bob" /> <qqbot-at-user id="alice" />\ndirect text');
+    assert.equal(sent.body.msg_id, messages[3].target.msgId, 'member selection preserves the existing passive reply routing');
+    await direct('', ['alice']);
+    assert.equal(requests.at(-1).body.markdown.content, '<qqbot-at-user id="alice" />');
+    const beforeInvalid = requests.length;
+    await assert.rejects(direct('private', ['alice'], { scope: 'c2c', target_id: 'alice' }), /只有群聊/);
+    await assert.rejects(direct('everyone', ['all']), /有效的群成员/);
+    assert.equal(requests.length, beforeInvalid);
+    const broadcast = (text, options = {}) => controller.invoke('session', { ...group, action: 'send', text, mention_everyone: true, ...options });
+    await broadcast('');
+    assert.equal(requests.at(-1).body.markdown.content, '<qqbot-at-everyone />');
+    await assert.rejects(broadcast('private', { scope: 'c2c', target_id: 'alice' }), /只有群聊/);
+    await assert.rejects(broadcast('mixed', { mention_ids: ['alice'] }), /全体成员或指定成员/);
+    const splitOffset = requests.length;
+    qqConfig.textChunkLimit = 120;
+    const pendingText = '乙'.repeat(120);
+    rejectBroadcastTail = true;
+    const partial = await broadcast('甲'.repeat(100) + pendingText);
+    assert.equal(partial.sent, false);
+    assert.equal(partial.remaining_text, pendingText);
+    await direct(partial.remaining_text, []);
+    assert.equal(requests.slice(splitOffset).filter(request => request.body.markdown?.content.includes('<qqbot-at-everyone />')).length, 1);
+    qqConfig.textChunkLimit = 4500;
     await qq.sendMarkdown(messages[0].target, 'SDK reply');
     await qq.sendFile(messages[0].target, join(directory, 'output.txt'), 'output.txt');
     const stream = qq.openStream(messages[0].target);
@@ -1621,7 +1873,7 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
   try {
     assert.equal(client.getServerVersion().name, 'codex-qqbot');
     assert.equal(client.getServerVersion().title, 'QQ Bot');
-    assert.equal(client.getServerVersion().version, '0.0.6');
+    assert.equal(client.getServerVersion().version, '0.0.7');
     const tools = (await client.listTools()).tools.map((tool) => tool.name);
     assert.deepEqual(tools.sort(), ['qqbot_browser', 'qqbot_configure', 'qqbot_desktop', 'qqbot_live', 'qqbot_models', 'qqbot_send_file', 'qqbot_send_message', 'qqbot_setup', 'qqbot_start', 'qqbot_status', 'qqbot_stop', 'qqbot_ui'].sort());
     const details = (await client.listTools()).tools;
