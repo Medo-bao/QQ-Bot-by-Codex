@@ -1,6 +1,6 @@
 {
   "name": "codex-qqbot",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "description": "Connect QQ private and group chats to local Codex sessions, with QR binding, streaming replies, file delivery and approvals.",
   "author": { "name": "Local adaptation of tencent-connect/dsh-qqbot" },
   "license": "MIT",

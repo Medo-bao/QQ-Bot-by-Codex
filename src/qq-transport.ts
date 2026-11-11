@@ -1,4 +1,4 @@
-import { QQBot, contentSanitizer, errorHandler, mentionGate, messageFilter, rateLimiter, typingIndicator } from '@tencent-connect/qqbot-nodejs';
+import { ApiError, MediaFileType, QQBot, contentSanitizer, errorHandler, mentionGate, messageFilter, rateLimiter, typingIndicator } from '@tencent-connect/qqbot-nodejs';
 import type { InlineKeyboard, InteractionEvent } from '@tencent-connect/qqbot-nodejs';
 import { cacheEventId, cacheMsgId } from './transport/msgid-cache.ts';
 import { resolveReplyTarget, sendResolvedMarkdown } from './transport/reply-target.ts';
@@ -38,6 +38,13 @@ export interface ChatTransport extends QQBotSender {
   groupMembers?(groupId: string, cursor?: string): Promise<Omit<GroupMemberPage, 'source'>>;
 }
 
+const mediaFileTypes = {
+  image: MediaFileType.IMAGE,
+  video: MediaFileType.VIDEO,
+  voice: MediaFileType.VOICE,
+  file: MediaFileType.FILE,
+};
+
 export class QQTransport implements ChatTransport {
   private readonly bot: QQBot;
   private readonly limiters = { c2c: new ReplyLimiter(replyPolicy.c2c), group: new ReplyLimiter(replyPolicy.group) };
@@ -52,7 +59,7 @@ export class QQTransport implements ChatTransport {
       appId: config.appId,
       appSecret: config.appSecret,
       transport: 'websocket',
-      userAgent: 'codex-qqbot/0.0.7',
+      userAgent: 'codex-qqbot/0.0.8',
       logger,
       baseUrl: process.env.QQBOT_BASE_URL || 'https://api.bot.qq.com',
       tokenBaseUrl: process.env.QQBOT_TOKEN_BASE_URL || 'https://api.bot.qq.com',
@@ -171,11 +178,20 @@ export class QQTransport implements ChatTransport {
 
   sendFile(target: ReplyTarget, path: string, fileName: string, sendAs: FileSendMode = 'auto'): Promise<unknown> {
     const kind = fileSendKind(path, sendAs);
-    const resolved = resolveReplyTarget(target, this.limiters[target.scope], false);
-    if (kind === 'image') return this.bot.sendImage(resolved, { localPath: path });
-    if (kind === 'video') return this.bot.sendVideo(resolved, { localPath: path });
-    if (kind === 'voice') return this.bot.sendVoice(resolved, { localPath: path });
-    return this.bot.sendFile(resolved, { localPath: path }, { fileName });
+    return this.bot.uploadMedia({ target, fileType: mediaFileTypes[kind], localPath: path, srvSendMsg: false,
+      ...(kind === 'file' ? { fileName } : {}) }).then(async upload => {
+      const limiter = this.limiters[target.scope];
+      const resolved = resolveReplyTarget(target, limiter, false);
+      const creds = this.bot.getCredentials();
+      const send = (msgId?: string) => this.bot.mediaApi.sendMediaMessage(target.scope, target.targetId, upload.file_info, creds, { msgId });
+      try { return { upload, message: await send(resolved.msgId) }; }
+      catch (error) {
+        if (!resolved.msgId || !(error instanceof ApiError) || error.httpStatus !== 400 ||
+          !/(?:msg_?id|消息\s*id)\s*(?:已(?:经)?)?过期/i.test(error.bizMessage || error.message)) throw error;
+        limiter.expire(resolved.msgId);
+        return { upload, message: await send(resolveReplyTarget(target, limiter, false).msgId) };
+      }
+    });
   }
 
   close(): void { this.stopping = true; this.cancelConnect?.(); this.bot.stop(); }

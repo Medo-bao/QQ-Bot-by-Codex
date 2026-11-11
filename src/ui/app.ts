@@ -6,6 +6,7 @@ import { bindLiveUi, hasLiveSettingsChanges, refreshLiveUi } from './live.ts';
 import { showFeedback, showModuleBadge, type FeedbackTone } from './feedback.ts';
 import { permissionPicker, closePermissionMenus } from './permissions.ts';
 import { bindDirectMentions } from './direct-mentions.ts';
+import type { FileSendMode } from '../types.ts';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const mode = (window as any).__QQBOT_MODE__ as 'mcp' | 'http';
@@ -38,7 +39,7 @@ let activeSearchQuery = '';
 let searchGroupCollapsed = false;
 let globalPermissionPicker: ReturnType<typeof permissionPicker> | undefined;
 const directMessageDrafts = new Map<string, string>();
-type DirectFile = { file: File; sendAs: 'auto' | 'file' | 'voice'; preview?: string; path?: string; status?: string };
+type DirectFile = { file: File; sendAs: FileSendMode; preview?: string; path?: string; status?: string };
 const directFileDrafts = new Map<string, DirectFile[]>();
 let directSending = false;
 const dirtySessions = new Set<string>();
@@ -80,6 +81,13 @@ const fields: Record<string, Field[]> = {
     { path: 'textChunkLimit', label: '单条消息字符上限', kind: 'number' },
     { path: 'historyLimit', label: '每轮补充的群聊历史条数', kind: 'number', help: '按群持久保存，补入完整消息和机器人回复；0 表示不额外补入。回复是否触发由上方群聊开关决定。' },
   ],
+  imageModeFields: [
+    { path: 'imageGeneration.mode', label: '生成方式', kind: 'select', options: ['codex', 'api'] },
+  ],
+  imageApiFields: [
+    { path: 'imageGeneration.model', label: 'API 生图模型', kind: 'select' },
+    { path: 'imageGeneration.keyFile', label: 'OpenAI Developers 密钥文件', wide: true, help: '填入已保存的 .env.local 完整路径。留空时读取本机的 OPENAI_API_KEY。' },
+  ],
   mediaFields: [
     { path: 'storageDir', label: '会话与资源存储目录', wide: true, help: '按机器人和会话分别归档聊天记录、附件及生成文件。留空使用本机数据目录下的 storage。' },
     { path: 'media.enabled', label: '接收图片与附件', kind: 'boolean', wide: true },
@@ -118,6 +126,8 @@ const fields: Record<string, Field[]> = {
   advancedFields: [{ path: 'codexCommand', label: 'Codex 可执行文件', wide: true }, { path: 'codexArgs', label: 'App Server 附加启动参数', kind: 'lines', wide: true, help: '每行一个参数。' }],
 };
 const labels: Record<string, string> = { '': '跟随默认', http: 'HTTP 流式（稳定优先）', auto: '由 Codex 自动选择', enabled: '允许', live: '实时搜索', cached: '缓存搜索', indexed: '索引搜索', allowlist: '仅白名单', open: '开放', disabled: '关闭', 'on-request': '由 Codex 请求确认', untrusted: '不可信操作需要确认', never: '不请求确认', user: '由我批准', auto_review: 'Codex 自动审核', 'workspace-write': '可写工作目录', 'read-only': '只读', 'danger-full-access': '完全访问' };
+labels.codex = 'Codex 默认';
+labels.api = 'OpenAI API';
 const get = (object: any, path: string): any => path.split('.').reduce((value, key) => value?.[key], object);
 const set = (object: any, path: string, value: any) => { const keys = path.split('.'); const final = keys.pop()!; const owner = keys.reduce((value, key) => value[key] ||= {}, object); owner[final] = value; };
 const settingPaths = new Map<string, string[]>();
@@ -168,6 +178,7 @@ function markDirty(): void {
   saveFeedback = undefined;
   if (!savingGlobal) submittedModules.clear();
   updateChanges();
+  renderImageMode();
   globalPermissionPicker?.refresh();
   updateHeader();
 }
@@ -325,8 +336,27 @@ function field(spec: Field, object: any, changed: () => void): HTMLElement {
   return label;
 }
 
+function renderImageMode(): void {
+  const settings = draft.imageGeneration;
+  const useApi = settings?.mode === 'api';
+  $('imageApiOptions').hidden = !useApi;
+  const help = useApi ? '通过 OpenAI 项目生成图片，按 API 用量计费。保存后从下一轮生效。'
+    : '使用 Codex 自带的图片工具。保存后从下一轮生效。';
+  showFeedback($('imageModeHelp'), help);
+  if (!useApi) return;
+  const keyFile = settings.keyFile?.trim() || '';
+  const saved = state?.config.imageGeneration;
+  if (keyFile !== (saved?.keyFile || '')) showFeedback($('imageKeyStatus'), '保存后检查密钥来源。', 'pending');
+  else if (saved?.keySource === 'file') showFeedback($('imageKeyStatus'), '已读取本机密钥文件。', 'success');
+  else if (saved?.keySource === 'environment') showFeedback($('imageKeyStatus'), '已读取本机的 OPENAI_API_KEY。', 'success');
+  else showFeedback($('imageKeyStatus'), keyFile ? '密钥文件无法读取，或文件内没有 OPENAI_API_KEY。'
+    : '尚未找到 API 密钥。可填入 OpenAI Developers 保存的文件路径。', 'error');
+}
+
 function renderForm(): void {
-  for (const [container, specs] of Object.entries(fields)) $(container).replaceChildren(...specs.map((spec) => field(spec, draft, markDirty)));
+  for (const [container, specs] of Object.entries(fields)) $(container).replaceChildren(...specs.map((spec) => field(
+    spec.path === 'imageGeneration.model' ? { ...spec, options: draft.imageGeneration?.models || [] } : spec, draft, markDirty)));
+  renderImageMode();
   globalPermissionPicker = permissionPicker(draft, $('tab-runtime'), markDirty);
   $('globalPermissions').replaceChildren(globalPermissionPicker.element);
   renderPresets();
@@ -772,7 +802,8 @@ function renderDirectFiles(): void {
     body.append(name, status);
     const mode = document.createElement('select'); mode.setAttribute('aria-label', `${entry.file.name} 的发送方式`); mode.disabled = directSending;
     const audio = entry.file.type.startsWith('audio/') || /\.(mp3|wav|ogg|aac|flac|m4a|silk|amr)$/i.test(entry.file.name);
-    for (const [value, label] of [['auto', '自动识别'], ['file', '按文件发送'], ...(audio ? [['voice', '按语音发送']] : [])]) {
+    const image = entry.file.type.startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp)$/i.test(entry.file.name);
+    for (const [value, label] of [['auto', '自动识别'], ...(image ? [['image', '按图片发送']] : []), ['file', '按文件发送'], ...(audio ? [['voice', '按语音发送']] : [])]) {
       const option = document.createElement('option'); option.value = value!; option.textContent = label!; mode.append(option);
     }
     mode.value = entry.sendAs; mode.onchange = () => { entry.sendAs = mode.value as DirectFile['sendAs']; };
@@ -1135,6 +1166,7 @@ async function readStatus(discardAt?: number): Promise<boolean> {
     state = await api('status');
     const latestConfig = structuredClone(state.config); delete latestConfig.credentialsConfigured;
     if (!draft || discardAt === draftRevision || !dirty && JSON.stringify(draft) !== JSON.stringify(latestConfig)) adoptSettings(latestConfig);
+    else renderImageMode();
     $('connectionStatus').textContent = state.connected ? 'QQ Bot 已连接' : state.running ? '连接中' : '连接未启动';
     $('connectionStatus').dataset.connected = String(Boolean(state.connected));
     const phase = state.binding || { phase: 'idle' };
@@ -1454,7 +1486,7 @@ function bindEvents(): void {
 async function main(): Promise<void> {
   document.body.dataset.transport = mode;
   if (mode === 'mcp') {
-    app = new App({ name: 'codex-qqbot-settings', title: 'QQ Bot', version: '0.0.7' }, {});
+    app = new App({ name: 'codex-qqbot-settings', title: 'QQ Bot', version: '0.0.8' }, {});
     app.onhostcontextchanged = (context) => { if (context.theme) document.body.dataset.theme = context.theme; };
     await app.connect();
     const theme = app.getHostContext()?.theme; if (theme) document.body.dataset.theme = theme;

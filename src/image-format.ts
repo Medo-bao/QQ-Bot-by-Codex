@@ -3,7 +3,7 @@ import { extname } from 'node:path';
 
 // Adapted from tencent-connect/dsh-qqbot#86: QQ image MIME types and suffixes
 // can disagree with the bytes, especially for GIF stickers and JPEG photos.
-function imageExtension(header: Buffer): string | undefined {
+export function imageExtension(header: Buffer): string | undefined {
   if (header.length >= 6 && ['GIF87a', 'GIF89a'].includes(header.toString('latin1', 0, 6))) return '.gif';
   if (header.length >= 8 && header.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))) return '.png';
   if (header.length >= 3 && header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff) return '.jpg';

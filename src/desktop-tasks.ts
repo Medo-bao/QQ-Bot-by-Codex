@@ -1,5 +1,8 @@
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { createReadStream, existsSync, readFileSync } from 'node:fs';
+import { realpath, stat } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { extname, isAbsolute, join, relative } from 'node:path';
+import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
 import { writeJson } from './config.ts';
 import { DesktopAppClient } from './desktop-app-client.ts';
@@ -13,6 +16,7 @@ interface DesktopJob {
 }
 const terminal = (job: DesktopJob) => ['completed', 'failed', 'cancelled', 'unknown'].includes(job.status);
 const sourceKey = (target: ReplyTarget) => `${target.scope}:${target.targetId}`;
+const oversizedHistory = (error: unknown) => error instanceof Error && error.message.startsWith('Thread history exceeds the read size limit.');
 
 export class DesktopTasks {
   private client = new DesktopAppClient();
@@ -24,8 +28,10 @@ export class DesktopTasks {
   private pollOffset = 0;
   private closed = false;
   private monitorError?: string;
+  private readonly checkedRollouts = new Map<string, string>();
   constructor(directory: string, private readonly logger: Logger,
-    private readonly notify: (target: ReplyTarget, text: string) => Promise<unknown>, private readonly enabled: () => boolean) {
+    private readonly notify: (target: ReplyTarget, text: string) => Promise<unknown>, private readonly enabled: () => boolean,
+    private readonly canNotify: () => boolean = () => true) {
     this.path = join(directory, 'desktop-jobs.json');
     this.jobs = existsSync(this.path) ? JSON.parse(readFileSync(this.path, 'utf8')) : [];
     for (const job of this.jobs) if (job.status === 'submitting') { job.status = 'unknown'; job.error = '后台在派发期间关闭，结果尚未确认，请查看目标会话后再决定是否重发。'; }
@@ -63,7 +69,7 @@ export class DesktopTasks {
       nextCursor: result.nextCursor || null, jobs: this.listJobs(target) };
   }
   async read(threadId: string, cursor?: string): Promise<any> {
-    return this.client.call('read_thread', { threadId, hostId: 'local', turnLimit: 8, includeOutputs: false, maxOutputCharsPerItem: 2500, ...(cursor ? { cursor } : {}) });
+    return this.readPage(threadId, cursor, 8, 2500);
   }
   async dispatch(target: ReplyTarget, threadId: string, prompt: string, notify = true): Promise<Omit<DesktopJob, 'target'>> {
     if (threadId === this.client.callerThreadId) throw new Error('请选择其他桌面会话，不能向当前控制会话派发任务。');
@@ -97,7 +103,61 @@ export class DesktopTasks {
     return { ...job, target: undefined };
   }
   private async taskHistory(threadId: string, cursor?: string): Promise<any> {
-    return this.client.call('read_thread', { threadId, hostId: 'local', turnLimit: 10, includeOutputs: false, maxOutputCharsPerItem: 16000, ...(cursor ? { cursor } : {}) });
+    return this.readPage(threadId, cursor, 4, 16000);
+  }
+  private async readPage(threadId: string, cursor: string | undefined, turnLimit: number, maxOutputCharsPerItem: number): Promise<any> {
+    try {
+      return await this.client.call('read_thread', { threadId, hostId: 'local', turnLimit, includeOutputs: false, maxOutputCharsPerItem, ...(cursor ? { cursor } : {}) });
+    } catch (error) {
+      if (!oversizedHistory(error)) throw error;
+      if (turnLimit > 1) return this.readPage(threadId, cursor, Math.floor(turnLimit / 2), maxOutputCharsPerItem);
+      if (maxOutputCharsPerItem > 512) return this.readPage(threadId, cursor, 1, 512);
+      throw error;
+    }
+  }
+
+  private async recoverCompletion(job: DesktopJob): Promise<boolean> {
+    // Only a previously correlated, local task can use a native completion event.
+    const turnId = job.turnId;
+    if (!turnId) return false;
+    try {
+      const home = await realpath(process.env.CODEX_HOME || join(homedir(), '.codex'));
+      const { DatabaseSync } = await import('node:sqlite');
+      const db = new DatabaseSync(join(home, 'state_5.sqlite'), { readOnly: true });
+      let rollout: unknown;
+      try { rollout = db.prepare('SELECT rollout_path FROM threads WHERE id = ?').get(job.threadId)?.rollout_path; }
+      finally { db.close(); }
+      if (typeof rollout !== 'string' || !isAbsolute(rollout)) return false;
+      const path = await realpath(rollout);
+      const roots = await Promise.all(['sessions', 'archived_sessions'].map(folder => realpath(join(home, folder)).catch(() => '')));
+      if (extname(path) !== '.jsonl' || !roots.some(root => {
+        const child = root && relative(root, path);
+        return child && !isAbsolute(child) && !child.startsWith('..');
+      })) return false;
+      const info = await stat(path);
+      if (!info.isFile()) return false;
+      const revision = `${path}\0${info.size}\0${info.mtimeMs}`;
+      if (this.checkedRollouts.get(job.id) === revision) return false;
+      const input = createReadStream(path, { encoding: 'utf8' });
+      const lines = createInterface({ input, crlfDelay: Infinity });
+      try {
+        for await (const line of lines) {
+          if (!line.includes(turnId) || !line.includes('"task_complete"')) continue;
+          let event;
+          try { event = JSON.parse(line); } catch { continue; }
+          const payload = event.payload;
+          if (event.type !== 'event_msg' || payload?.type !== 'task_complete' || payload.turn_id !== turnId ||
+            typeof payload.last_agent_message !== 'string' || !payload.last_agent_message.split(/\r?\n/).some((line: string) => line.trim() === `QQ Bot 任务 #${job.id}`)) continue;
+          this.finish(job, { status: 'completed' }, payload.last_agent_message);
+          job.progress = '已从原会话核对任务完成记录。';
+          job.updatedAt = Date.now();
+          this.checkedRollouts.delete(job.id);
+          return true;
+        }
+      } finally { lines.close(); input.destroy(); }
+      this.checkedRollouts.set(job.id, revision);
+    } catch { /* Leave the task pending if no matching completion can be verified. */ }
+    return false;
   }
   private async locate(job: DesktopJob, history: any): Promise<any> {
     const marker = `QQ Bot 任务 #${job.id}`;
@@ -145,7 +205,12 @@ export class DesktopTasks {
         for (const job of jobs) {
           if (terminal(job)) continue;
           const snapshot = snapshots.get(job.threadId)!;
-          if (snapshot.status === 'rejected') { job.progress = `等待桌面连接恢复：${snapshot.reason instanceof Error ? snapshot.reason.message : snapshot.reason}`; continue; }
+          if (snapshot.status === 'rejected') {
+            if (oversizedHistory(snapshot.reason)) {
+              if (!await this.recoverCompletion(job)) job.progress = '目标会话有回合超出读取上限，等待该任务的完成记录。';
+            } else job.progress = `等待桌面连接恢复：${snapshot.reason instanceof Error ? snapshot.reason.message : snapshot.reason}`;
+            continue;
+          }
           const history = snapshot.value;
           const latest = history.turns?.[0]; job.updatedAt = Date.now();
           if (job.status === 'queued') {
@@ -157,7 +222,13 @@ export class DesktopTasks {
             } catch (error) { job.status = 'unknown'; job.error = `派发结果未确认，请查看目标会话后再决定是否重发：${error instanceof Error ? error.message : error}`; }
             this.save(); continue;
           }
-          const turn = await this.locate(job, history);
+          let turn;
+          try { turn = await this.locate(job, history); }
+          catch (error) {
+            if (!oversizedHistory(error)) throw error;
+            if (!await this.recoverCompletion(job)) job.progress = '目标会话有回合超出读取上限，等待该任务的完成记录。';
+            continue;
+          }
           if (!turn) { job.progress = '等待目标会话确认任务标识，暂不回传其他轮次结果。'; continue; }
           const waiting = turn.status === 'inProgress' && history.thread?.status?.activeFlags?.some((flag: string) => /waiting|approval|input/i.test(flag));
           job.status = waiting ? 'waiting' : 'running';
@@ -166,7 +237,10 @@ export class DesktopTasks {
           this.finish(job, turn);
         }
       }
-      for (const job of this.jobs) if (terminal(job) && job.notify && !job.delivered && !job.deliveryError) await this.deliver(job);
+      for (const job of this.jobs) {
+        if (this.closed || !this.canNotify()) break;
+        if (terminal(job) && job.notify && !job.delivered && !job.deliveryError) await this.deliver(job);
+      }
       if (jobs.length) this.save();
     } catch (error) {
       const message = `等待桌面连接恢复：${error instanceof Error ? error.message : error}`;

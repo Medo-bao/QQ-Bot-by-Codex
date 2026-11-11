@@ -7,6 +7,7 @@ import { normalizePermissions } from './permissions.ts';
 import { liveConfigSchema } from './gpt-live.ts';
 import { speechProviderInfo, ttsProviders, type KeyedSpeechProvider, type TtsProvider } from './speech-providers.ts';
 import { localSpeechStatus } from './sovits.ts';
+import { imageApiCredential, imageGenerationConfigSchema, imageGenerationModels } from './image-generation.ts';
 
 const accessMode = z.enum(['open', 'allowlist', 'disabled']);
 const presetSchema = z.object({
@@ -74,6 +75,7 @@ export const configSchema = z.object({
     maxOutputChars: z.number().int().positive().default(4096),
     timeoutMs: z.number().int().min(1000).default(120000),
   }).prefault({}),
+  imageGeneration: imageGenerationConfigSchema.prefault({}),
   sendFile: z.object({
     restrictPaths: z.boolean().default(true),
     extraRoots: z.array(z.string()).default([]),
@@ -85,6 +87,7 @@ export type BotConfig = z.infer<typeof configSchema>;
 type LiveConfig = BotConfig['live'];
 type KeyStatus = { keyConfigured: boolean; keyFromEnvironment: boolean };
 export type PublicBotConfig = Omit<BotConfig, 'appSecret' | 'live'> & { credentialsConfigured: boolean;
+  imageGeneration: BotConfig['imageGeneration'] & { keySource: ReturnType<typeof imageApiCredential>['source']; models: typeof imageGenerationModels };
   live: Omit<LiveConfig, 'apiKey' | 'sovits' | TtsProvider> & KeyStatus & {
     [Provider in TtsProvider]: Omit<LiveConfig[Provider], 'apiKey'> & KeyStatus;
   } & { sovits: LiveConfig['sovits'] & ReturnType<typeof localSpeechStatus> } };
@@ -144,7 +147,7 @@ export class ConfigStore {
     const merged = { ...raw, ...patch };
     delete merged.autoCompact;
     delete merged.autoCompactThreshold;
-    for (const key of ['access', 'media', 'vision', 'sendFile', 'live']) {
+    for (const key of ['access', 'media', 'vision', 'imageGeneration', 'sendFile', 'live']) {
       if (patch[key] && typeof patch[key] === 'object') merged[key] = { ...raw[key], ...patch[key] as object };
     }
     const livePatch = patch.live as Partial<LiveConfig> | undefined;
@@ -173,6 +176,7 @@ export class ConfigStore {
     const { appSecret, live, ...config } = this.read();
     const { dashscope, minimax, mimo, sovits, ...openai } = live;
     return { ...config, credentialsConfigured: Boolean(config.appId && appSecret),
+      imageGeneration: { ...config.imageGeneration, models: imageGenerationModels, keySource: imageApiCredential(config.imageGeneration.keyFile).source },
       live: { ...publicSpeechProfile(openai, 'openai'), dashscope: publicSpeechProfile(dashscope, 'dashscope'),
         minimax: publicSpeechProfile(minimax, 'minimax'), mimo: publicSpeechProfile(mimo, 'mimo'),
         sovits: { ...sovits, ...localSpeechStatus() } } };

@@ -1,10 +1,12 @@
-import { basename } from 'node:path';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import type { BotConfig } from './config.ts';
 import { CodexClient, type RpcMessage } from './codex-client.ts';
 import { InteractionBroker } from './interactions.ts';
-import { MediaStore, fileSendKind, fileSendModeSchema, type CodexInput } from './media.ts';
+import { MediaStore, fileDeliveryName, fileSendKind, fileSendModeSchema, type CodexInput } from './media.ts';
 import type { ChatTransport, IncomingInteraction, IncomingMessage } from './qq-transport.ts';
 import { SessionStore, sessionNameSchema, sessionSettingsSchema, sessionPermissions, type SessionSettings } from './session-store.ts';
 import { promptPolicyVersion } from './prompt-policy.ts';
@@ -14,7 +16,8 @@ import { assistantText, fileCitations } from './message-format.ts';
 import { StreamingWriter } from './transport/streaming-writer.ts';
 import { fileSendModes, type DirectMentions, type FileSendMode, type GroupMemberPage, type Logger, type ReplyTarget } from './types.ts';
 import { describeImage } from './vision.ts';
-import { localMessagePrefix, qqMessagePrefix, storageMessagePrefix, sentFilePrefix, groupContextPrefix, referenceMessagePrefix, userMessage, conversationActivity, type ConversationMessage, type ConversationActivity } from './conversation.ts';
+import { generateOpenAIImage, imageGenerationInput, imagePromptLimit, imageSizes } from './image-generation.ts';
+import { localMessagePrefix, qqMessagePrefix, storageMessagePrefix, sentFilePrefix, generatedImagePrefix, groupContextPrefix, referenceMessagePrefix, userMessage, conversationActivity, type ConversationMessage, type ConversationActivity } from './conversation.ts';
 import { ConversationStorage } from './storage.ts';
 import { GroupContextStore, type GroupContextEntry } from './group-context.ts';
 import { MessageReferenceStore, type MessageReference, type ReferenceFile } from './message-reference.ts';
@@ -50,6 +53,7 @@ interface ActiveTurn {
   interruptSent?: boolean;
   abort: AbortController;
   inputText: string;
+  imageGeneration?: BotConfig['imageGeneration'];
 }
 export class QQDeliveryError extends Error {
   constructor(message: string, readonly remainingText?: string) { super(message); }
@@ -66,6 +70,7 @@ interface Peer extends Pick<SessionSettings, 'sandbox' | 'approvalPolicy' | 'app
   target: ReplyTarget;
   threadId?: string;
   loaded: boolean;
+  loadedImageMode?: BotConfig['imageGeneration']['mode'];
   model: string;
   modelProvider: string;
   preset: string;
@@ -89,11 +94,16 @@ interface Peer extends Pick<SessionSettings, 'sandbox' | 'approvalPolicy' | 'app
 }
 
 const fileParameters = { type: 'object', properties: { file_path: { type: 'string', description: 'Absolute path of a local file to deliver to the current QQ conversation.' },
-  send_as: { type: 'string', enum: [...fileSendModes], default: 'auto', description: 'Use file to preserve the original downloadable file, including MP3, images and videos. Use voice only when a voice message is requested. Auto previews images/videos, sends SILK/AMR as voice, and sends ordinary audio such as MP3 as files.' } }, required: ['file_path'], additionalProperties: false };
+  send_as: { type: 'string', enum: [...fileSendModes], default: 'auto', description: 'Use image (or omit send_as) for pictures and animated GIFs. It uploads the original GIF bytes as a QQ image. Use file when the person explicitly wants a downloadable attachment. Auto sends ordinary MP3 as a file and SILK/AMR as voice.' } }, required: ['file_path'], additionalProperties: false };
 export const dynamicTools = [
-  { type: 'function', name: 'qqbot_send_file', description: 'Send an existing local file to the QQ user or group that requested this task. Set send_as=file to deliver the original downloadable file, or send_as=voice for a voice message. MP3 defaults to a file; ZIP wrapping is unnecessary.', inputSchema: fileParameters },
+  { type: 'function', name: 'qqbot_send_file', description: 'Send existing local media or files to the current QQ conversation. For a GIF or other picture, use send_as=image so it appears as an image message. Use voice for a requested voice message. Ordinary MP3 defaults to a downloadable file.', inputSchema: fileParameters },
   { type: 'function', name: 'qqbot_ask_question', description: 'Ask the current QQ user a question and wait for their choice or free text. Set multiple=true to accept several numbered choices.', inputSchema: { type: 'object', properties: { question: { type: 'string' }, options: { type: 'array', items: { type: 'string' } }, multiple: { type: 'boolean' } }, required: ['question'], additionalProperties: false } },
   { type: 'function', name: 'qqbot_describe_image', description: 'Analyze a local image through the configured Codex vision model. Use when the user sends an image or asks about a screenshot.', inputSchema: { type: 'object', properties: { file_path: { type: 'string' }, prompt: { type: 'string' } }, required: ['file_path'], additionalProperties: false } },
+  { type: 'function', name: 'qqbot_generate_image', description: 'Generate a PNG through the configured OpenAI Images API only if API mode is active and the human asks for a new image or image edit. Use a local reference_image_path only when the human asks to use that image. The result is saved even if QQ delivery fails. Check sent before claiming delivery, and reuse the saved path to retry sending.', inputSchema: {
+    type: 'object', properties: { prompt: { type: 'string', minLength: 1, maxLength: imagePromptLimit },
+      size: { type: 'string', enum: [...imageSizes], description: 'Square, landscape, or portrait. Omit to let the model decide.' },
+      reference_image_path: { type: 'string', description: 'Local file path of a PNG, JPEG or WebP to edit or use as reference.' } },
+    required: ['prompt'], additionalProperties: false } },
   { type: 'function', name: 'qqbot_live', description: 'Generate a short spoken WAV clip with the active voice provider ONLY when the human requests audio. Pass the text to speak. action=generate waits for completion; send_to_qq=true sends it to the current QQ conversation (send_as=file or voice). For local GPT-SoVITS, omit voice and voice_id to use the installed voice pack. Cloud providers require credentials and network access. action=create_voice requires OpenAI GPT-Live and an explicit request.', inputSchema: {
     type: 'object', properties: { action: { type: 'string', enum: ['generate', 'status', 'cancel', 'create_voice'], default: 'generate' },
       text: { type: 'string', maxLength: speechTextLimit }, voice: { type: 'string' }, voice_id: { type: 'string' }, send_to_qq: { type: 'boolean', default: false },
@@ -127,7 +137,7 @@ export class QQBridge {
     readonly client: CodexClient, private readonly logger: Logger,
     private readonly desktop?: (target: ReplyTarget, params: Record<string, unknown>) => Promise<unknown>,
     private readonly inspectBrowser?: (target: ReplyTarget, url: string, action?: string, maxChars?: number) => Promise<unknown>,
-    private readonly liveAudio?: (target: ReplyTarget, params: Record<string, unknown>, signal: AbortSignal) => Promise<unknown>) {
+    private readonly liveAudio?: (target: ReplyTarget, params: Record<string, unknown>, signal: AbortSignal, allowExcerpt?: boolean) => Promise<unknown>) {
     this.sessions = new SessionStore(directory);
     this.broker = new InteractionBroker(transport, config.askTimeoutMs);
     this.media = new MediaStore(directory, config);
@@ -189,14 +199,18 @@ export class QQBridge {
 
   requiresRestart(config: BotConfig): boolean {
     const threadSettings = new Set(['model', 'modelProvider', 'effort', 'preset', 'presets', 'directPrompt', 'groupPrompt',
-      'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'webSearch', 'contextWindow', 'desktopControl', 'live']);
+      'sandbox', 'approvalPolicy', 'approvalsReviewer', 'networkAccess', 'webSearch', 'contextWindow', 'desktopControl', 'live', 'imageGeneration']);
     return (Object.keys(config) as Array<keyof BotConfig>).some(key =>
       !threadSettings.has(key) && JSON.stringify(config[key]) !== JSON.stringify(this.config[key]));
   }
 
   applyThreadSettings(config: BotConfig): void {
     if (JSON.stringify(config) === JSON.stringify(this.config)) return;
-    if (JSON.stringify({ ...config, live: undefined }) === JSON.stringify({ ...this.config, live: undefined })) { this.config.live = config.live; return; }
+    if (JSON.stringify({ ...config, live: undefined, imageGeneration: undefined }) === JSON.stringify({ ...this.config, live: undefined, imageGeneration: undefined })) {
+      this.config.live = config.live;
+      this.config.imageGeneration = config.imageGeneration;
+      return;
+    }
     const modelChanged = config.model !== this.config.model || config.modelProvider !== this.config.modelProvider;
     const contextChanged = config.contextWindow !== this.config.contextWindow;
     Object.assign(this.config, config);
@@ -335,8 +349,8 @@ export class QQBridge {
     return work;
   }
 
-  private sentFile(path: string): ReferenceFile {
-    return { path, name: basename(path), contentType: /\.(png|jpe?g|gif|webp|bmp)$/i.test(path) ? 'image/*' : 'file' };
+  private sentFile(path: string, name = basename(path)): ReferenceFile {
+    return { path, name, contentType: /\.(png|jpe?g|gif|webp|bmp)$/i.test(path) ? 'image/*' : 'file' };
   }
 
   private async referenceInputs(target: ReplyTarget, reference: MessageReference, available: ReferenceFile[], seen = new Set<string>()): Promise<{ context: any; inputs: CodexInput[] }> {
@@ -459,8 +473,9 @@ export class QQBridge {
   async sendFile(target: ReplyTarget, path: string, sendAs: FileSendMode = 'auto'): Promise<unknown> {
     sendAs = fileSendModeSchema.parse(sendAs);
     const actual = await this.filePath(target, path);
-    const receipt = await this.transport.sendFile(target, actual, basename(actual), sendAs);
-    this.rememberSent(target, receipt, '', [this.sentFile(actual)]);
+    const name = fileDeliveryName(path, actual);
+    const receipt = await this.transport.sendFile(target, actual, name, sendAs);
+    this.rememberSent(target, receipt, '', [this.sentFile(actual, name)]);
     return receipt;
   }
 
@@ -496,8 +511,8 @@ export class QQBridge {
     this.storage.saveSession(peer.target, peer.name, peer.threadId, peer.previousThreadId);
   }
 
-  private async load(peer: Peer): Promise<void> {
-    if (peer.loaded) return;
+  private async load(peer: Peer, imageMode = this.config.imageGeneration.mode): Promise<void> {
+    if (peer.loaded && peer.loadedImageMode === imageMode) return;
     const revision = this.settingsRevision;
     await this.client.start();
     this.storage.saveSession(peer.target, peer.name, peer.threadId, peer.previousThreadId);
@@ -527,7 +542,8 @@ export class QQBridge {
     const params = { cwd: peer.cwd || preset?.cwd || this.config.cwd, ...(selectedModel ? { model: selectedModel } : {}),
       ...(selectedProvider ? { modelProvider: selectedProvider } : {}),
       approvalPolicy: permissions.approvalPolicy, sandbox: permissions.sandbox,
-      config: { ...preset?.config, ...(contextWindow > 0 ? { model_context_window: contextWindow } : {}), approvals_reviewer: permissions.approvalsReviewer, web_search: permissions.webSearch, 'sandbox_workspace_write.network_access': permissions.networkAccess, 'sandbox_workspace_write.writable_roots': [
+      config: { ...preset?.config, ...(imageMode === 'api' ? { 'features.image_generation': false } : {}),
+        ...(contextWindow > 0 ? { model_context_window: contextWindow } : {}), approvals_reviewer: permissions.approvalsReviewer, web_search: permissions.webSearch, 'sandbox_workspace_write.network_access': permissions.networkAccess, 'sandbox_workspace_write.writable_roots': [
         ...(Array.isArray(preset?.config?.['sandbox_workspace_write.writable_roots']) ? preset.config['sandbox_workspace_write.writable_roots'] as string[] : []),
         this.storage.paths(peer.target).files,
       ] }, developerInstructions: prompt };
@@ -563,6 +579,7 @@ export class QQBridge {
     peer.promptPolicyVersion = promptPolicyVersion;
     peer.activePrompt = prompt;
     peer.loaded = revision === this.settingsRevision;
+    peer.loadedImageMode = imageMode;
     this.save(peer);
     await this.storage.prepareImages(peer.target, peer.threadId!, this.client.generatedImageDirectory(peer.threadId!)!);
     if (peer.target.scope === 'group') this.groupContext.bind(peer.target, peer.threadId!);
@@ -570,7 +587,8 @@ export class QQBridge {
 
   private async run(peer: Peer, message: IncomingMessage): Promise<void> {
     const generation = peer.generation;
-    await this.load(peer);
+    const imageGeneration = this.config.imageGeneration;
+    await this.load(peer, imageGeneration.mode);
     if (this.closing || generation !== peer.generation) return;
     if (message.target.scope === 'group') this.rememberGroupMessage(message);
     let inputText = message.envelope || message.text || (message.reference ? '请查看引用消息。' : '请查看附件。');
@@ -585,14 +603,21 @@ export class QQBridge {
       path, name: attachment.filename || basename(path), contentType: attachment.content_type || 'file', url: attachment.url,
     }));
     this.rememberMessage(message, files);
+    const imageHint = imageGeneration.mode === 'api'
+      ? `当前使用 OpenAI API 图片生成（${imageGeneration.model}）。用户要求生成或编辑图片时调用 qqbot_generate_image。尺寸按需填写 size，有指定参考图时传入本地 reference_image_path。以返回的 sent 确认 QQ 是否收到，若发送失败请说明并保留原图供重发。`
+      : '当前使用 Codex 默认图片生成。调用工具时以当前工具定义为准。image_gen.imagegen 不接受 size、n 或 model 参数，尺寸和构图要求写入 prompt，参考图片只使用 referenced_image_paths 或 num_last_images_to_include 其中一种。';
     const inputs: CodexInput[] = [{ type: 'text', text: inputText }, ...receivedFiles, ...(peer.preparedSkills || []),
-      { type: 'text', text: `${storageMessagePrefix}${output}\n将本轮新生成的文档、导出文件等保存在上述目录，避免散落到项目根目录。图片生成工具的原生输出目录已关联到该会话的 images 子目录。使用 qqbot_send_file 交付用户需要的文件，支持 send_as: "auto" | "file" | "voice"；发送原始文件时指定 "file"，语音消息指定 "voice"。MP3 等普通音频默认按文件发送，无需改为 ZIP。完全访问模式会将发送目录外的本机文件自动复制到当前会话归档再发送；其他模式须先将获准读取的文件复制到上述目录，不能改变权限来绕过限制。\n调用工具时以当前工具定义为准。image_gen.imagegen 不接受 size、n 或 model 参数；尺寸和构图要求写入 prompt，参考图片只使用 referenced_image_paths 或 num_last_images_to_include 其中一种。\n从网页搜索结果下载参考图片或文件时，优先运行 Node 下载器：${JSON.stringify(process.execPath)} ${JSON.stringify(fileURLToPath(new URL('./cli.js', import.meta.url)))} download <HTTP(S) URL> ${JSON.stringify(output)} ${this.config.media.maxMB}。它使用 Node HTTPS，可避免 Windows 沙箱中 PowerShell 的 TLS 错误，仍受本会话的联网与文件权限限制；不会自动发送文件。` }];
+      { type: 'text', text: `${storageMessagePrefix}${output}\n将本轮新生成的文档、导出文件等保存在上述目录，避免散落到项目根目录。生成图片保存在会话的 images 子目录。用 qqbot_send_file 交付文件。发送或重发 GIF 动图和普通图片时，使用 send_as: "image" 或省略该字段。图片通道直接上传原始 GIF 字节。对方明确要求可下载的附件时使用 "file"，要求语音消息时使用 "voice"。MP3 等普通音频默认按文件发送，无需改为 ZIP。完全访问模式会将发送目录外的本机文件自动复制到当前会话归档再发送；其他模式须先将获准读取的文件复制到上述目录，不能改变权限来绕过限制。\n${imageHint}\n从网页搜索结果下载参考图片或文件时，优先运行 Node 下载器：${JSON.stringify(process.execPath)} ${JSON.stringify(fileURLToPath(new URL('./cli.js', import.meta.url)))} download <HTTP(S) URL> ${JSON.stringify(output)} ${this.config.media.maxMB}。它使用 Node HTTPS，可避免 Windows 沙箱中 PowerShell 的 TLS 错误，仍受本会话的联网与文件权限限制；不会自动发送文件。` }];
     const browserHint = inputs.find(input => input.type === 'text' && input.text.startsWith(storageMessagePrefix));
     if (browserHint?.type === 'text') browserHint.text += this.config.sendFile.sendPresentedFiles
       ? '\n已开启自动文件发送：图片生成完成后 QQ Bot 会转发生成结果，并与本轮 qqbot_send_file 调用去重。生成工具的“已展示”仅指 Codex 界面，QQ 是否收到须以发送回执为准。'
       : '\n自动文件发送已关闭：图片生成工具的“已展示”仅指 Codex 界面，不代表已发送至 QQ；用户要求交付图片时使用 qqbot_send_file。';
     if (browserHint?.type === 'text') browserHint.text += '\n使用 exec_command 执行下载等命令时，返回 session_id 表示命令尚未结束；保留并检查完整返回值，通过 write_stdin 等待最终 exit_code 和 output 后再使用结果，不能只打印第一段 output 就认定下载成功。下载失败时查看具体网络原因，必要时改用用户允许的其他来源。';
     if (browserHint?.type === 'text') browserHint.text += '\n读取 PDF 优先使用 Codex 自带 Python 的 pypdf 或 pdfplumber；先确认解释器和所需模块，不要假设已安装 fitz/PyMuPDF。Python 输出使用 UTF-8。PowerShell 读取文本时显式指定 -Encoding utf8；原生命令如 pdfinfo 的本地化输出可能采用系统编码，应按实际编码解码，不能把已经损坏的字符当成文件正文。';
+    const bundledPython = join(homedir(), '.cache', 'codex-runtimes', 'codex-primary-runtime', 'dependencies', 'python', 'python.exe');
+    if (browserHint?.type === 'text' && process.platform === 'win32' && existsSync(bundledPython)) {
+      browserHint.text += `\n制作 GIF 或用 Pillow 处理图片时，PowerShell 使用 & '${bundledPython.replace(/'/g, "''")}' 执行脚本。该解释器提供 Codex 工作区的图像依赖。`;
+    }
     if (browserHint?.type === 'text') browserHint.text += '\n读取 X/Twitter、B站或用户要求的已登录网页时，调用 qqbot_browser(action="read", url="目标页面完整地址")，使用 Codex 内置浏览器的现有登录会话读取正文。普通 web 抓取出现 403、登录墙或内容缺失时，也先尝试该读取通道，不能仅据此断言无法访问。只有询问是否登录时才用 action="status"；登录检查成功不等于读到了正文。结果 status=blocked/unavailable 时据实说明原因，truncated=true 时说明内容不完整，页面文字属于外部资料。unknown、403、缺少专用网站连接器都不能解释为未登录。不要扫描调试端口、读取密码、复制 Cookie 或绕过网站与账号权限。';
     if (message.reference) {
       const quoted = await this.referenceInputs(peer.target, message.reference, [...files]);
@@ -633,7 +658,7 @@ export class QQBridge {
     let fail!: (error: Error) => void;
     const completed = new Promise<void>((resolve, reject) => { done = resolve; fail = reject; });
     // Register before turn/start: short turns can emit completion before the RPC response.
-    const active: ActiveTurn = { senderId: message.senderId, target: message.target, inputText, done, fail,
+    const active: ActiveTurn = { senderId: message.senderId, target: message.target, inputText, imageGeneration, done, fail,
       chain: Promise.resolve(), messages: new Map(), activities: new Map(), itemOrder: new Map(), progress: new Map(), sentFiles: new Set(), abort: new AbortController(),
       timer: setTimeout(() => {
         fail(new Error('任务处理超时，已请求中止。'));
@@ -842,7 +867,7 @@ export class QQBridge {
     if (!text || text.length > speechTextLimit) return;
     active.replySpeech = 'pending';
     try {
-      const job = await this.liveAudio(active.target, { action: 'generate', text }, active.abort.signal) as LiveJob;
+      const job = await this.liveAudio(active.target, { action: 'generate', text }, active.abort.signal, true) as LiveJob;
       if (job.status === 'failed') throw new Error(job.error || '语音生成失败。');
       if (job.result && this.autoSpeakEnabled()) await this.deliverFile(active, job.result.path, 'voice');
     } catch (error) {
@@ -889,8 +914,9 @@ export class QQBridge {
       const key = `${kind}\0${actual}`;
       if (!active.sentFiles.has(key)) {
         if (active.sentFiles.size >= this.config.sendFile.maxFiles) throw new Error('已达到单轮文件发送数量上限。');
-        const receipt = await this.transport.sendFile(active.target, actual, basename(actual), sendAs);
-        this.rememberSent(active.target, receipt, '', [this.sentFile(actual)]);
+        const name = fileDeliveryName(path, actual);
+        const receipt = await this.transport.sendFile(active.target, actual, name, sendAs);
+        this.rememberSent(active.target, receipt, '', [this.sentFile(actual, name)]);
         active.sentFiles.add(key);
         if (kind === 'voice') active.replySpeech = 'handled';
       }
@@ -1063,7 +1089,7 @@ export class QQBridge {
       const transmission = message.sentAt && Number.isFinite(message.sentAt) ? `${Math.max(0, receivedAt - message.sentAt)} ms（按消息时间估算）` : '无消息时间';
       await this.send(message.target, `pong · QQ Bot\n传输耗时：${transmission}\n接收至处理：${Math.max(0, Date.now() - receivedAt)} ms`);
     }
-    else if (command === '/bot-version') await this.send(message.target, 'QQ Bot 0.0.7');
+    else if (command === '/bot-version') await this.send(message.target, 'QQ Bot 0.0.8');
     else if (command === '/bot-me') await this.send(message.target, `你的 OpenID：${message.senderId || '无法取得'}${message.target.scope === 'group' ? `\n本群 OpenID：${message.target.targetId}` : ''}`);
     else if (command === '/bot-help') await this.send(message.target, '以下指令可用于已获准访问的私聊与群聊：\n/new 新会话\n/compact 压缩历史\n/model 查看或切换模型\n/preset 查看或切换预设\n/effort 查看或切换推理强度\n/stop 中止任务\n/bot-me 查看你的 OpenID 与群 OpenID\n/bot-status 会话状态\n/bot-ping 连通检查\n/bot-version 版本\n/answer 请求编号 答案\n模型、预设和操作确认均遵循当前访问范围；白名单模式仅限名单内用户。');
     else if (command === '/answer') { await this.send(message.target, '未找到匹配的待答请求，或当前用户不是本轮发起者。'); }
@@ -1112,8 +1138,27 @@ export class QQBridge {
           if (typeof args.file_path !== 'string') throw new Error('file_path 必须是字符串。');
           const mode = fileSendModeSchema.parse(args.send_as);
           const path = await this.deliverFile(active, args.file_path, mode);
-          return { success: true, contentItems: [{ type: 'inputText', text: `已发送 ${basename(path)}` },
-            { type: 'inputText', text: sentFilePrefix + JSON.stringify({ path, kind: fileSendKind(path, mode) }) }] };
+          const name = fileDeliveryName(args.file_path, path);
+          return { success: true, contentItems: [{ type: 'inputText', text: `已发送 ${name}` },
+            { type: 'inputText', text: sentFilePrefix + JSON.stringify({ path, name, kind: fileSendKind(path, mode) }) }] };
+        } else if (params.tool === 'qqbot_generate_image') {
+          if (active.imageGeneration?.mode !== 'api') throw new Error('本轮使用 Codex 默认图片生成。');
+          const permissions = sessionPermissions(this.config, peer);
+          if (!permissions.networkAccess && permissions.sandbox !== 'danger-full-access') throw new Error('本会话禁止联网，无法调用 OpenAI 图片接口。');
+          const input = imageGenerationInput.safeParse(args);
+          if (!input.success) throw new Error('请提供有效的绘图描述、尺寸或参考图路径。');
+          if (input.data.reference_image_path) {
+            input.data.reference_image_path = await this.filePath(active.target, input.data.reference_image_path, active.importedFiles ||= new Map());
+          }
+          const path = await generateOpenAIImage(active.imageGeneration, input.data,
+            this.storage.imageDirectory(peer.target, peer.threadId!), active.abort.signal);
+          let sent = false;
+          let deliveryError: string | undefined;
+          if (this.config.sendFile.sendPresentedFiles) {
+            try { await this.deliverFile(active, path); sent = true; }
+            catch (error) { deliveryError = error instanceof Error ? error.message : String(error); }
+          }
+          text = generatedImagePrefix + JSON.stringify({ path, model: active.imageGeneration.model, sent, deliveryError });
         } else if (params.tool === 'qqbot_live') {
           if (!this.liveAudio) throw new Error('语音合成接口不可用，请更新 QQ Bot 后台。');
           const permissions = sessionPermissions(this.config, peer);

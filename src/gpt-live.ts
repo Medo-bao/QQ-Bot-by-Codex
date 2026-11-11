@@ -191,7 +191,7 @@ export class GptLive {
     return config;
   }
 
-  start(owner: string, directory: string, params: unknown, signal?: AbortSignal): LiveJob {
+  start(owner: string, directory: string, params: unknown, signal?: AbortSignal, allowExcerpt = false): LiveJob {
     const config = this.config(), input = liveGenerateSchema.parse(params);
     const provider = config.provider;
     const key = provider === 'sovits' ? '' : speechProfile(config, provider).apiKey;
@@ -209,7 +209,7 @@ export class GptLive {
       let path: string | undefined;
       try {
         const progress = (status: Progress) => { job.status = status; };
-        const { audio, ...result } = await this.capture(config, input, abort.signal, progress);
+        const { audio, ...result } = await this.capture(config, input, abort.signal, progress, allowExcerpt);
         if (abort.signal.aborted) throw new Error('语音生成已取消。');
         await mkdir(directory, { recursive: true });
         path = join(directory, `${provider === 'openai' ? 'gpt-live' : provider}-${job.id}.wav`);
@@ -226,9 +226,9 @@ export class GptLive {
     return structuredClone(job);
   }
 
-  private async capture(config: LiveConfig, input: LiveInput, signal: AbortSignal, progress: (state: Progress) => void) {
+  private async capture(config: LiveConfig, input: LiveInput, signal: AbortSignal, progress: (state: Progress) => void, allowExcerpt: boolean) {
     const provider = config.provider;
-    if (provider === 'sovits') return this.localSpeech.capture(input.text, config.sovits, config.maxDurationSeconds, signal, progress);
+    if (provider === 'sovits') return this.localSpeech.capture(input.text, config.sovits, config.maxDurationSeconds, signal, progress, allowExcerpt);
     const { pcm, ...metadata } = provider === 'openai'
       ? await capture(config, input, signal, progress, this.dependencies)
       : await captureTts({ ...config[provider], provider, text: input.text, voice: input.voice_id || input.voice || config[provider].voice,

@@ -23,6 +23,7 @@ export class ConversationStorage {
   }
 
   files(target: ReplyTarget, threadId: string): string { return join(this.paths(target).files, segment(threadId)); }
+  imageDirectory(target: ReplyTarget, threadId: string): string { return join(this.files(target, threadId), 'images'); }
   audioDirectory(target?: ReplyTarget, threadId = 'direct'): string {
     return target ? join(this.files(target, threadId), 'audio') : join(this.root, `bot-${segment(this.config.appId)}`, 'voice-previews');
   }
@@ -49,7 +50,7 @@ export class ConversationStorage {
   }
 
   async prepareImages(target: ReplyTarget, threadId: string, nativePath: string): Promise<void> {
-    const destination = join(this.files(target, threadId), 'images');
+    const destination = this.imageDirectory(target, threadId);
     await mkdir(destination, { recursive: true });
     await mkdir(dirname(nativePath), { recursive: true });
     const source = await lstat(nativePath).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error; });

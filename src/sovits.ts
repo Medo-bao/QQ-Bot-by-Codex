@@ -6,10 +6,11 @@ import { sovitsParameters, type SovitsSettings } from './sovits-settings.ts';
 const runtimeEntry = ['packages', 'sovits-runtime', 'src', 'index.js'];
 const startupBudgetMs = 240_000;
 type Runtime = {
-  engine: { idleUnloadMs: number; touch(): void };
+  engine: { port: number; idleUnloadMs: number; touch(): void };
   renderPreview(text: string, options: {
     signal: AbortSignal;
     maxDurationMs: number;
+    allowExcerpt: boolean;
     maxChars: number;
     params: Pick<SovitsSettings, 'temperature' | 'topK' | 'topP' | 'speedFactor'>;
     onReady: () => void;
@@ -46,7 +47,8 @@ export class LocalSpeech {
     }, () => {});
   }
 
-  async capture(text: string, settings: SovitsSettings, maxDurationSeconds: number, signal: AbortSignal, progress: (state: 'generating' | 'finalizing') => void) {
+  async capture(text: string, settings: SovitsSettings, maxDurationSeconds: number, signal: AbortSignal,
+    progress: (state: 'generating' | 'finalizing') => void, allowExcerpt: boolean) {
     const installation = localSpeechStatus();
     if (!installation.available) {
       throw new Error('GPT-SoVITS 本地安装未就绪，请检查项目目录、Python 环境和音色包。');
@@ -68,7 +70,7 @@ export class LocalSpeech {
     try {
       request.throwIfAborted();
       const { temperature, topK, topP, speedFactor, maxChars } = settings;
-      const result = await runtime.renderPreview(text, { signal: request, maxDurationMs, maxChars,
+      const result = await runtime.renderPreview(text, { signal: request, maxDurationMs, maxChars, allowExcerpt,
         params: { temperature, topK, topP, speedFactor }, onReady: () => progress('generating') });
       request.throwIfAborted();
       if (!Buffer.isBuffer(result.wav) || !Number.isFinite(result.durationMs) || result.durationMs <= 0) {
@@ -81,6 +83,7 @@ export class LocalSpeech {
       if (signal.aborted) throw new Error('语音生成已取消。');
       if (timeout.aborted) throw new Error('本地语音生成超时，请缩短文字或检查引擎状态。');
       if ((error as { code?: string })?.code === 'audio-too-long') throw new Error('返回的音频超过时长上限，请缩短文字。');
+      if ((error as { code?: string })?.code === 'port-in-use') throw new Error(`本地语音端口 ${runtime.engine.port} 正被占用，请在端口释放后重试。`, { cause: error });
       throw error;
     }
   }

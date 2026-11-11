@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.0.8 - 2026-11-11
+
+- Add an optional OpenAI Images API mode for generation and reference-image edits. Save results in the conversation so they can be resent if QQ delivery fails.
+- Send GIFs through the QQ image channel by default. Reuse uploaded media when QQ reports an expired reply message ID, and fix lookup and display of URL-encoded filenames.
+- Recover desktop task results from matching local completion records when the target history exceeds the read limit, and deliver them after QQ reconnects.
+- Clarify expired desktop connection errors and improve Windows image processing and local GPT-SoVITS narration of long text.
+
 ## 0.0.7 - 2026-11-07
 
 - Add Alibaba Cloud CosyVoice, MiniMax Speech, Xiaomi MiMo, and local GPT-SoVITS. Cloud services retain separate keys, models, and voices. Preview or download WAV clips, send them to QQ, and retry delivery independently.

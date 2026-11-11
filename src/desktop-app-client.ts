@@ -24,7 +24,11 @@ export class DesktopAppClient {
     if (!this.pipePath) return Promise.reject(new Error('当前后台未连接 Codex 桌面，请从 Codex 中重新打开 QQ Bot。'));
     this.connecting = new Promise<void>((resolve, reject) => {
       const socket = createConnection(this.pipePath);
-      socket.once('error', reject);
+      socket.once('error', (error: NodeJS.ErrnoException) => {
+        if (['ENOENT', 'ECONNREFUSED'].includes(error.code || '')) {
+          reject(new Error('Codex 桌面连接已失效，请从当前 Codex 窗口重新打开 QQ Bot 后重试。', { cause: error }));
+        } else reject(error);
+      });
       socket.once('connect', () => {
         this.socket = socket;
         socket.on('error', error => { if (this.socket === socket) this.disconnect(error); });

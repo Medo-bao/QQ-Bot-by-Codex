@@ -83,6 +83,16 @@ async function execute(threadId, turnId, input) {
     notify('item/completed', { ...common, item });
   }
   let generatedFile;
+  if (text.startsWith('openai-image-probe')) {
+    const reference = text.split('\n')[1];
+    const image = await ask('item/tool/call', { ...common, callId: 'openai-image', tool: 'qqbot_generate_image', arguments: {
+      prompt: 'A small blue square', size: '1024x1024', ...(reference ? { reference_image_path: reference } : {}),
+    } });
+    trace({ openaiImage: image });
+    const item = { id: 'openai-image-' + turnId, type: 'dynamicToolCall', tool: 'qqbot_generate_image', status: image.success ? 'completed' : 'failed', ...image };
+    histories[threadId].find(turn => turn.id === turnId).items.push(item); saveHistory();
+    notify('item/completed', { ...common, item });
+  }
   if (text.includes('gpt-live-check')) {
     const speech = await ask('item/tool/call', { ...common, callId: 'gpt-live-audio', tool: 'qqbot_live', arguments: {
       action: 'generate', text: '你好，语音接口已接入。', send_to_qq: true, send_as: text.includes('voice') ? 'voice' : 'file',
@@ -124,8 +134,11 @@ async function execute(threadId, turnId, input) {
   }
   if (text.includes('send-generated-image')) {
     const folder = join(process.env.CODEX_HOME, 'generated_images', threadId); mkdirSync(folder, { recursive: true });
-    const file = join(folder, 'fixture100%.png'); generatedFile = file;
-    writeFileSync(file, Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jvWQAAAAASUVORK5CYII=', 'base64'));
+    const encoded = text.includes('encoded-name');
+    const name = encoded ? '中文100%.png' : 'fixture100%.png';
+    const file = join(folder, name); generatedFile = file;
+    const diskFile = encoded ? join(folder, encodeURIComponent(name)) : file;
+    writeFileSync(diskFile, Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jvWQAAAAASUVORK5CYII=', 'base64'));
     const mode = /\bfile\b/.test(text) ? 'file' : 'auto';
     const [delivery, repeated] = await Promise.all([
       ask('item/tool/call', { ...common, callId: 'generated-image', tool: 'qqbot_send_file', arguments: { file_path: pathToFileURL(file).href, send_as: mode } }),
@@ -142,7 +155,7 @@ async function execute(threadId, turnId, input) {
       denied = await ask('item/tool/call', { ...common, callId: 'outside-image', tool: 'qqbot_send_file', arguments: { file_path: outside } });
       notify('item/completed', { ...common, item: { id: 'outside-image', type: 'dynamicToolCall', tool: 'qqbot_send_file', status: 'failed', ...denied } });
     }
-    trace({ generatedImage: { file, delivery, repeated, vision, denied } });
+    trace({ generatedImage: { file: diskFile, delivery, repeated, vision, denied } });
     if (!delivery.success) throw new Error('generated image delivery failed');
   }
   if (text.includes('local-question')) {

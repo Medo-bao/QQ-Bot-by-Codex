@@ -2,7 +2,7 @@
 
 Use local Codex from QQ private chats, QQ groups and a desktop plugin interface to handle conversations, run tasks and deliver files.
 
-**Current version: 0.0.7** · [中文](README.md) · [Changelog](CHANGELOG_EN.md) · [Source release](https://github.com/Medo-bao/QQ-Bot-by-Codex/releases/tag/v0.0.7)
+**Current version: 0.0.8** · [中文](README.md) · [Changelog](CHANGELOG_EN.md) · [Source release](https://github.com/Medo-bao/QQ-Bot-by-Codex/releases/tag/v0.0.8)
 
 QQ Bot connects Tencent's QQ Bot SDK to a local Codex App Server and reuses your Codex login, model providers and tools. DSH is not required. Adapted from [tencent-connect/dsh-qqbot](https://github.com/tencent-connect/dsh-qqbot), under the MIT license.
 
@@ -86,7 +86,8 @@ Changing a role or preset starts fresh context while retaining the old archive. 
 
 Open **Direct send**, choose a QQ recipient conversation and add text or files through selection, drag-and-drop or paste. This sends as the bot without asking the AI to respond.
 
-- `auto`: image/video previews, SILK/AMR voice messages, and original files for ordinary audio such as MP3.
+- `auto`: image previews including GIF, video previews, SILK/AMR voice messages, and original files for ordinary audio such as MP3.
+- `image`: send an image or animated GIF as a QQ image message.
 - `file`: preserve the original downloadable file and filename, including images, video and MP3.
 - `voice`: explicitly select voice delivery, subject to QQ's format and size support.
 

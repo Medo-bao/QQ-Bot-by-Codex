@@ -74,4 +74,10 @@ export class ReplyLimiter {
     }
     this.messages.set(messageId, { count: 1, firstSeenAt: now });
   }
+
+  /** A definitive rejection from QQ takes precedence over the local window. */
+  public expire(messageId: string): void {
+    const tracked = this.messages.get(messageId);
+    if (tracked) tracked.firstSeenAt = Date.now() - this.ttlMs;
+  }
 }

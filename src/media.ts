@@ -1,6 +1,6 @@
 import { createWriteStream } from 'node:fs';
 import { mkdir, open, readdir, realpath, rename, rm, stat } from 'node:fs/promises';
-import { basename, extname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -14,6 +14,12 @@ export const fileSendModeSchema = z.enum(fileSendModes).default('auto');
 
 export function localFilePath(path: string): string {
   return /^file:/i.test(path) ? fileURLToPath(path) : path.replace(/^sandbox:/i, '');
+}
+
+export function fileDeliveryName(requestedPath: string, actualPath: string): string {
+  const requested = basename(localFilePath(requestedPath));
+  const actual = basename(actualPath);
+  return encodeURIComponent(requested) === actual ? requested : actual;
 }
 
 export function fileSendKind(path: string, sendAs: FileSendMode = 'auto'): 'file' | 'image' | 'video' | 'voice' {
@@ -155,7 +161,19 @@ export class MediaStore {
   async allowedFile(path: string, workspaceRoots: string[] = [], importExternal?: (actual: string) => Promise<string>): Promise<string> {
     path = localFilePath(path);
     if (!isAbsolute(path)) throw new Error('file_path 必须是绝对路径。');
-    const actual = await realpath(path);
+    const actual = await realpath(path).catch(async (error: NodeJS.ErrnoException) => {
+      if (error.code !== 'ENOENT') throw error;
+      const name = basename(path);
+      const encoded = encodeURIComponent(name);
+      if (encoded !== name) {
+        // Some exporters leave the filename percent-encoded on disk.
+        try { return await realpath(join(dirname(path), encoded)); }
+        catch (aliasError) {
+          if (!['ENOENT', 'ENAMETOOLONG'].includes((aliasError as NodeJS.ErrnoException).code || '')) throw aliasError;
+        }
+      }
+      throw new Error('文件不存在。请使用导出工具返回的实际绝对路径，并确认文件已写入。', { cause: error });
+    });
     if (!(await stat(actual)).isFile()) throw new Error('发送目标必须是普通文件。');
     if (this.config.sendFile.restrictPaths) {
       const roots = [this.config.cwd, this.directory, ...workspaceRoots, ...this.config.sendFile.extraRoots];

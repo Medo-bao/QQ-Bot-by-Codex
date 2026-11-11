@@ -31,13 +31,14 @@ export class BotController {
   private readonly liveAudio: GptLive;
   private readonly desktopAttachment: DesktopAttachmentStore;
   constructor(readonly store: ConfigStore, private readonly logger: Logger) {
-    this.desktopTasks = new DesktopTasks(store.directory, logger, (target, text) => this.send(target, text), () => this.store.read().desktopControl);
+    this.desktopTasks = new DesktopTasks(store.directory, logger, (target, text) => this.send(target, text),
+      () => this.store.read().desktopControl, () => this.connected);
     this.browserAccess = new BrowserAccess(store.directory, () => this.desktopTasks.browserContext());
     this.liveAudio = new GptLive(() => this.store.read().live);
     this.desktopAttachment = new DesktopAttachmentStore(store.directory, logger);
     const pipePath = process.env.CODEX_APP_TOOLS_PIPE_PATH;
     const threadId = process.env.CODEX_THREAD_ID || process.env.CODEX_SESSION_ID;
-    const desktop = pipePath && threadId ? this.desktopAttachment.update({ pipePath, threadId,
+    const desktop = pipePath ? this.desktopAttachment.update({ pipePath, threadId,
       browserEnvironment: Object.fromEntries(browserEnvironmentKeys.flatMap(key => process.env[key] ? [[key, process.env[key]!]] : [])),
     }) : this.desktopAttachment.read();
     if (desktop) {
@@ -72,7 +73,7 @@ export class BotController {
     const bridge = new QQBridge(config, this.store.directory, transport, client, logger,
       (target, params) => this.desktop(target.scope, target.targetId, params, target.replyUserId),
       (target, url, action, maxChars) => this.inspectBrowser(target.scope, target.targetId, url, action, maxChars),
-      (target, params, signal) => this.live({ ...params, scope: target.scope, target_id: target.targetId, send_to_qq: false }, signal, true));
+      (target, params, signal, allowExcerpt) => this.live({ ...params, scope: target.scope, target_id: target.targetId, send_to_qq: false }, signal, true, allowExcerpt));
     this.bridge = bridge;
     transport.onDisconnected = (reason) => { if (this.bridge === bridge) { this.connected = false; this.lastError = reason; } };
     transport.onConnected = () => { if (this.bridge === bridge) { this.connected = true; this.lastError = undefined; } };
@@ -293,7 +294,7 @@ export class BotController {
     throw new Error('网页操作须为 status 或 read。');
   }
 
-  private async live(params: Record<string, any>, signal?: AbortSignal, wait = false): Promise<unknown> {
+  private async live(params: Record<string, any>, signal?: AbortSignal, wait = false, allowExcerpt = false): Promise<unknown> {
     const config = this.store.read();
     let target: ReplyTarget | undefined;
     if (params.scope !== undefined || params.target_id !== undefined) {
@@ -332,7 +333,7 @@ export class BotController {
         if (params.send_to_qq && (!target || !this.connected)) throw new Error('请先连接 QQ 并选择接收会话。');
         const storage = new ConversationStorage(this.store.directory, config);
         const session = target ? new SessionStore(this.store.directory).get(`${config.appId}:${target.scope}:${target.targetId}`) : undefined;
-        const job = this.liveAudio.start(owner, storage.audioDirectory(target, session?.threadId), params, signal);
+        const job = this.liveAudio.start(owner, storage.audioDirectory(target, session?.threadId), params, signal, allowExcerpt);
         if (params.send_to_qq) void deliver(job.id);
         return wait ? this.liveAudio.wait(owner, job.id) : job;
       }

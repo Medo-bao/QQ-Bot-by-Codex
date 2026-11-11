@@ -2,7 +2,7 @@
 
 在 QQ 私聊、群聊和 Codex 插件界面中使用本机 Codex，处理消息、执行任务并交付文件。
 
-**当前版本：0.0.7** · [English](README_EN.md) · [更新日志](CHANGELOG.md) · [下载源码](https://github.com/Medo-bao/QQ-Bot-by-Codex/releases/tag/v0.0.7)
+**当前版本：0.0.8** · [English](README_EN.md) · [更新日志](CHANGELOG.md) · [下载源码](https://github.com/Medo-bao/QQ-Bot-by-Codex/releases/tag/v0.0.8)
 
 QQ Bot 通过腾讯 QQ Bot SDK 连接 QQ 与本地 Codex App Server，复用本机的 Codex 登录、模型提供商和工具配置，无需安装 DSH。项目改造自 [tencent-connect/dsh-qqbot](https://github.com/tencent-connect/dsh-qqbot)，采用 MIT 许可证。
 
@@ -72,7 +72,8 @@ npm.cmd ci --ignore-scripts
 
 点击 **直接发送**，选择 QQ 接收会话，输入文字或通过选择、拖入、粘贴添加附件。此操作以机器人身份发送内容，不触发 AI 回复。
 
-- `auto`：图片和视频使用预览，SILK / AMR 使用语音通道，MP3 等普通音频按文件发送。
+- `auto`：图片（含 GIF）和视频使用预览，SILK / AMR 使用语音通道，MP3 等普通音频按文件发送。
+- `image`：通过 QQ 图片通道发送图片或 GIF 动图。
 - `file`：保留原始文件与文件名，图片、视频、MP3 也可按文件交付。
 - `voice`：明确使用语音通道，具体格式和大小仍受 QQ 平台支持范围约束。
 

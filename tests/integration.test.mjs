@@ -207,7 +207,7 @@ test('GPT-SoVITS selects the installed local voice and uses the normal preview a
           if (!options.installDir.endsWith('runtime')) throw new Error('wrong installation');
           if (options.idleUnloadMs !== 240000) throw new Error('wrong startup idle setting');
           const engine = { idleUnloadMs: options.idleUnloadMs, touched: false, touch() { this.touched = true; } };
-          return { engine, async renderPreview(text, { signal, onReady, maxDurationMs, maxChars, params }) {
+          return { engine, async renderPreview(text, { signal, onReady, maxDurationMs, maxChars, params, allowExcerpt }) {
             onReady();
             if (maxDurationMs !== 5000) throw new Error('wrong audio limit');
             if (maxChars !== 65 || params.temperature !== 0.8 || params.topK !== 15 || params.topP !== 0.85 || params.speedFactor !== 1.2) {
@@ -216,7 +216,7 @@ test('GPT-SoVITS selects the installed local voice and uses the normal preview a
             signal.throwIfAborted();
             if (text === '超限') {
               if (engine.idleUnloadMs !== 0 || !engine.touched) throw new Error('idle timer was not cancelled');
-              throw Object.assign(new Error('limit'), { code: 'audio-too-long' });
+              if (!allowExcerpt) throw Object.assign(new Error('limit'), { code: 'audio-too-long' });
             }
             const wav = Buffer.alloc(44 + 9600);
             wav.write('RIFF'); wav.writeUInt32LE(wav.length - 8, 4); wav.write('WAVEfmt ', 8);
@@ -248,6 +248,8 @@ test('GPT-SoVITS selects the installed local voice and uses the normal preview a
     const over = live.start('local', directory, { text: '超限' });
     assert.match((await live.wait(over.owner, over.id)).error, /时长上限/);
     assert.equal((await readdir(directory)).filter(file => file.endsWith('.wav')).length, 1);
+    const excerpt = live.start('local', directory, { text: '超限' }, undefined, true);
+    assert.equal((await live.wait(excerpt.owner, excerpt.id)).status, 'completed', 'automatic narration can request a bounded excerpt');
   } finally {
     await live.close();
     if (previous === undefined) delete process.env.QQBOT_SOVITS_ROOT; else process.env.QQBOT_SOVITS_ROOT = previous;
@@ -266,11 +268,11 @@ test('GPT-Live uses the real QQ dynamic-tool round trip, archives per thread, se
   const qq = new FakeQQ(), client = new CodexClient(config, quiet);
   const localReads = [];
   let bridge;
-  bridge = new QQBridge(config, directory, qq, client, quiet, undefined, undefined, async (target, params, signal) => {
+  bridge = new QQBridge(config, directory, qq, client, quiet, undefined, undefined, async (target, params, signal, allowExcerpt) => {
     const session = bridge.status().sessions.find(item => item.scope === target.scope && item.peerId === target.targetId);
     const output = bridge.storage.audioDirectory(target, session.threadId);
     if (config.live.provider === 'sovits') {
-      localReads.push({ text: params.text, precedingReply: qq.messages.at(-1)?.text });
+      localReads.push({ text: params.text, precedingReply: qq.messages.at(-1)?.text, allowExcerpt: Boolean(allowExcerpt) });
       const path = join(output, `fixture-local-${localReads.length}.wav`);
       await writeFile(path, await readFile(qq.files[0].path));
       return { status: 'completed', result: { path } };
@@ -323,6 +325,7 @@ test('GPT-Live uses the real QQ dynamic-tool round trip, archives per thread, se
     await bridge.handleMessage(message('gpt-live-check file audio-only', 'group', 'team', 'alice'));
     await idle();
     assert.equal(localReads.length, 2, 'only the explicit local audio request ran this turn');
+    assert.deepEqual(localReads.map(entry => entry.allowExcerpt), [true, false]);
     assert.equal(qq.files.length, 3);
     assert.equal(qq.files.at(-1).sendAs, 'file');
     const history = await controller.conversation('group', 'team');
@@ -403,7 +406,7 @@ test('Persisted QQ tools refresh complete indexes without replacing history or u
     assert.equal(event.type, 'dynamic_tools_updated');
     assert.equal(event.payload.thread_id, threadId);
     assert.deepEqual(event.payload.tools, [...dynamicTools, unrelated]);
-    assert.deepEqual(JSON.parse(state.prepare('SELECT input_schema FROM thread_dynamic_tools WHERE name=?').get(previous.name).input_schema).properties.send_as.enum, ['auto', 'file', 'voice']);
+    assert.deepEqual(JSON.parse(state.prepare('SELECT input_schema FROM thread_dynamic_tools WHERE name=?').get(previous.name).input_schema).properties.send_as.enum, ['auto', 'image', 'file', 'voice']);
     assert.deepEqual(state.prepare('SELECT description FROM thread_dynamic_tools WHERE name=?').get(unrelated.name).description, unrelated.description);
     for (const tool of dynamicTools) {
       const row = state.prepare('SELECT description,input_schema FROM thread_dynamic_tools WHERE name=?').get(tool.name);
@@ -443,8 +446,9 @@ test('Desktop dispatch preserves original threads, queues busy targets, scopes j
   const { desktopFixture } = await import('./fixtures/desktop-server.mjs');
   const directory = await temp(); const desktop = await desktopFixture(directory);
   const delivered = []; let failDelivery = false; let controller;
+  let online = true;
   const notify = async (target, text) => { if (failDelivery) { failDelivery = false; throw new Error('fixture QQ offline'); } delivered.push({ target, text }); };
-  let manager = new DesktopTasks(directory, quiet, notify, () => true);
+  let manager = new DesktopTasks(directory, quiet, notify, () => true, () => online);
   t.after(async () => { await controller?.dispose(); manager.close(); await desktop.close(); });
   manager.attach(desktop.pipePath, desktop.owner);
   const source = { scope: 'group', targetId: 'source-group', replyUserId: 'alice' };
@@ -462,7 +466,12 @@ test('Desktop dispatch preserves original threads, queues busy targets, scopes j
   assert.equal(manager.listJobs(source)[0].status, 'waiting');
   desktop.threads.get('desktop-alpha').activeFlags = [];
   await assert.rejects(manager.action(source, { action: 'cancel', job_id: job.id }), /已经交给/);
-  desktop.finish('desktop-alpha', '这是本次任务的新结果。'); await manager.poll(); await manager.poll();
+  online = false;
+  desktop.finish('desktop-alpha', '这是本次任务的新结果。'); await manager.poll();
+  assert.equal(manager.listJobs(source)[0].status, 'completed');
+  assert.equal(delivered.length, 0, 'a completed job remains pending delivery while QQ is offline');
+  online = true;
+  await manager.poll();
   assert.equal(delivered.length, 1); assert.match(delivered[0].text, /本次任务的新结果/); assert.equal(delivered[0].target.replyUserId, 'alice');
   assert.equal(manager.listJobs({ scope: 'group', targetId: 'another-group' }).length, 0);
   await assert.rejects(manager.action({ scope: 'group', targetId: 'another-group' }, { action: 'retry_delivery', job_id: job.id }), /没有/);
@@ -634,6 +643,63 @@ test('Completed generated images reach QQ before the final answer, deduplicate e
     assert.equal(qq.files.length, 3);
     assert.equal(qq.messages.filter(item => item.text.includes('图片已生成，但发送到 QQ 失败')).length, 1, 'failed delivery reports once, keeps the image, and does not claim it was sent');
     assert.ok(bridge.status().sessions.every(session => !session.busy && session.queued === 0));
+  } finally { await bridge.close(); }
+});
+
+test('OpenAI image mode reuses the QQ thread, archives PNGs and preserves results when delivery fails', { timeout: 15000 }, async t => {
+  const directory = await temp();
+  const store = new ConfigStore(directory);
+  const keyFile = join(directory, '.env.local');
+  await writeFile(keyFile, 'OPENAI_API_KEY="fixture-image-key"\n');
+  const config = store.update({ appId: 'fixture-app', appSecret: 'fixture-secret', cwd: directory, codexCommand: fixture,
+    codexArgs: [directory], access: { c2cMode: 'open' }, imageGeneration: { keyFile } });
+  const qq = new FakeQQ(), client = new CodexClient(config, quiet), bridge = new QQBridge(config, directory, qq, client, quiet);
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jvWQAAAAASUVORK5CYII=';
+  const request = t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({ data: [{ b64_json: png }] })));
+  const response = () => requireTrace(directory).filter(item => item.openaiImage).at(-1).openaiImage;
+  const generated = () => JSON.parse(response().contentItems[0].text.split('\n')[1]);
+  await bridge.start();
+  try {
+    assert.equal(config.imageGeneration.mode, 'codex');
+    assert.equal(store.publicConfig().imageGeneration.keySource, 'file');
+    assert.ok(!JSON.stringify(store.publicConfig()).includes('fixture-image-key'));
+    await bridge.handleMessage(message('openai-image-probe'));
+    assert.equal(response().success, false);
+    assert.equal(request.mock.callCount(), 0);
+    const threadId = bridge.status().sessions[0].threadId;
+
+    const api = store.update({ imageGeneration: { mode: 'api' } });
+    assert.equal(bridge.requiresRestart(api), false);
+    bridge.applyThreadSettings(api);
+    await bridge.handleMessage(message('openai-image-probe'));
+    assert.equal(bridge.status().sessions[0].threadId, threadId);
+    assert.equal(requireTrace(directory).filter(item => item.method === 'thread/resume').at(-1).params.config['features.image_generation'], false);
+    const [url, options] = request.mock.calls[0].arguments;
+    assert.equal(url, 'https://api.openai.com/v1/images/generations');
+    assert.equal(options.headers.Authorization, 'Bearer fixture-image-key');
+    assert.deepEqual(JSON.parse(options.body), { model: 'gpt-image-2.6-sunburst', prompt: 'A small blue square', output_format: 'png', size: '1024x1024' });
+    const first = generated();
+    assert.equal(first.sent, true);
+    assert.equal(qq.files[0].path, first.path);
+    assert.deepEqual(await readFile(first.path), Buffer.from(png, 'base64'));
+
+    qq.failNextFile = true;
+    await bridge.handleMessage(message(`openai-image-probe\n${first.path}`));
+    const [editUrl, editOptions] = request.mock.calls[1].arguments;
+    assert.equal(editUrl, 'https://api.openai.com/v1/images/edits');
+    assert.equal(editOptions.body.get('image[]').type, 'image/png');
+    const second = generated();
+    assert.equal(second.sent, false);
+    assert.match(second.deliveryError, /fixture file delivery unavailable/);
+    const archived = JSON.parse(await readFile(bridge.storage.historyFile(message('').target, threadId), 'utf8'));
+    assert.ok(archived.messages.some(item => item.files?.some(file => file.path === second.path && file.image)));
+
+    bridge.applyThreadSettings(store.update({ imageGeneration: { mode: 'codex' } }));
+    await bridge.handleMessage(message('auto-image-probe terminal-only'));
+    assert.equal(bridge.status().sessions[0].threadId, threadId);
+    assert.equal(requireTrace(directory).filter(item => item.method === 'thread/resume').at(-1).params.config['features.image_generation'], undefined);
+    assert.equal(request.mock.callCount(), 2);
+    assert.equal(qq.files.length, 2);
   } finally { await bridge.close(); }
 });
 
@@ -949,7 +1015,7 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     quoteMediaExpired = true;
     const beforeGeneratedFiles = qq.files.length;
     qq.fileDelayMs = 15;
-    await bridge.handleMessage(message('send-generated-image'));
+    await bridge.handleMessage(message('send-generated-image encoded-name'));
     const generated = requireTrace(directory).find((item) => item.generatedImage)?.generatedImage;
     assert.equal(generated.delivery.success, true, 'the current thread generated-image folder is allowed by the actual dynamic tool');
     assert.equal(generated.repeated.success, true);
@@ -958,6 +1024,7 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     assert.ok(warnings.some(text => text.includes('QQ tool failed: qqbot_send_file') && text.includes('文件不在工作目录')), 'failure logs preserve the actual dynamic-tool error');
     assert.equal(qq.files.length, beforeGeneratedFiles + 1, 'the dynamic tool, sandbox alias and final Markdown link deliver the same image once');
     const deliveredImage = qq.files.at(-1);
+    assert.equal(deliveredImage.fileName, '中文100%.png', 'an encoded export keeps the requested display name');
     await bridge.handleMessage({ ...message('quote delivered bot image'), reference: { key: deliveredImage.receipt.ext_info.ref_idx } });
     const imageReplyTurn = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item) === 'quote delivered bot image');
     assert.equal(referenceContext(imageReplyTurn).isBot, true);
@@ -1003,6 +1070,7 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     const privatePaths = bridge.status().sessions.find((item) => item.peerId === 'alice').storage;
     assert.ok(qq.files.at(-1).path.startsWith(privatePaths.files), 'generated images physically live in the conversation archive');
     const archived = JSON.parse(await readFile(join(privatePaths.history, first + '.json'), 'utf8'));
+    assert.ok(archived.messages.some(item => item.files?.some(file => file.path === deliveredImage.path && file.name === deliveredImage.fileName)));
     assert.ok(archived.messages.some(item => item.text === 'personal role'));
     assert.ok((await readFile(join(privatePaths.history, first + '.md'), 'utf8')).includes('personal role'));
     assert.ok(!JSON.stringify(archived.messages).includes('[QQ Bot 本轮文件目录]'));
@@ -1216,6 +1284,7 @@ test('Active QQ tasks survive global settings saves, preserve queued messages an
     const first = bridge.handleMessage(message('local-question settings-save', 'group', 'team'));
     await waitFor(() => bridge.status().pending.length === 1);
     const before = bridge.status().sessions[0];
+    const launchedBeforeSave = requireTrace(directory).filter(item => item.launch).length;
     const second = bridge.handleMessage(message('queued settings message', 'group', 'team', 'bob'));
     await waitFor(() => bridge.status().sessions[0].queued === 2);
     const state = await controller.configure({ ...store.publicConfig(), model: 'fixture-model', sandbox: 'danger-full-access' });
@@ -1233,7 +1302,7 @@ test('Active QQ tasks survive global settings saves, preserve queued messages an
     await Promise.all([first, second]);
     assert.equal(qq.messages.filter(item => item.text.startsWith('Codex fixture reply:')).length, 2);
     const trace = requireTrace(directory);
-    assert.equal(trace.filter(item => item.launch).length, 1, 'the running Codex child is retained');
+    assert.equal(trace.filter(item => item.launch).length, launchedBeforeSave, 'saving settings does not start another Codex child');
     assert.equal(trace.filter(item => item.method === 'turn/interrupt').length, 0);
     const resumed = trace.filter(item => item.method === 'thread/resume').at(-1);
     assert.equal(resumed.params.threadId, before.threadId);
@@ -1630,7 +1699,16 @@ test('Tencent SDK uses actual HTTP/WebSocket QQ frames; media inputs and outgoin
         [{ member_openid: 'alice', username: 'Alice' }, { member_openid: 'bot', bot: true }],
         next_cursor: second ? '' : 'next/+' }));
     }
-    else if (request.url.endsWith('/files')) response.end(JSON.stringify({ file_uuid: 'fixture-file', file_info: 'fixture-file-info', ttl: 3600 }));
+    else if (request.url.endsWith('/files')) {
+      if (request.url === '/v2/groups/gif-expiry/files') {
+        cacheMsgId('group', 'gif-expiry', 'expired-during-upload', Date.now() - replyPolicy.group.ttlMs, 'alice');
+        cacheMsgId('group', 'gif-expiry', 'fresh-after-upload', Date.now(), 'alice');
+      }
+      response.end(JSON.stringify({ file_uuid: 'fixture-file', file_info: 'fixture-file-info', ttl: 3600 }));
+    }
+    else if (request.url === '/v2/groups/gif-retry/messages' && requests.at(-1).body.msg_id === 'rejected-by-qq') {
+      response.writeHead(400).end(JSON.stringify({ message: 'msgid已经过期,不能回复' }));
+    }
     else if (rejectBroadcastTail && requests.at(-1).body.markdown?.content === '乙'.repeat(100)) {
       rejectBroadcastTail = false;
       response.writeHead(403).end(JSON.stringify({ code: 22009, message: 'fixture tail rejected' }));
@@ -1827,6 +1905,28 @@ test('Tencent SDK uses actual HTTP/WebSocket QQ frames; media inputs and outgoin
     assert.ok(audioUploads.filter(request => request.body.file_type === 4 && request.body.file_data === Buffer.from('mp3-fixture').toString('base64')).every(request => request.body.file_name === '原始音频.MP3'), 'MP3 file delivery preserves the filename and original bytes');
     assert.throws(() => qq.sendFile(messages[0].target, song, '原始音频.MP3', 'invalid'), /auto|file|voice/);
     assert.equal(uploads().length, beforeAudio + 10, 'invalid modes never issue a QQ upload');
+    const gif = join(directory, '两帧动图.GIF');
+    const gifBytes = Buffer.from('R0lGODlhBAAEAIEAAAAA/wAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQAGQAAACwAAAAABAAEAAAICQABCBxIsCCAgAAh+QQBGQABACwAAAAABAAEAIH///8AAAAAAAAAAAAICQABCBxIsCCAgAA7', 'base64');
+    await writeFile(gif, gifBytes);
+    const beforeGif = requests.length;
+    cacheMsgId('group', 'gif-expiry', 'expired-during-upload', Date.now(), 'alice');
+    await qq.sendFile({scope:'group',targetId:'gif-expiry',msgId:'expired-during-upload',replyUserId:'alice'}, gif, '两帧动图.GIF');
+    const gifExpiry = requests.slice(beforeGif).filter(request => request.path.startsWith('/v2/groups/gif-expiry/'));
+    assert.equal(gifExpiry.length, 2);
+    assert.equal(gifExpiry[0].body.file_type, 1);
+    assert.equal(gifExpiry[0].body.file_data, gifBytes.toString('base64'));
+    assert.equal(gifExpiry[0].body.srv_send_msg, false);
+    assert.equal(gifExpiry[1].body.msg_type, 7);
+    assert.equal(gifExpiry[1].body.msg_id, 'fresh-after-upload');
+
+    cacheMsgId('group', 'gif-retry', 'rejected-by-qq', Date.now(), 'alice');
+    await qq.sendFile({scope:'group',targetId:'gif-retry',msgId:'rejected-by-qq',replyUserId:'alice'}, gif, '两帧动图.GIF', 'image');
+    const gifRetry = requests.slice(beforeGif).filter(request => request.path.startsWith('/v2/groups/gif-retry/'));
+    assert.equal(gifRetry.length, 3, 'a definitively expired reply retries only the message');
+    assert.equal(gifRetry[0].body.file_type, 1);
+    assert.equal(gifRetry[1].body.msg_id, 'rejected-by-qq');
+    assert.equal(gifRetry[2].body.msg_id, undefined);
+    assert.deepEqual(gifRetry[2].body.media, gifRetry[1].body.media);
   } finally {
     qq.close();
     globalThis.fetch = originalFetch;
@@ -1873,7 +1973,7 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
   try {
     assert.equal(client.getServerVersion().name, 'codex-qqbot');
     assert.equal(client.getServerVersion().title, 'QQ Bot');
-    assert.equal(client.getServerVersion().version, '0.0.7');
+    assert.equal(client.getServerVersion().version, '0.0.8');
     const tools = (await client.listTools()).tools.map((tool) => tool.name);
     assert.deepEqual(tools.sort(), ['qqbot_browser', 'qqbot_configure', 'qqbot_desktop', 'qqbot_live', 'qqbot_models', 'qqbot_send_file', 'qqbot_send_message', 'qqbot_setup', 'qqbot_start', 'qqbot_status', 'qqbot_stop', 'qqbot_ui'].sort());
     const details = (await client.listTools()).tools;
@@ -2026,7 +2126,8 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
       const peer = new Client({ name: 'startup-fixture', version: '1.0.0' });
       startupClients.push(peer);
       await peer.connect(new StdioClientTransport({ command: process.execPath, args: [resolve('dist/cli.js'), 'mcp'],
-        env: { ...process.env, QQBOT_DATA_DIR: directory, QQBOT_BASE_URL: gatewayBase, QQBOT_TOKEN_BASE_URL: gatewayBase, QQBOT_BRIDGE_CHILD: child ? '1' : '0' }, stderr: 'pipe' }));
+        env: { ...process.env, QQBOT_DATA_DIR: directory, QQBOT_BASE_URL: gatewayBase, QQBOT_TOKEN_BASE_URL: gatewayBase, QQBOT_BRIDGE_CHILD: child ? '1' : '0',
+          CODEX_APP_TOOLS_PIPE_PATH: 'fixture-restarted-desktop-pipe', CODEX_THREAD_ID: '', CODEX_SESSION_ID: '' }, stderr: 'pipe' }));
       return peer;
     };
     const waitForState = async (predicate) => {
@@ -2049,6 +2150,9 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
       const [primary, secondary] = await Promise.all([connect(), connect()]);
       const online = await waitForState(state => state?.connected);
       assert.equal(online.config.autoStart, true);
+      const attachment = JSON.parse(await readFile(join(directory, 'desktop-attachment.json'), 'utf8'));
+      assert.equal(attachment.pipePath, 'fixture-restarted-desktop-pipe');
+      assert.equal(attachment.threadId, 'mcp-parent-thread', 'startup refreshes the desktop pipe before a caller turn exists');
       assert.equal(connections, 1);
       const shared = await secondary.callTool({ name: 'qqbot_status', arguments: {} });
       assert.equal(shared.structuredContent.connected, true);

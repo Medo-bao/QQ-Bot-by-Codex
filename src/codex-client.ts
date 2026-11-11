@@ -146,7 +146,7 @@ export class CodexClient {
       }
     });
     await this.call('initialize', {
-      clientInfo: { name: 'codex_qqbot', title: 'QQ Bot', version: '0.0.7' },
+      clientInfo: { name: 'codex_qqbot', title: 'QQ Bot', version: '0.0.8' },
       capabilities: { experimentalApi: true },
     });
     this.notify('initialized', {});

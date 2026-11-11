@@ -24,7 +24,7 @@
 <button data-tab="access" aria-selected="false"><span>访问范围</span><small>用户、群聊与白名单</small></button>
 <button data-tab="models" aria-selected="false"><span>模型与预设</span><small>模型提供商、技能与会话预设</small></button>
 <button data-tab="prompts" aria-selected="false"><span>回复与提示词</span><small>流式输出与个性化提示词</small></button>
-<button data-tab="media" aria-selected="false"><span>图片与文件</span><small>图片理解、附件与交付文件</small></button>
+<button data-tab="media" aria-selected="false"><span>图片与文件</span><small>图片生成、图片理解与附件</small></button>
 <button data-tab="live" aria-selected="false"><span>语音与音色</span><small>合成服务、试听与 QQ 语音</small></button>
 <button data-tab="runtime" aria-selected="false"><span>运行设置</span><small>队列、超时与本机数据</small></button>
 </nav></div>
@@ -39,7 +39,20 @@
 <section class="tab" id="tab-access" hidden><h2>访问范围</h2><p>允许哪些用户和群使用本机 Codex。</p><div id="accessFields" class="fields"></div><div class="notice">群聊任务的发起者也需要被允许。群聊默认只响应 @机器人的消息。</div><div class="section"><h3>最近消息来源</h3><p>向机器人发送消息后，可以在这里添加用户或群。</p><div id="peers"></div></div></section>
 <section class="tab" id="tab-models" hidden><h2>模型与预设</h2><p>留空使用 Codex 的默认设置。预设用于组合模型、提示词、技能和会话配置。</p><div id="modelFields" class="fields"></div><button id="refreshModels">刷新可用模型与技能</button><p id="catalogInfo" role="status"></p><datalist id="models"></datalist><datalist id="providers"></datalist><div class="section"><div class="card-head"><h3>会话预设</h3><button id="addPreset">添加预设</button></div><div class="row"><input id="newPresetId" aria-label="新预设 ID" placeholder="新预设 ID，例如 coding" style="max-width:260px"></div><div id="presets"></div><p class="notice">切换预设后，新会话生效。在 QQ 中使用 /preset 查看并切换，再发送 /new。</p></div></section>
 <section class="tab" id="tab-prompts" hidden><h2>回复与提示词</h2><p>设置 QQ Bot 的默认回复方式与提示词。可在「会话」中为每个私聊或群聊单独设置角色与额外提示词。</p><div class="notice">QQ Bot 不自动注入 Codex 的全局个性化指令、AGENTS 指令或记忆。</div><div id="promptFields" class="fields"></div></section>
-<section class="tab" id="tab-media" hidden><h2>图片与文件</h2><p>处理收到的图片和附件，并把交付文件发送回 QQ。</p><div id="mediaFields" class="fields"></div></section>
+<section class="tab" id="tab-media" hidden>
+  <h2>图片与文件</h2>
+  <p>选择生图方式，管理收到的图片和发送到 QQ 的文件。</p>
+  <div class="section">
+    <h3>图片生成</h3>
+    <div id="imageModeFields" class="fields"></div>
+    <p id="imageModeHelp" class="notice" role="status"></p>
+    <div id="imageApiOptions" hidden>
+      <div id="imageApiFields" class="fields"></div>
+      <p id="imageKeyStatus" class="notice" role="status"></p>
+    </div>
+  </div>
+  <div class="section"><h3>附件、图片理解与交付</h3><div id="mediaFields" class="fields"></div></div>
+</section>
 <section class="tab" id="tab-live" hidden>
 <div class="speech-heading">
 <h2>语音与音色</h2>
@@ -67,7 +80,7 @@
 <div id="liveSovitsParameters" class="fields speech-sliders"></div>
 <label class="field toggle speech-auto-read">
   <span>自动朗读 QQ 回复</span><input id="liveSovitsAutoSpeak" type="checkbox" aria-describedby="liveSovitsAutoSpeakHint">
-  <small id="liveSovitsAutoSpeakHint">开启后，每轮完成的 QQ 回复会追加一条语音。超出合成上限时发送文字回复。</small>
+  <small id="liveSovitsAutoSpeakHint">开启后，在文字回复后追加语音。超出时长上限时朗读开头。</small>
 </label>
 </section>
 </div>

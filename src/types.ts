@@ -5,7 +5,7 @@
 /** 会话作用域 */
 export type ChatScope = 'c2c' | 'group';
 
-export const fileSendModes = ['auto', 'file', 'voice'] as const;
+export const fileSendModes = ['auto', 'image', 'file', 'voice'] as const;
 export type FileSendMode = typeof fileSendModes[number];
 
 export interface GroupMember { id: string; name?: string; }

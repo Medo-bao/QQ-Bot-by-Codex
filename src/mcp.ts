@@ -9,16 +9,17 @@ import { browserEnvironmentKeys } from './browser-access.ts';
 import { ttsProviders } from './speech-providers.ts';
 
 export async function startMcp(): Promise<void> {
-  const server = new McpServer({ name: 'codex-qqbot', title: 'QQ Bot', version: '0.0.7' });
+  const server = new McpServer({ name: 'codex-qqbot', title: 'QQ Bot', version: '0.0.8' });
   const textResult = (value: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
     ...(value && typeof value === 'object' && !Array.isArray(value) ? { structuredContent: value as Record<string, unknown> } : {}) });
   const attachDesktop = async (meta?: Record<string, unknown>) => {
-    if (process.env.QQBOT_BRIDGE_CHILD === '1') return;
+    const pipePath = process.env.CODEX_APP_TOOLS_PIPE_PATH;
+    if (process.env.QQBOT_BRIDGE_CHILD === '1' || !pipePath) return;
     let context: any = meta?.['x-codex-turn-metadata'];
     if (typeof context === 'string') { try { context = JSON.parse(context); } catch { context = undefined; } }
     const threadId = context?.thread_id || context?.session_id || process.env.CODEX_THREAD_ID || process.env.CODEX_SESSION_ID;
-    if (process.env.CODEX_APP_TOOLS_PIPE_PATH && typeof threadId === 'string' && threadId) await callService('desktopAttach', {
-      pipePath: process.env.CODEX_APP_TOOLS_PIPE_PATH, threadId,
+    await callService('desktopAttach', {
+      pipePath, threadId,
       browserEnvironment: Object.fromEntries(browserEnvironmentKeys.flatMap(key => process.env[key] ? [[key, process.env[key]!]] : [])),
     });
   };
@@ -97,7 +98,7 @@ export async function startMcp(): Promise<void> {
       thread_id: z.string().optional(), prompt: z.string().optional(), job_id: z.string().optional(), notify_qq: z.boolean().optional(),
     } }, (params, extra) => execute('desktop', params, extra._meta));
     server.registerTool('qqbot_send_message', { title: 'QQ Bot 发送消息', description: 'Send a Markdown message to a specified QQ user or group. Use only when the human explicitly asks to send to this QQ conversation.', inputSchema: { ...destination, text: z.string().min(1) } }, (params) => execute('send', params));
-    server.registerTool('qqbot_send_file', { title: 'QQ Bot 发送文件', description: 'Send an existing local file to a specified QQ conversation, within configured allowed paths. MP3 defaults to an original file. Set send_as=file to force a downloadable file or send_as=voice for a voice message. Requires an explicit human request to send to that recipient.', inputSchema: { ...destination, file_path: z.string().min(1), send_as: fileSendModeSchema.describe('auto previews images/videos and native QQ voice; ordinary audio such as MP3 is sent as a file. file always preserves the original file and filename. voice sends audio as a voice message.') } }, (params) => execute('sendFile', params));
+    server.registerTool('qqbot_send_file', { title: 'QQ Bot 发送文件', description: 'Send existing local media or files to a specified QQ conversation, within configured allowed paths. Use image or auto for pictures and animated GIFs. Requires an explicit human request to send to that recipient.', inputSchema: { ...destination, file_path: z.string().min(1), send_as: fileSendModeSchema.describe('auto detects image, video and native voice. image sends pictures and GIFs as image messages. file sends a downloadable attachment, and is the default for ordinary MP3. voice sends audio as a voice message.') } }, (params) => execute('sendFile', params));
   }
   await server.connect(new StdioServerTransport());
 }
