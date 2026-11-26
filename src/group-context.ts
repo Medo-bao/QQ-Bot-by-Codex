@@ -10,7 +10,7 @@ export interface GroupContextEntry {
   id: string; role: 'user' | 'assistant'; senderId: string; senderName?: string; text: string;
   timestamp?: number; files?: Array<{ path?: string; name: string; contentType?: string; unavailable?: string }>;
 }
-interface State { threadId?: string; entries: GroupContextEntry[]; }
+interface State { threadId?: string; entries: GroupContextEntry[]; imageInputs?: string[]; }
 
 /** The reply gate controls model turns; received group context survives process restarts. */
 export class GroupContextStore {
@@ -31,16 +31,33 @@ export class GroupContextStore {
     writeJson(paths.state, this.state(target));
   }
   seed(target: ReplyTarget, threadId: string, historyPath: string): void {
-    if (existsSync(this.paths(target).state)) return;
+    const existing = existsSync(this.paths(target).state);
+    const state = this.state(target);
+    if (existing && (state.imageInputs || state.threadId && state.threadId !== threadId)) return;
     const messages: ConversationMessage[] = existsSync(historyPath) ? JSON.parse(readFileSync(historyPath, 'utf8')).messages : [];
-    const state = this.state(target); state.threadId = threadId;
-    for (const message of messages) {
+    state.threadId = threadId;
+    state.imageInputs = [...new Set(messages.filter(message => message.role === 'user').flatMap(message =>
+      (message.files || []).filter(file => file.image).map(file => file.path)))].slice(-this.maxEntries);
+    for (const message of existing ? [] : messages) {
       if (message.phase === 'commentary' || message.phase === 'error' || (!message.text && !message.files?.length)) continue;
       this.append(target, { id: `native:${threadId}:${message.id}`, role: message.role,
         senderId: message.role === 'assistant' ? 'qqbot' : message.authorId || (message.source === 'local' ? 'qqbot-local-ui' : 'unknown'),
         senderName: message.role === 'assistant' ? 'QQ Bot' : message.authorName || (message.source === 'local' ? '本机' : undefined),
         text: message.text, files: message.files });
     }
+    this.save(target);
+  }
+
+  imageInputs(target: ReplyTarget): Set<string> { return new Set(this.state(target).imageInputs); }
+
+  rememberImageInputs(target: ReplyTarget, threadId: string, paths: string[]): void {
+    if (!paths.length) return;
+    const state = this.state(target);
+    if (state.threadId !== threadId) return;
+    const existing = state.imageInputs || [];
+    const images = new Set([...existing, ...paths]);
+    if (images.size === existing.length) return;
+    state.imageInputs = [...images].slice(-this.maxEntries);
     this.save(target);
   }
   append(target: ReplyTarget, entry: GroupContextEntry): void {
@@ -94,7 +111,7 @@ export class GroupContextStore {
     state.threadId = threadId; this.save(target);
   }
   clear(target: ReplyTarget): void {
-    const state = this.state(target); state.entries = []; state.threadId = undefined; this.save(target);
+    const state = this.state(target); state.entries = []; state.threadId = undefined; state.imageInputs = []; this.save(target);
     appendFileSync(this.paths(target).archive, JSON.stringify({ type: 'reset', timestamp: Date.now() }) + '\n', { mode: 0o600 });
   }
   archivePath(target: ReplyTarget): string { return this.paths(target).archive; }

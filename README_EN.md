@@ -2,7 +2,7 @@
 
 Use local Codex from QQ private chats, QQ groups and a desktop plugin interface to handle conversations, run tasks and deliver files.
 
-**Current version: 0.0.8** · [中文](README.md) · [Changelog](CHANGELOG_EN.md) · [Source release](https://github.com/Medo-bao/QQ-Bot-by-Codex/releases/tag/v0.0.8)
+**Current version: 0.0.9** · [中文](README.md) · [Changelog](CHANGELOG_EN.md) · [Source release](https://github.com/Medo-bao/QQ-Bot-by-Codex/releases/tag/v0.0.9)
 
 QQ Bot connects Tencent's QQ Bot SDK to a local Codex App Server and reuses your Codex login, model providers and tools. DSH is not required. Adapted from [tencent-connect/dsh-qqbot](https://github.com/tencent-connect/dsh-qqbot), under the MIT license.
 

@@ -2,7 +2,7 @@
 
 在 QQ 私聊、群聊和 Codex 插件界面中使用本机 Codex，处理消息、执行任务并交付文件。
 
-**当前版本：0.0.8** · [English](README_EN.md) · [更新日志](CHANGELOG.md) · [下载源码](https://github.com/Medo-bao/QQ-Bot-by-Codex/releases/tag/v0.0.8)
+**当前版本：0.0.9** · [English](README_EN.md) · [更新日志](CHANGELOG.md) · [下载本版源码](https://github.com/Medo-bao/QQ-Bot-by-Codex/releases/tag/v0.0.9)
 
 QQ Bot 通过腾讯 QQ Bot SDK 连接 QQ 与本地 Codex App Server，复用本机的 Codex 登录、模型提供商和工具配置，无需安装 DSH。项目改造自 [tencent-connect/dsh-qqbot](https://github.com/tencent-connect/dsh-qqbot)，采用 MIT 许可证。
 

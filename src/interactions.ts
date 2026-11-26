@@ -3,6 +3,9 @@ import type { InlineKeyboard } from '@tencent-connect/qqbot-nodejs';
 import type { ChatTransport, IncomingInteraction, IncomingMessage } from './qq-transport.ts';
 import type { ReplyTarget } from './types.ts';
 
+interface Answer { text: string; message?: IncomingMessage; }
+const answerCommand = /^\/answer\s+(\S+)(?:\s+([\s\S]+))?$/i;
+
 interface Pending {
   token: string;
   requestId: number | string;
@@ -14,14 +17,15 @@ interface Pending {
   multiple?: boolean;
   text: string;
   kind?: 'question' | 'approval';
-  resolve: (answer: string | null) => void;
+  resolve: (answer: Answer | null) => void;
   timer: NodeJS.Timeout;
 }
 
 /** Correlate every button to a live request, peer and initiating user. */
 export class InteractionBroker {
   private readonly pending = new Map<string, Pending>();
-  constructor(private readonly transport: ChatTransport, private readonly timeoutMs: number) {}
+  constructor(private readonly transport: ChatTransport, private readonly timeoutMs: number,
+    private readonly readReplyContext?: (message: IncomingMessage) => Promise<string>) {}
 
   list() {
     return [...this.pending.values()].map(({ token, threadId, target, senderId, text, options, multiple, freeText, kind }) => ({ token, threadId, target, senderId, text, options, multiple, freeText, kind }));
@@ -29,7 +33,7 @@ export class InteractionBroker {
 
   /** The authenticated local UI may answer a request in its selected conversation. */
   localText(target: ReplyTarget, text: string): boolean {
-    const explicit = /^\/answer\s+(\S+)\s+([\s\S]+)$/i.exec(text.trim());
+    const explicit = answerCommand.exec(text.trim());
     const entries = [...this.pending.values()].filter((entry) => entry.target.scope === target.scope && entry.target.targetId === target.targetId);
     const entry = explicit ? entries.find((item) => item.token === explicit[1]) : entries.length === 1 ? entries[0] : undefined;
     return Boolean(entry && this.text({ target, senderId: entry.senderId, text, attachments: [], shouldAnswer: true }));
@@ -40,8 +44,8 @@ export class InteractionBroker {
     text: string; options: string[]; freeText?: boolean; multiple?: boolean; kind?: 'question' | 'approval';
   }): Promise<string | null> {
     const token = randomUUID().slice(0, 8);
-    let resolveAnswer!: (value: string | null) => void;
-    const answer = new Promise<string | null>((resolve) => { resolveAnswer = resolve; });
+    let resolveAnswer!: Pending['resolve'];
+    const answer = new Promise<Answer | null>((resolve) => { resolveAnswer = resolve; });
     const entry: Pending = { ...input, token, freeText: input.freeText ?? false, resolve: resolveAnswer,
       timer: setTimeout(() => this.finish(token, null), this.timeoutMs) };
     this.pending.set(token, entry);
@@ -62,7 +66,11 @@ export class InteractionBroker {
         await this.transport.sendMarkdown(input.target, text);
       }
     } catch (error) { this.finish(token, null); throw error; }
-    return answer;
+    const reply = await answer;
+    if (!reply) return null;
+    if (!reply.message || !this.readReplyContext) return reply.text;
+    const context = await this.readReplyContext(reply.message);
+    return [reply.text, context].filter(Boolean).join('\n');
   }
 
   interaction(event: IncomingInteraction): boolean {
@@ -80,20 +88,26 @@ export class InteractionBroker {
   text(message: IncomingMessage): boolean {
     const text = message.text.trim();
     if (/^\/(?:stop|new|reset|clear|model|compact|effort|preset)(?:\s|$)|^\/bot-/i.test(text)) return false;
-    const explicit = /^\/answer\s+(\S+)\s+([\s\S]+)$/i.exec(text);
+    const explicit = answerCommand.exec(text);
     const candidates = [...this.pending.values()].filter((entry) => this.matches(entry, message.target, message.senderId));
     const entry = explicit ? candidates.find((candidate) => candidate.token === explicit[1]) : candidates.length === 1 ? candidates[0] : undefined;
     if (!entry) return false;
-    const raw = (explicit?.[2] || text).trim();
+    const raw = explicit ? (explicit[2] || '').trim() : text;
+    const withContext = entry.freeText && entry.kind !== 'approval' && this.readReplyContext &&
+      (message.attachments.length > 0 || message.reference);
+    if (!raw && !withContext) return false;
+    let answer: string;
     if (entry.multiple && /^\d+(?:\s*[,， ]\s*\d+)*$/.test(raw)) {
       const selected = [...new Set(raw.split(/[,，\s]+/).map((index) => entry.options[Number(index) - 1]))];
       if (selected.some((option) => option === undefined)) return false;
-      this.finish(entry.token, JSON.stringify(selected)); return true;
+      answer = JSON.stringify(selected);
+    } else {
+      const index = /^\d+$/.test(raw) ? Number(raw) - 1 : -1;
+      const selected = entry.options[index] || entry.options.find((option) => option === raw);
+      if (!selected && !entry.freeText) return false;
+      answer = selected || raw;
     }
-    const index = /^\d+$/.test(raw) ? Number(raw) - 1 : -1;
-    const selected = entry.options[index] || entry.options.find((option) => option === raw);
-    if (!selected && !entry.freeText) return false;
-    this.finish(entry.token, selected || raw);
+    this.finish(entry.token, answer, withContext ? message : undefined);
     return true;
   }
 
@@ -115,11 +129,11 @@ export class InteractionBroker {
     return entry.senderId === senderId && entry.target.scope === target.scope && entry.target.targetId === target.targetId;
   }
 
-  private finish(token: string, value: string | null): void {
+  private finish(token: string, value: string | null, message?: IncomingMessage): void {
     const entry = this.pending.get(token);
     if (!entry) return;
     clearTimeout(entry.timer);
     this.pending.delete(token);
-    entry.resolve(value);
+    entry.resolve(value === null ? null : { text: value, message });
   }
 }

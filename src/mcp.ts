@@ -1,4 +1,5 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { pluginVersion } from './version.ts';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { ConfigStore } from './config.ts';
@@ -9,7 +10,7 @@ import { browserEnvironmentKeys } from './browser-access.ts';
 import { ttsProviders } from './speech-providers.ts';
 
 export async function startMcp(): Promise<void> {
-  const server = new McpServer({ name: 'codex-qqbot', title: 'QQ Bot', version: '0.0.8' });
+  const server = new McpServer({ name: 'codex-qqbot', title: 'QQ Bot', version: pluginVersion });
   const textResult = (value: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(value, null, 2) }],
     ...(value && typeof value === 'object' && !Array.isArray(value) ? { structuredContent: value as Record<string, unknown> } : {}) });
   const attachDesktop = async (meta?: Record<string, unknown>) => {

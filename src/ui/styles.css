@@ -212,6 +212,7 @@ body[data-session-open="true"] #error, body[data-session-open="true"] #feedback 
 .copy-message { display: block; border: 0; color: var(--muted); background: transparent; font-size: 11px; padding: 4px 0; margin-top: 8px; opacity: 0; }
 .chat-message:hover .copy-message, .copy-message:focus-visible { opacity: 1; }
 .turn-activity { margin: 3px 0 26px; padding: 0; }
+.turn-status { margin: 3px 0 26px; color: var(--muted); font-size: 14px; }
 .turn-activity > summary { display: flex; align-items: center; gap: 12px; list-style: none; color: var(--muted); padding: 8px 0; font-size: 14px; }
 .turn-activity > summary::-webkit-details-marker { display: none; }
 .turn-activity > summary::after { content: '›'; font-size: 19px; line-height: 1; transform: rotate(90deg); }

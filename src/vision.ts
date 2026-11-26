@@ -1,11 +1,43 @@
+import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { stat } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { extname, join } from 'node:path';
+import { promisify } from 'node:util';
 import { CodexClient } from './codex-client.ts';
 import type { BotConfig } from './config.ts';
 import type { Logger } from './types.ts';
 
+const pythonDirectory = join(homedir(), '.cache', 'codex-runtimes', 'codex-primary-runtime', 'dependencies', 'python');
+export const bundledImagePython = process.platform === 'win32' ? join(pythonDirectory, 'python.exe') : join(pythonDirectory, 'bin', 'python3');
+const runFile = promisify(execFile);
+const compressPng = `import sys, warnings
+from PIL import Image
+warnings.simplefilter("error", Image.DecompressionBombWarning)
+with Image.open(sys.argv[1], formats=["PNG"]) as image:
+    if image.is_animated:
+        sys.exit(1)
+    image.save(sys.stdout.buffer, format="PNG", compress_level=6)
+`;
+
+async function visionInput(path: string, limit: number, signal: AbortSignal) {
+  const { size } = await stat(path);
+  if (size <= limit) return { type: 'localImage', path };
+  if (extname(path).toLowerCase() === '.png' && existsSync(bundledImagePython)) {
+    try {
+      const { stdout } = await runFile(bundledImagePython, ['-I', '-c', compressPng, path], {
+        encoding: 'buffer', maxBuffer: limit, windowsHide: true, signal,
+      });
+      return { type: 'image', url: 'data:image/png;base64,' + stdout.toString('base64') };
+    } catch {
+      signal.throwIfAborted();
+    }
+  }
+  throw new Error(`图片为 ${size} 字节，超过视觉输入上限 ${limit} 字节。请另存较小的预览图，再用副本路径重试。`);
+}
+
 export async function describeImage(config: BotConfig, logger: Logger, path: string, prompt?: string, signal?: AbortSignal): Promise<string> {
   if (!config.vision.enabled) throw new Error('视觉理解已关闭。');
-  if ((await stat(path)).size > config.vision.maxBytes) throw new Error('图片超过视觉输入大小上限。');
   const client = new CodexClient(config, logger);
   let threadId: string | undefined;
   let output = '';
@@ -15,7 +47,12 @@ export async function describeImage(config: BotConfig, logger: Logger, path: str
   void complete.catch(() => {});
   let disposal: Promise<void> | undefined;
   const dispose = () => disposal ||= client.close();
-  const cancel = (reason: string) => { fail(new Error(reason)); void dispose().catch((error) => logger.warn(String(error))); };
+  const processing = new AbortController();
+  const cancel = (reason: string) => {
+    const error = new Error(reason);
+    processing.abort(error); fail(error);
+    void dispose().catch((error) => logger.warn(String(error)));
+  };
   const aborted = () => cancel('图片分析已取消。');
   signal?.addEventListener('abort', aborted, { once: true });
   client.requestHandler = async (message) => {
@@ -36,6 +73,8 @@ export async function describeImage(config: BotConfig, logger: Logger, path: str
   const timer = setTimeout(() => cancel('视觉理解超时。'), config.vision.timeoutMs);
   try {
     if (signal?.aborted) throw new Error('图片分析已取消。');
+    const input = await visionInput(path, config.vision.maxBytes, processing.signal);
+    processing.signal.throwIfAborted();
     await client.start();
     const { config: nativeConfig } = await client.call('config/read', { includeLayers: false });
     const disabledMcpServers = Object.fromEntries(Object.keys(nativeConfig?.mcp_servers ?? {})
@@ -52,7 +91,7 @@ export async function describeImage(config: BotConfig, logger: Logger, path: str
     const effort = selected?.supportedReasoningEfforts?.some((entry: any) => entry.reasoningEffort === 'low')
       ? 'low' : selected?.defaultReasoningEffort;
     await client.call('turn/start', { threadId, ...(effort ? { effort } : {}),
-      input: [{ type: 'text', text: prompt || config.vision.defaultPrompt }, { type: 'localImage', path }] });
+      input: [{ type: 'text', text: prompt || config.vision.defaultPrompt }, input] });
     await complete;
     if (!output.trim()) throw new Error('视觉理解未返回图片描述。');
     return output.slice(0, config.vision.maxOutputChars);

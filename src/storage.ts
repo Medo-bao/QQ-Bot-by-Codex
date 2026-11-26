@@ -77,8 +77,11 @@ export class ConversationStorage {
     const directory = this.paths(target).history;
     mkdirSync(directory, { recursive: true });
     const path = join(directory, `${segment(threadId)}.json`);
-    const existing: ConversationMessage[] = existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')).messages : [];
-    const complete = full || !existsSync(path);
+    const existing: { formatVersion?: number; messages: ConversationMessage[] } =
+      existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : { messages: [] };
+    // Unversioned archives may have attached context images to speakers on older pages.
+    const formatVersion = 2;
+    const complete = full || existing.formatVersion !== formatVersion;
     const pages: ConversationMessage[][] = [];
     let cursor: string | undefined;
     do {
@@ -86,8 +89,8 @@ export class ConversationStorage {
       pages.unshift(page.messages);
       cursor = complete ? page.nextCursor || undefined : undefined;
     } while (cursor);
-    const messages = [...new Map([...existing, ...pages.flat()].map((message) => [message.id, message])).values()];
-    writeJson(path, { threadId, messages });
+    const messages = [...new Map([...existing.messages, ...pages.flat()].map((message) => [message.id, message])).values()];
+    writeJson(path, { formatVersion, threadId, messages });
     const text = messages.map((message) => {
       const author = message.role === 'assistant' ? `QQ Bot${message.replyToName || message.replyToId ? ` → ${message.replyToName || message.replyToId}` : ''}`
         : message.source === 'local' ? '本机' : message.authorName || message.authorId || 'QQ 用户';

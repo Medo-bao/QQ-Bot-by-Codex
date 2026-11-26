@@ -1,4 +1,5 @@
 import { App } from '@modelcontextprotocol/ext-apps';
+import { pluginVersion } from '../version.ts';
 import { renderMarkdown } from './markdown.ts';
 import { assistantText } from '../message-format.ts';
 import { renderBindingQr } from './binding-qr.ts';
@@ -218,7 +219,7 @@ function updateHeader(): void {
   const phase = state?.binding?.phase;
   const ready = state?.config.credentialsConfigured;
   const unavailable: Record<string, boolean> = {
-    start: !ready || Boolean(state?.connected), stop: !state?.running,
+    start: !ready || Boolean(state?.connected || state?.reconnecting), stop: !state?.running,
     bind: phase === 'starting' || phase === 'saving',
     cancelBind: !['starting', 'waiting', 'saving'].includes(phase), unbind: !ready,
   };
@@ -288,11 +289,12 @@ function renderCollection(): void {
   $('noMatchingSessions').hidden = botMatches || Boolean(matches);
   const expanded = query ? !searchGroupCollapsed : !collapsedBots.has(state.config.appId || 'unbound');
   $('toggleBotGroup').setAttribute('aria-expanded', String(expanded));
-  $('toggleBotGroup').title = `${subtitle} · ${state.connected ? '已连接' : pending ? '等待扫码' : '未连接'}`;
+  const connectionLabel = state.connected ? '已连接' : state.reconnecting ? '正在重新连接' : pending ? '等待扫码' : '未连接';
+  $('toggleBotGroup').title = `${subtitle} · ${connectionLabel}`;
   $('sessionList').hidden = !expanded;
   $('botSessionCount').textContent = String(matches);
   $('botGroupStatus').dataset.active = String(Boolean(state.connected || pending));
-  $('botGroupStatus').title = state.connected ? '已连接' : pending ? '等待扫码' : '未连接';
+  $('botGroupStatus').title = connectionLabel;
   $('manageBot').setAttribute('aria-pressed', String(selectedRobot));
   if (view === 'sessions' && query) $('collectionSummary').textContent = `${matches} 个匹配会话`;
   let count = 0;
@@ -397,7 +399,7 @@ async function action(name: string, payload: any = {}, success?: string): Promis
   updateHeader();
   try {
     const result = await api(name, payload);
-    showFeedback($('feedback'), success || labels?.[2] || '', 'success');
+    showFeedback($('feedback'), name === 'start' && result.reconnecting ? '' : success || labels?.[2] || '', 'success');
     if (name === 'shutdown') exited = true;
     else { exited = false; await refresh(true); }
     return result;
@@ -650,8 +652,16 @@ function renderChatMessages(key: string, older = false): void {
   const activityGroup = (turnId: string) => {
     if (!turnId || activityTurns.has(turnId)) return; activityTurns.add(turnId);
     const comments = all.filter((message) => message.turnId === turnId && message.phase === 'commentary');
-    const tools = record.activities.filter((item) => item.turnId === turnId);
-    if (!comments.length && !tools.length && turnId !== record.activeTurnId) return;
+    const activities = record.activities.filter((item) => item.turnId === turnId);
+    const terminal = activities.find(item => item.kind === 'turnStatus');
+    const tools = activities.filter(item => item !== terminal);
+    if (!comments.length && !tools.length && (terminal || turnId !== record.activeTurnId)) {
+      if (terminal) {
+        const notice = document.createElement('p'); notice.className = 'turn-status'; notice.textContent = terminal.label;
+        messages.append(notice);
+      }
+      return;
+    }
     const details = document.createElement('details'); details.className = 'turn-activity'; details.dataset.turn = turnId;
     details.dataset.activityKey = `turn:${turnId}`;
     details.open = record.activityOpen.get(turnId) ?? turnId === record.activeTurnId;
@@ -659,7 +669,8 @@ function renderChatMessages(key: string, older = false): void {
     details.ontoggle = () => { if (details.isConnected && details.open !== renderedOpen) { record.activityOpen.set(turnId, details.open); renderedOpen = details.open; } };
     const summary = document.createElement('summary');
     const thinking = tools.some(tool => tool.kind === 'reasoning' && tool.status === 'running');
-    const label = document.createElement('span'); label.className = 'activity-label'; label.textContent = turnId === record.activeTurnId ? thinking ? '正在思考' : '正在处理' : tools.some(tool => tool.kind === 'reasoning') ? '思考与活动' : '活动';
+    const label = document.createElement('span'); label.className = 'activity-label';
+    label.textContent = terminal?.label ?? (turnId === record.activeTurnId ? thinking ? '正在思考' : '正在处理' : tools.some(tool => tool.kind === 'reasoning') ? '思考与活动' : '活动');
     const count = document.createElement('span'); count.className = 'activity-count'; count.textContent = tools.length ? tools.map((tool) => tool.label).filter((label, index, values) => values.indexOf(label) === index).join(' · ') : comments.length ? `${comments.length} 条进展` : '等待模型响应…';
     summary.append(label, count); details.append(summary);
     const body = document.createElement('div'); body.className = 'activity-body';
@@ -674,7 +685,7 @@ function renderChatMessages(key: string, older = false): void {
       entry.open = record.activityOpen.get(openKey) ?? (prose && tool.status === 'running');
       let renderedOpen = entry.open;
       entry.ontoggle = () => { if (entry.isConnected && entry.open !== renderedOpen) { record.activityOpen.set(openKey, entry.open); renderedOpen = entry.open; } };
-      const title = document.createElement('summary'); title.textContent = `${tool.status === 'failed' ? '未完成 · ' : ''}${tool.kind === 'reasoning' && tool.status === 'running' ? '正在思考' : tool.label}`; entry.append(title);
+      const title = document.createElement('summary'); title.textContent = `${tool.status === 'failed' ? '未完成 · ' : tool.status === 'interrupted' ? '已中止 · ' : ''}${tool.kind === 'reasoning' && tool.status === 'running' ? '正在思考' : tool.label}`; entry.append(title);
       if (tool.detail) {
         const detail = prose ? richText(tool.detail, key) : document.createElement('pre');
         if (!prose) detail.textContent = tool.detail;
@@ -1167,7 +1178,7 @@ async function readStatus(discardAt?: number): Promise<boolean> {
     const latestConfig = structuredClone(state.config); delete latestConfig.credentialsConfigured;
     if (!draft || discardAt === draftRevision || !dirty && JSON.stringify(draft) !== JSON.stringify(latestConfig)) adoptSettings(latestConfig);
     else renderImageMode();
-    $('connectionStatus').textContent = state.connected ? 'QQ Bot 已连接' : state.running ? '连接中' : '连接未启动';
+    $('connectionStatus').textContent = state.connected ? 'QQ Bot 已连接' : state.reconnecting ? 'QQ Bot 正在重新连接' : state.running ? '连接中' : '连接未启动';
     $('connectionStatus').dataset.connected = String(Boolean(state.connected));
     const phase = state.binding || { phase: 'idle' };
     const phaseLabel: Record<string, string> = { idle: state.config.credentialsConfigured ? `已保存机器人 ${state.config.appId}` : '尚未绑定机器人', starting: '正在获取二维码…', waiting: '请用手机 QQ 扫码连接', expired: '二维码已过期，请刷新扫码', saving: '正在保存凭据…', bound: '已绑定并连接', failed: `绑定失败：${phase.reason}` };
@@ -1486,7 +1497,7 @@ function bindEvents(): void {
 async function main(): Promise<void> {
   document.body.dataset.transport = mode;
   if (mode === 'mcp') {
-    app = new App({ name: 'codex-qqbot-settings', title: 'QQ Bot', version: '0.0.8' }, {});
+    app = new App({ name: 'codex-qqbot-settings', title: 'QQ Bot', version: pluginVersion }, {});
     app.onhostcontextchanged = (context) => { if (context.theme) document.body.dataset.theme = context.theme; };
     await app.connect();
     const theme = app.getHostContext()?.theme; if (theme) document.body.dataset.theme = theme;

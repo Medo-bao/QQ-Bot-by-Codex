@@ -653,7 +653,9 @@ test('OpenAI image mode reuses the QQ thread, archives PNGs and preserves result
   await writeFile(keyFile, 'OPENAI_API_KEY="fixture-image-key"\n');
   const config = store.update({ appId: 'fixture-app', appSecret: 'fixture-secret', cwd: directory, codexCommand: fixture,
     codexArgs: [directory], access: { c2cMode: 'open' }, imageGeneration: { keyFile } });
-  const qq = new FakeQQ(), client = new CodexClient(config, quiet), bridge = new QQBridge(config, directory, qq, client, quiet);
+  const warnings = [];
+  const qq = new FakeQQ(), client = new CodexClient(config, quiet);
+  const bridge = new QQBridge(config, directory, qq, client, { ...quiet, warn: text => warnings.push(text) });
   const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jvWQAAAAASUVORK5CYII=';
   const request = t.mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({ data: [{ b64_json: png }] })));
   const response = () => requireTrace(directory).filter(item => item.openaiImage).at(-1).openaiImage;
@@ -683,9 +685,13 @@ test('OpenAI image mode reuses the QQ thread, archives PNGs and preserves result
     assert.equal(qq.files[0].path, first.path);
     assert.deepEqual(await readFile(first.path), Buffer.from(png, 'base64'));
 
+    const networkError = code => new TypeError('fetch failed', { cause: Object.assign(new Error('private proxy details'), { code }) });
+    request.mock.mockImplementationOnce(async () => { throw networkError('UND_ERR_CONNECT_TIMEOUT'); });
     qq.failNextFile = true;
     await bridge.handleMessage(message(`openai-image-probe\n${first.path}`));
-    const [editUrl, editOptions] = request.mock.calls[1].arguments;
+    assert.equal(request.mock.callCount(), 3, 'a connection timeout retries the edit once');
+    assert.ok(warnings.some(text => text.includes('UND_ERR_CONNECT_TIMEOUT')));
+    const [editUrl, editOptions] = request.mock.calls[2].arguments;
     assert.equal(editUrl, 'https://api.openai.com/v1/images/edits');
     assert.equal(editOptions.body.get('image[]').type, 'image/png');
     const second = generated();
@@ -694,11 +700,18 @@ test('OpenAI image mode reuses the QQ thread, archives PNGs and preserves result
     const archived = JSON.parse(await readFile(bridge.storage.historyFile(message('').target, threadId), 'utf8'));
     assert.ok(archived.messages.some(item => item.files?.some(file => file.path === second.path && file.image)));
 
+    request.mock.mockImplementationOnce(async () => { throw networkError('UND_ERR_SOCKET'); });
+    await bridge.handleMessage(message('openai-image-probe'));
+    assert.equal(response().success, false);
+    assert.match(response().contentItems[0].text, /UND_ERR_SOCKET.*无法确认请求是否已受理/);
+    assert.doesNotMatch(response().contentItems[0].text, /private proxy details/);
+    assert.equal(request.mock.callCount(), 4, 'a possibly submitted generation is not replayed');
+
     bridge.applyThreadSettings(store.update({ imageGeneration: { mode: 'codex' } }));
     await bridge.handleMessage(message('auto-image-probe terminal-only'));
     assert.equal(bridge.status().sessions[0].threadId, threadId);
     assert.equal(requireTrace(directory).filter(item => item.method === 'thread/resume').at(-1).params.config['features.image_generation'], undefined);
-    assert.equal(request.mock.callCount(), 2);
+    assert.equal(request.mock.callCount(), 4);
     assert.equal(qq.files.length, 2);
   } finally { await bridge.close(); }
 });
@@ -818,6 +831,7 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
   let quoteDownloads = 0, quoteMediaExpired = false, contextDownloads = 0, contextMediaExpired = false;
   let releaseContextDownload, contextDownloadStarted = false;
   const quoteHttp = createServer((request, response) => {
+    if (request.url === '/answer-source.ai') { response.end('%PDF-1.6 fixture'); return; }
     if (request.url.startsWith('/context-')) {
       contextDownloads++;
       if (contextMediaExpired || request.url === '/context-expired.png') { response.writeHead(410); response.end(); return; }
@@ -888,8 +902,20 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     await waitFor(() => bridge.broker.list().length === 1 && bridge.broker.list()[0].token !== pending.token);
     pending = bridge.broker.list()[0];
     await bridge.handleMessage({ ...message(`/answer ${pending.token} 2`, 'group', 'team'), shouldAnswer: false });
+    await waitFor(() => bridge.broker.list().some(item => item.text === '请上传源文件'));
+    const upload = { ...message('', 'group', 'team'), shouldAnswer: false, messageIndex: 'source-answer',
+      attachments: [{ filename: '源文件.ai', content_type: 'file', size: 16, url: quoteBase + '/answer-source.ai' }] };
+    await bridge.handleMessage(upload);
     await task;
     await queuedTask;
+    const sourceReply = requireTrace(directory).find(item => item.sourceReply).sourceReply;
+    assert.equal(sourceReply.success, true);
+    const source = JSON.parse(sourceReply.contentItems[0].text.split('\n')[1]).files[0];
+    assert.equal(source.name, '源文件.ai');
+    assert.equal(await readFile(source.path, 'utf8'), '%PDF-1.6 fixture');
+    const groupStorage = bridge.status().sessions.find(item => item.peerId === 'team').storage;
+    const archive = (await readFile(join(groupStorage.directory, 'group-messages.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(archive.findLast(item => item.id === upload.contextId).files[0].path, source.path);
     const queuedTurn = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('queued group question'));
     assert.ok(!groupContext(queuedTurn).messages.some(item => item.text.includes('future passive group message')), 'queued requests do not receive user messages that arrived later');
     assert.ok(groupContext(queuedTurn).messages.some(item => item.role === 'assistant'), 'the previous task reply is available when the queued task begins');
@@ -935,6 +961,10 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     assert.equal(await readFile(ordinaryFile.path, 'utf8'), 'ordinary context file');
     assert.ok(ordinaryTurn.params.input.some(item => item.type === 'localImage' && item.path === ordinaryFile.path), 'unquoted recent pictures reach model image input');
     assert.equal(contextDownloads, 1);
+    await bridge.handleMessage(message('follow up on the same ordinary image', 'group', 'team', 'bob'));
+    const repeatImage = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('follow up on the same ordinary image'));
+    assert.ok(!repeatImage.params.input.some(item => item.type === 'localImage'), 'a historical image already submitted to this thread is not reattached');
+    assert.equal(groupContext(repeatImage).messages.find(item => item.id === passiveContextImage.contextId).files[0].path, ordinaryFile.path);
     await bridge.handleMessage(passiveContextImage);
     assert.equal(contextDownloads, 1, 'gateway redelivery reuses the local ordinary attachment');
     await rm(ordinaryFile.path);
@@ -942,6 +972,7 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     const recoveredTurn = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('recover ordinary previous image'));
     const recoveredFile = groupContext(recoveredTurn).messages.find(item => item.id === passiveContextImage.contextId).files[0];
     assert.notEqual(recoveredFile.path, ordinaryFile.path);
+    assert.ok(recoveredTurn.params.input.some(item => item.type === 'localImage' && item.path === recoveredFile.path));
     assert.equal(await readFile(recoveredFile.path, 'utf8'), 'ordinary context file');
     assert.equal(contextDownloads, 2, 'a missing cached file is restored from its recorded QQ attachment');
     await bridge.handleMessage({ ...message('普通文档', 'group', 'team', 'alice'), attachments: [{ ...contextImage, content_type: 'text/plain', filename: 'context-note.txt', url: quoteBase + '/context-note.txt' }], shouldAnswer: false });
@@ -993,6 +1024,11 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     const sameImage = requireTrace(directory).find(item => item.method === 'turn/start' && currentText(item).includes('same current and quoted image'));
     assert.equal(quoteDownloads, 2, 'the current attachment is downloaded once and reused for its quote');
     assert.equal(sameImage.params.input.filter(item => item.type === 'localImage').length, 1);
+    const groupArchive = JSON.parse(await readFile(join(groupStorage.history, groupThread + '.json'), 'utf8'));
+    const userFiles = text => groupArchive.messages.find(item => item.role === 'user' && item.text.startsWith(text)).files.map(file => file.path);
+    assert.deepEqual(userFiles('read ordinary previous image without quoting'), []);
+    assert.deepEqual(userFiles('read quoted context'), []);
+    assert.deepEqual(userFiles('same current and quoted image'), [sameImage.params.input.find(item => item.type === 'localImage').path]);
     await bridge.handleMessage({ ...message('nested quoted context', 'group', 'team', 'bob'), reference: {
       key: 'forwarded-context', text: '转发的对话资料', references: [{ key: 'original-ref==', text: '较短预览' }, { key: '', text: '第二条转发消息', senderId: 'bob' }],
     } });
@@ -1147,6 +1183,9 @@ test('QQ → real JSONL child process: isolation, streaming, approvals, question
     await bridge.handleMessage(message('/stop'));
     await hanging;
     assert.equal(bridge.status().sessions.find((item) => item.threadId === first).busy, false);
+    const interruptedHistory = await fileViewer.conversation('c2c', 'alice');
+    const interruptedTurn = interruptedHistory.messages.findLast(item => item.role === 'user' && item.text === 'hang').turnId;
+    assert.ok(interruptedHistory.activities.some(item => item.turnId === interruptedTurn && item.status === 'interrupted' && item.label === '本轮已中止'));
     await bridge.handleMessage(message('/model fixture-model'));
     await bridge.handleMessage(message('/effort high'));
     await bridge.handleMessage(message('/compact'));
@@ -1556,6 +1595,7 @@ test('Pending QQ interactions are scoped to the request owner, peer and lifetime
   assert.equal(await answer, null, 'timeout grants nothing');
   assert.equal(broker.interaction({ target, senderId: 'alice', data }), false);
   const next = broker.ask({ requestId: 2, threadId: 'thread-a', target, senderId: 'alice', text: 'Which name?', options: [], freeText: true });
+  assert.equal(broker.text(message('  ')), false);
   assert.equal(broker.text(message('Custom answer')), true);
   assert.equal(await next, 'Custom answer');
   const multiple = broker.ask({ requestId: 3, threadId: 'thread-a', target, senderId: 'alice', text: 'Choose several', options: ['A', 'B', 'C'], multiple: true });
@@ -1699,7 +1739,14 @@ test('Tencent SDK uses actual HTTP/WebSocket QQ frames; media inputs and outgoin
         [{ member_openid: 'alice', username: 'Alice' }, { member_openid: 'bot', bot: true }],
         next_cursor: second ? '' : 'next/+' }));
     }
+    else if (request.url === '/v2/groups/voice-duration/upload_prepare') {
+      response.end(JSON.stringify({ upload_id: 'long-voice', block_size: requests.at(-1).body.file_size, parts: [] }));
+    }
     else if (request.url.endsWith('/files')) {
+      if (request.url === '/v2/groups/voice-duration/files' && (requests.at(-1).body.upload_id || requests.at(-1).body.file_type === 3)) {
+        response.writeHead(400).end(JSON.stringify({ message: '上传音频时长超过限制' }));
+        return;
+      }
       if (request.url === '/v2/groups/gif-expiry/files') {
         cacheMsgId('group', 'gif-expiry', 'expired-during-upload', Date.now() - replyPolicy.group.ttlMs, 'alice');
         cacheMsgId('group', 'gif-expiry', 'fresh-after-upload', Date.now(), 'alice');
@@ -1905,6 +1952,20 @@ test('Tencent SDK uses actual HTTP/WebSocket QQ frames; media inputs and outgoin
     assert.ok(audioUploads.filter(request => request.body.file_type === 4 && request.body.file_data === Buffer.from('mp3-fixture').toString('base64')).every(request => request.body.file_name === '原始音频.MP3'), 'MP3 file delivery preserves the filename and original bytes');
     assert.throws(() => qq.sendFile(messages[0].target, song, '原始音频.MP3', 'invalid'), /auto|file|voice/);
     assert.equal(uploads().length, beforeAudio + 10, 'invalid modes never issue a QQ upload');
+    const voiceTarget = { scope: 'group', targetId: 'voice-duration' };
+    const longVoicePath = join(directory, 'full-song.mp3');
+    await writeFile(longVoicePath, Buffer.alloc(5 * 1024 * 1024));
+    const beforeLongVoice = requests.length;
+    const durationError = /超过 QQ 单条语音的时长限制.*可选择按文件发送/;
+    await assert.rejects(qq.sendFile(voiceTarget, song, '原始音频.MP3', 'voice'), durationError);
+    await assert.rejects(qq.sendFile(voiceTarget, longVoicePath, 'full-song.mp3', 'voice'), durationError);
+    const rejected = requests.slice(beforeLongVoice);
+    assert.deepEqual(rejected.map(request => [request.path.split('/').at(-1), request.body.file_type || request.body.upload_id]), [
+      ['files', 3], ['upload_prepare', 3], ['files', 'long-voice'],
+    ], 'QQ duration rejection stops both upload paths without sending a message or changing modes');
+    await qq.sendFile(voiceTarget, song, '原始音频.MP3', 'file');
+    assert.equal(requests.at(-2).body.file_type, 4);
+    assert.equal(requests.at(-1).body.msg_type, 7);
     const gif = join(directory, '两帧动图.GIF');
     const gifBytes = Buffer.from('R0lGODlhBAAEAIEAAAAA/wAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQAGQAAACwAAAAABAAEAAAICQABCBxIsCCAgAAh+QQBGQABACwAAAAABAAEAIH///8AAAAAAAAAAAAICQABCBxIsCCAgAA7', 'base64');
     await writeFile(gif, gifBytes);
@@ -1973,7 +2034,8 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
   try {
     assert.equal(client.getServerVersion().name, 'codex-qqbot');
     assert.equal(client.getServerVersion().title, 'QQ Bot');
-    assert.equal(client.getServerVersion().version, '0.0.8');
+    const pluginManifest = JSON.parse(await readFile('.codex-plugin/plugin.json', 'utf8'));
+    assert.equal(client.getServerVersion().version, pluginManifest.version);
     const tools = (await client.listTools()).tools.map((tool) => tool.name);
     assert.deepEqual(tools.sort(), ['qqbot_browser', 'qqbot_configure', 'qqbot_desktop', 'qqbot_live', 'qqbot_models', 'qqbot_send_file', 'qqbot_send_message', 'qqbot_setup', 'qqbot_start', 'qqbot_status', 'qqbot_stop', 'qqbot_ui'].sort());
     const details = (await client.listTools()).tools;
@@ -2102,21 +2164,32 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
     const requests = [];
     let gatewayBase;
     let connections = 0;
+    let resumes = 0;
+    let gateway;
+    let gatewayGate;
     const http = createServer(async (request, response) => {
       let body = ''; for await (const chunk of request) body += chunk;
       requests.push(request.url);
       response.setHeader('content-type', 'application/json');
       if (request.url === '/app/getAppAccessToken') response.end(JSON.stringify({ access_token: 'startup-fixture-token', expires_in: '7200' }));
-      else if (request.url === '/gateway') response.end(JSON.stringify({ url: gatewayBase.replace('http:', 'ws:') + '/ws' }));
+      else if (request.url === '/gateway') {
+        await gatewayGate;
+        response.end(JSON.stringify({ url: gatewayBase.replace('http:', 'ws:') + '/ws' }));
+      }
       else { response.statusCode = 404; response.end('{}'); }
     });
     const sockets = new WebSocketServer({ server: http });
     sockets.on('connection', socket => {
+      gateway = socket;
       connections++;
       socket.send(JSON.stringify({ op: 10, d: { heartbeat_interval: 60000 } }));
       socket.on('message', raw => {
         const frame = JSON.parse(raw);
         if (frame.op === 2) socket.send(JSON.stringify({ op: 0, s: 1, t: 'READY', d: { session_id: 'startup-fixture', user: { id: 'bot' } } }));
+        if (frame.op === 6) {
+          resumes++;
+          socket.send(JSON.stringify({ op: 0, s: 2, t: 'RESUMED', d: {} }));
+        }
         if (frame.op === 1) socket.send(JSON.stringify({ op: 11, d: null }));
       });
     });
@@ -2164,6 +2237,19 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
       assert.doesNotMatch(startupLog, /EADDRINUSE|自动启动失败/, 'concurrent daemon launch is a successful reuse, not an error');
       assert.equal(startupLog.match(/QQ 后台服务已启动/g)?.length, 1);
       assert.match(startupLog, /^\d{4}-\d{2}-\d{2}T\S+ \[INFO\] \[qqbot\] QQ 后台服务已启动/m, 'runtime diagnostics include a timestamp and severity');
+      let releaseGateway;
+      gatewayGate = new Promise(resolve => { releaseGateway = resolve; });
+      try {
+        gateway.send(JSON.stringify({ op: 7, d: null }));
+        const reconnecting = await waitForState(state => state?.running && !state.connected);
+        assert.equal(reconnecting.reconnecting, true);
+        const duringReconnect = await secondary.callTool({ name: 'qqbot_start', arguments: {} });
+        assert.equal(duringReconnect.structuredContent.reconnecting, true, 'starting while the SDK reconnects keeps the same bridge');
+        assert.equal(connections, 1);
+      } finally { releaseGateway(); }
+      const resumed = await waitForState(state => state?.connected);
+      assert.equal(resumed.reconnecting, false);
+      assert.equal(resumes, 1, 'the existing gateway session resumes without starting a fresh bridge');
       await new Promise(resolve => setTimeout(resolve, 100));
       await primary.callTool({ name: 'qqbot_stop', arguments: {} });
       const stopped = await secondary.callTool({ name: 'qqbot_status', arguments: {} });
@@ -2180,7 +2266,7 @@ test('Actual MCP stdio discovery and shared service setup page preserve credenti
       const unboundStatus = await unbound.callTool({ name: 'qqbot_status', arguments: {} });
       assert.equal(unboundStatus.structuredContent.config.credentialsConfigured, false);
       await assert.rejects(callService('status', {}, directory), error => ['ENOENT', 'ECONNREFUSED'].includes(error.code));
-      assert.equal(connections, 1, 'child and unbound instances never connect');
+      assert.equal(connections, 2, 'child and unbound instances never connect');
       assert.ok(!requests.some(path => /messages|files/.test(path)), 'startup sends no QQ messages or files');
     } finally {
       for (const peer of startupClients) await peer.close();

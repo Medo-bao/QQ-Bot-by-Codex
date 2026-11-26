@@ -1,10 +1,12 @@
 import { ApiError, MediaFileType, QQBot, contentSanitizer, errorHandler, mentionGate, messageFilter, rateLimiter, typingIndicator } from '@tencent-connect/qqbot-nodejs';
 import type { InlineKeyboard, InteractionEvent } from '@tencent-connect/qqbot-nodejs';
+import { COMPLETE_UPLOAD_RETRY_POLICY, UPLOAD_RETRY_POLICY } from '@tencent-connect/qqbot-nodejs/protocol';
 import { cacheEventId, cacheMsgId } from './transport/msgid-cache.ts';
 import { resolveReplyTarget, sendResolvedMarkdown } from './transport/reply-target.ts';
 import { ReplyLimiter } from './transport/reply-limiter.ts';
 import { replyPolicy } from './transport/reply-policy.ts';
 import type { BotConfig } from './config.ts';
+import { pluginVersion } from './version.ts';
 import { isGroupMemberId, type FileSendMode, type GroupMemberPage, type Logger, type RawAttachment, type ReplyTarget } from './types.ts';
 import type { QQBotSender } from './transport/outbound-buffer.ts';
 import { fileSendKind } from './media.ts';
@@ -45,13 +47,23 @@ const mediaFileTypes = {
   file: MediaFileType.FILE,
 };
 
+function voiceDurationExceeded(error: unknown): boolean {
+  return error instanceof ApiError && error.httpStatus === 400 && /(?:音频|语音)时长超过限制/.test(error.bizMessage || error.message);
+}
+
+// Repeating either upload request cannot change the duration of a rejected voice clip.
+for (const policy of [UPLOAD_RETRY_POLICY, COMPLETE_UPLOAD_RETRY_POLICY]) {
+  const shouldRetry = policy.shouldRetry;
+  policy.shouldRetry = (error, attempt) => !voiceDurationExceeded(error) && shouldRetry?.(error, attempt) !== false;
+}
+
 export class QQTransport implements ChatTransport {
   private readonly bot: QQBot;
   private readonly limiters = { c2c: new ReplyLimiter(replyPolicy.c2c), group: new ReplyLimiter(replyPolicy.group) };
   private stopping = false;
   private botUserId = '';
   private cancelConnect?: () => void;
-  onDisconnected?: (reason: string) => void;
+  onDisconnected?: (reason: string, willReconnect: boolean) => void;
   onConnected?: () => void;
 
   constructor(config: BotConfig, private readonly logger: Logger) {
@@ -59,7 +71,7 @@ export class QQTransport implements ChatTransport {
       appId: config.appId,
       appSecret: config.appSecret,
       transport: 'websocket',
-      userAgent: 'codex-qqbot/0.0.8',
+      userAgent: `codex-qqbot/${pluginVersion}`,
       logger,
       baseUrl: process.env.QQBOT_BASE_URL || 'https://api.bot.qq.com',
       tokenBaseUrl: process.env.QQBOT_TOKEN_BASE_URL || 'https://api.bot.qq.com',
@@ -94,7 +106,7 @@ export class QQTransport implements ChatTransport {
     this.bot.on('disconnected', (event) => {
       if (!this.stopping) {
         logger.warn(`QQ 连接中断: ${event.reason || event.code}, reconnect=${event.willReconnect}`);
-        this.onDisconnected?.(event.reason || String(event.code));
+        this.onDisconnected?.(event.reason || String(event.code), event.willReconnect);
       }
     });
   }
@@ -147,7 +159,7 @@ export class QQTransport implements ChatTransport {
       void this.bot.start().catch((error: Error) => {
         clearPending();
         reject(error);
-        if (!this.stopping) this.onDisconnected?.(error.message);
+        if (!this.stopping) this.onDisconnected?.(error.message, false);
       });
     });
   }
@@ -178,8 +190,14 @@ export class QQTransport implements ChatTransport {
 
   sendFile(target: ReplyTarget, path: string, fileName: string, sendAs: FileSendMode = 'auto'): Promise<unknown> {
     const kind = fileSendKind(path, sendAs);
-    return this.bot.uploadMedia({ target, fileType: mediaFileTypes[kind], localPath: path, srvSendMsg: false,
-      ...(kind === 'file' ? { fileName } : {}) }).then(async upload => {
+    const uploaded = this.bot.uploadMedia({ target, fileType: mediaFileTypes[kind], localPath: path, srvSendMsg: false,
+      ...(kind === 'file' ? { fileName } : {}) }).catch(error => {
+      if (kind === 'voice' && voiceDurationExceeded(error)) {
+        throw new Error('音频超过 QQ 单条语音的时长限制。请缩短或分段后发送；需要发送完整音频时，可选择按文件发送。', { cause: error });
+      }
+      throw error;
+    });
+    return uploaded.then(async upload => {
       const limiter = this.limiters[target.scope];
       const resolved = resolveReplyTarget(target, limiter, false);
       const creds = this.bot.getCredentials();

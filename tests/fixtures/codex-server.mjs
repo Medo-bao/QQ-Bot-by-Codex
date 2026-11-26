@@ -177,6 +177,8 @@ async function execute(threadId, turnId, input) {
     const question = await ask('item/tool/requestUserInput', { ...common, itemId: 'question', questions: [{ id: 'choice', question: 'Choose output format', isOther: true, isSecret: false,
       options: [{ label: 'Markdown', description: 'Text report' }, { label: 'CSV', description: 'Table' }] }] });
     trace({ question });
+    const sourceReply = await ask('item/tool/call', { ...common, callId: 'request-source', tool: 'qqbot_ask_question', arguments: { question: '请上传源文件' } });
+    trace({ sourceReply });
     const file = await ask('item/tool/call', { ...common, callId: 'file', tool: 'qqbot_send_file', namespace: null, arguments: { file_path: join(directory, 'report.txt') } });
     trace({ file });
     if (!file.success) throw new Error('file send failed');

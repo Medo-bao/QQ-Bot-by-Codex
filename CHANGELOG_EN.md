@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.0.9 - 2026-11-25
+
+- Conversation history and JSON archives attribute uploaded images to the message that contained them. Quoted images and earlier group images remain available to the model.
+- Automatically attach an earlier group image only once per thread. Later turns can still read the original from its archived path.
+- Accept attachments and quotes as standalone answers to follow-up questions. Try lossless compression when a static PNG exceeds the image analysis size limit.
+- Show interrupted turns in conversation history. Report the cause of image API network failures and retry once when the connection failed before the request could be sent.
+- Preserve active tasks when Start is selected while the QQ gateway is reconnecting. When QQ rejects an overlong voice clip, stop retrying the upload and explain how to shorten it, split it, or send the full audio as a file.
+
 ## 0.0.8 - 2026-11-11
 
 - Add an optional OpenAI Images API mode for generation and reference-image edits. Save results in the conversation so they can be resent if QQ delivery fails.

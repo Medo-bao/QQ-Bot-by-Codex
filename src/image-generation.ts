@@ -6,6 +6,7 @@ import { parseEnv } from 'node:util';
 import { EnvHttpProxyAgent } from 'undici';
 import { z } from 'zod';
 import { imageExtension } from './image-format.ts';
+import type { Logger } from './types.ts';
 
 export const imageGenerationModels = ['gpt-image-2.6-sunburst', 'gpt-image-2.6-flare',
   'gpt-image-2.5-sunburst', 'gpt-image-2.5-flare', 'gpt-image-2'] as const;
@@ -41,8 +42,25 @@ export function imageApiCredential(keyFile: string): { key?: string; source: 'fi
 const referenceTypes: Record<string, string> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.webp': 'image/webp' };
 let imageProxyAgent: EnvHttpProxyAgent | undefined;
 
+const connectFailureCodes = new Set(['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'UND_ERR_CONNECT_TIMEOUT', 'ENETUNREACH', 'EHOSTUNREACH']);
+
+function transportCodes(error: unknown): string[] {
+  const cause = error instanceof Error && !('code' in error) ? error.cause ?? error : error;
+  const failures: unknown[] = cause instanceof AggregateError && cause.errors.length ? [...cause.errors] : [cause];
+  if (cause instanceof AggregateError && 'code' in cause) failures.push(cause);
+  return failures.map(failure => {
+    const code = (failure as NodeJS.ErrnoException | null)?.code;
+    return typeof code === 'string' && /^[A-Z][A-Z0-9_]{1,63}$/.test(code) ? code : '';
+  });
+}
+
+function codeDetail(codes: string[]): string {
+  const known = [...new Set(codes.filter(Boolean))];
+  return known.length ? `（${known.join('、')}）` : '';
+}
+
 export async function generateOpenAIImage(config: ImageGenerationConfig, input: z.infer<typeof imageGenerationInput>,
-  directory: string, signal: AbortSignal): Promise<string> {
+  directory: string, signal: AbortSignal, logger: Logger): Promise<string> {
   const { key } = imageApiCredential(config.keyFile);
   if (!key) throw new Error('未找到 OpenAI API 密钥，请在「图片与文件」中检查密钥来源。');
 
@@ -67,15 +85,32 @@ export async function generateOpenAIImage(config: ImageGenerationConfig, input: 
   const timeout = AbortSignal.timeout(300_000);
   const requestSignal = AbortSignal.any([signal, timeout]);
   const requestError = (message: string) => new Error(signal.aborted ? '图片生成已取消。'
-    : timeout.aborted ? '等待 OpenAI 生成图片超时。' : message);
+    : timeout.aborted ? '等待 OpenAI 图片结果超时，无法确认是否已生成。' : message);
+  const proxy = process.env.https_proxy || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.HTTP_PROXY
+    || process.env.all_proxy || process.env.ALL_PROXY;
+  const url = `https://api.openai.com/v1/images/${reference ? 'edits' : 'generations'}`;
+  let dispatcher: EnvHttpProxyAgent | undefined;
+  try { if (proxy) dispatcher = imageProxyAgent ??= new EnvHttpProxyAgent({ httpsProxy: proxy }); }
+  catch (error) { throw requestError(`无法使用 QQ Bot 后台的图片接口代理配置${codeDetail(transportCodes(error))}。`); }
+  const options = { method: 'POST', headers, body, signal: requestSignal, redirect: 'error' as const, dispatcher };
   let response: Response;
-  try {
-    const proxy = process.env.https_proxy || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.HTTP_PROXY
-      || process.env.all_proxy || process.env.ALL_PROXY;
-    const dispatcher = proxy ? imageProxyAgent ??= new EnvHttpProxyAgent({ httpsProxy: proxy }) : undefined;
-    const options = { method: 'POST', headers, body, signal: requestSignal, redirect: 'error' as const, dispatcher };
-    response = await fetch(`https://api.openai.com/v1/images/${reference ? 'edits' : 'generations'}`, options);
-  } catch { throw requestError('无法连接 OpenAI 图片接口，请检查 QQ Bot 后台网络。'); }
+  for (let attempt = 0; ; attempt++) {
+    try {
+      response = await fetch(url, options);
+      break;
+    } catch (error) {
+      const codes = transportCodes(error);
+      const beforeConnect = codes.every(code => connectFailureCodes.has(code));
+      const detail = codeDetail(codes);
+      // A lost response can belong to an accepted, billable generation. Only reconnect before submission.
+      if (attempt === 0 && beforeConnect && !requestSignal.aborted) {
+        logger.warn(`OpenAI 图片接口连接失败${detail}，正在重连一次。`);
+        continue;
+      }
+      throw requestError(beforeConnect ? `无法连接 OpenAI 图片接口${detail}，请检查后台网络或代理。`
+        : `未收到 OpenAI 图片接口的响应${detail}，无法确认请求是否已受理。`);
+    }
+  }
   if (!response.ok) {
     await response.body?.cancel().catch(() => {});
     const hint = response.status === 401 ? '请检查 OpenAI API 密钥。'
@@ -83,7 +118,9 @@ export async function generateOpenAIImage(config: ImageGenerationConfig, input: 
         : response.status === 429 ? '请检查项目额度或稍后重试。' : '请检查绘图描述、参考图和模型设置。';
     throw requestError(`OpenAI 图片请求失败（HTTP ${response.status}）。${hint}`);
   }
-  const result = await response.json().catch(() => { throw requestError('OpenAI 返回了无法读取的图片结果。'); }) as
+  const result = await response.json().catch(error => {
+    throw requestError(`OpenAI 已响应，但未能读取图片结果${codeDetail(transportCodes(error))}。`);
+  }) as
     { data?: Array<{ b64_json?: unknown }> } | null;
   const encoded = result?.data?.[0]?.b64_json;
   if (typeof encoded !== 'string') throw new Error('OpenAI 未返回图片。');

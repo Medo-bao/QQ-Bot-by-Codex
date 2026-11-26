@@ -25,6 +25,7 @@ export class BotController {
   private binding: { phase: string; qrUrl?: string; reason?: string } = { phase: 'idle' };
   private lastError?: string;
   private connected = false;
+  private reconnecting = false;
   private controlClient?: CodexClient;
   private readonly desktopTasks: DesktopTasks;
   private readonly browserAccess: BrowserAccess;
@@ -49,14 +50,14 @@ export class BotController {
 
   status() {
     const storage = new ConversationStorage(this.store.directory, this.store.read());
-    return { running: Boolean(this.bridge), connected: this.connected, error: this.lastError,
+    return { running: Boolean(this.bridge), connected: this.connected, reconnecting: this.reconnecting, error: this.lastError,
       binding: this.binding, config: this.store.publicConfig(), dataDirectory: this.store.directory, storageDirectory: storage.root,
       ...(this.bridge?.status() || { sessions: new SessionStore(this.store.directory).list(this.store.read().appId).map((session) => ({ ...session, permissions: sessionPermissions(this.store.read(), session), storage: storage.paths({ scope: session.scope as 'c2c' | 'group', targetId: session.peerId }) })), observedPeers: {}, pending: [] }) };
   }
 
   async start(): Promise<unknown> {
     if (this.connecting) return this.connecting;
-    if (this.bridge && this.connected) return this.status();
+    if (this.bridge && (this.connected || this.reconnecting)) return this.status();
     this.connecting = this.startOnce().finally(() => { this.connecting = undefined; });
     return this.connecting;
   }
@@ -75,19 +76,29 @@ export class BotController {
       (target, url, action, maxChars) => this.inspectBrowser(target.scope, target.targetId, url, action, maxChars),
       (target, params, signal, allowExcerpt) => this.live({ ...params, scope: target.scope, target_id: target.targetId, send_to_qq: false }, signal, true, allowExcerpt));
     this.bridge = bridge;
-    transport.onDisconnected = (reason) => { if (this.bridge === bridge) { this.connected = false; this.lastError = reason; } };
-    transport.onConnected = () => { if (this.bridge === bridge) { this.connected = true; this.lastError = undefined; } };
+    transport.onDisconnected = (reason, willReconnect) => {
+      if (this.bridge !== bridge) return;
+      this.connected = false;
+      this.reconnecting = willReconnect;
+      this.lastError = reason;
+    };
+    transport.onConnected = () => {
+      if (this.bridge !== bridge) return;
+      this.connected = true;
+      this.reconnecting = false;
+      this.lastError = undefined;
+    };
     client.onExit((error) => { this.lastError = error.message; });
-    try { await bridge.start(); this.connected = true; return this.status(); }
+    try { await bridge.start(); return this.status(); }
     catch (error) {
       this.lastError = error instanceof Error ? error.message : String(error);
-      await bridge.close(); this.bridge = undefined; this.connected = false; throw error;
+      await this.stop(); throw error;
     }
   }
 
   async stop(): Promise<unknown> {
     const bridge = this.bridge;
-    this.bridge = undefined; this.connected = false;
+    this.bridge = undefined; this.connected = false; this.reconnecting = false;
     if (bridge) await bridge.close();
     return this.status();
   }

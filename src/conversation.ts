@@ -20,7 +20,8 @@ export interface ConversationFile { path: string; name: string; image: boolean; 
 export interface ConversationActivity { id: string; turnId?: string; kind: string; label: string; detail: string; status: string; order?: number; }
 
 export function conversationActivity(item: any): ConversationActivity | undefined {
-  const status = ['inProgress', 'in_progress', 'running'].includes(item.status) ? 'running' : 'completed';
+  const status = ['inProgress', 'in_progress', 'running'].includes(item.status) ? 'running'
+    : item.status === 'interrupted' ? 'interrupted' : 'completed';
   if (item.type === 'reasoning') {
     const detail = (Array.isArray(item.summary) ? item.summary : []).filter((part: unknown): part is string => typeof part === 'string').filter(Boolean).join('\n\n');
     if (!detail.trim() && status !== 'running') return;
@@ -47,6 +48,13 @@ export function displayMessageText(text: string): string {
   return text.replace(/<qqbot-at-user\s+id=["']([^"']+)["']\s*\/>/g, '@$1').replace(/<@!?([^>]+)>/g, '@$1');
 }
 
+export function turnFailureMessage(message?: string): string {
+  if (message && /^\s*\{\s*"detail"\s*:\s*"Bad Request"\s*\}\s*$/.test(message)) {
+    return 'Codex 模型服务拒绝了本轮请求（HTTP 400）。可在「会话设置」中压缩历史后重试。';
+  }
+  return message || 'Codex 执行失败。';
+}
+
 export function userMessage(id: string, content: any[]): ConversationMessage {
   let text = content.filter((item) => item.type === 'text' && !item.text.startsWith(storageMessagePrefix) && !item.text.startsWith(groupContextPrefix) && !item.text.startsWith(referenceMessagePrefix)).map((item) => item.text).join('\n');
   let scope: string | undefined; let authorId: string | undefined; let authorName: string | undefined;
@@ -70,7 +78,19 @@ export function userMessage(id: string, content: any[]): ConversationMessage {
     const start = text.indexOf('\n\n<message>\n');
     if (start >= 0) text = text.slice(start + '\n\n<message>\n'.length, -'\n</message>'.length);
   }
-  const images = content.filter((item) => ['image', 'localImage'].includes(item.type));
+  // The bridge appends quoted and earlier group pictures after the per-turn instructions.
+  const boundary = content.findIndex(item => item.type === 'text' &&
+    (item.text.startsWith(storageMessagePrefix) || item.text.startsWith(referenceMessagePrefix)));
+  const direct = boundary < 0 ? content : content.slice(0, boundary);
+  const directText = direct.filter(item => item.type === 'text' && !item.text.startsWith(groupContextPrefix));
+  const receivedPaths = new Set<string>();
+  for (const item of directText.slice(1)) {
+    // A direct upload that is also quoted may have its only localImage in the quote.
+    const note = /^QQ 附件：[^\r\n]+\r?\n本地路径：([^\r\n]+)$/.exec(item.text);
+    if (note) receivedPaths.add(note[1]!);
+  }
+  const images = content.filter((item, index) => ['image', 'localImage'].includes(item.type) &&
+    (boundary < 0 || index < boundary || receivedPaths.has(item.path)));
   if (!text && images.length) text = `[图片 × ${images.length}]`;
   text = text.replace(/^\s*(?:<@!?[^>]+>|<qqbot-at-user\s+id=["'][^"']+["']\s*\/>)\s*/, '');
   return { id, role: 'user', text: displayMessageText(text), source, scope, authorId, authorName,
@@ -88,7 +108,10 @@ export async function readConversation(client: CodexClient, threadId: string, cu
       else if (item.type === 'agentMessage' && item.text) messages.push({ id: item.id, role: 'assistant', text: item.text, phase: item.phase, turnId: turn.id,
         order, replyToId: sender?.scope === 'group' ? sender.authorId : undefined, replyToName: sender?.scope === 'group' ? sender.authorName : undefined });
       const activity = conversationActivity(['reasoning', 'plan'].includes(item.type) ? { ...item, status: turn.status === 'inProgress' ? 'inProgress' : 'completed' } : item);
-      if (activity) activities.push({ ...activity, turnId: turn.id, order });
+      if (activity) {
+        if (turn.status === 'interrupted' && activity.status === 'running') activity.status = 'interrupted';
+        activities.push({ ...activity, turnId: turn.id, order });
+      }
     }
     const files = new Map<string, ConversationFile>();
     for (const item of turn.items || []) {
@@ -123,7 +146,9 @@ export async function readConversation(client: CodexClient, threadId: string, cu
       if (!answer) { answer = { id: `files-${turn.id}`, role: 'assistant', text: '', turnId: turn.id, replyToId: sender?.authorId, replyToName: sender?.authorName }; messages.push(answer); }
       answer.files = [...files.values()];
     }
-    if (turn.status === 'failed' && turn.error?.message) messages.push({ id: `error-${turn.id}`, role: 'assistant', text: `处理失败：${turn.error.message}`, phase: 'error', turnId: turn.id });
+    if (turn.status === 'failed' && turn.error?.message) messages.push({ id: `error-${turn.id}`, role: 'assistant', text: `处理失败：${turnFailureMessage(turn.error.message)}`, phase: 'error', turnId: turn.id });
+    if (turn.status === 'interrupted') activities.push({ id: `interrupted-${turn.id}`, turnId: turn.id,
+      kind: 'turnStatus', status: 'interrupted', label: '本轮已中止', detail: '' });
   }
   return { threadId, messages, activities, nextCursor: page.nextCursor || null, turnIds: page.data.map((turn: any) => turn.id) as string[] };
 }

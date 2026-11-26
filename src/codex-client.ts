@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { pluginVersion } from './version.ts';
 import { existsSync } from 'node:fs';
 import { open } from 'node:fs/promises';
 import { delimiter, extname, isAbsolute, join, relative, toNamespacedPath } from 'node:path';
@@ -146,7 +147,7 @@ export class CodexClient {
       }
     });
     await this.call('initialize', {
-      clientInfo: { name: 'codex_qqbot', title: 'QQ Bot', version: '0.0.8' },
+      clientInfo: { name: 'codex_qqbot', title: 'QQ Bot', version: pluginVersion },
       capabilities: { experimentalApi: true },
     });
     this.notify('initialized', {});

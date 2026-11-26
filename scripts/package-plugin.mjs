@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 const output = resolve('release/codex-qqbot');
 await mkdir(output, { recursive: true });
 for (const path of ['plugin.json', 'mcp.json']) await rm(resolve(output, path), { force: true });
-for (const path of ['.codex-plugin', '.mcp.json', 'skills', 'assets', 'LICENSE', 'README.md']) {
+for (const path of ['.codex-plugin', '.mcp.json', 'skills', 'assets', 'LICENSE', 'README.md', 'README_EN.md', 'CHANGELOG.md', 'CHANGELOG_EN.md']) {
   await cp(resolve(path), resolve(output, path), { recursive: true, force: true });
 }
 await mkdir(resolve(output, 'docs'), { recursive: true });
